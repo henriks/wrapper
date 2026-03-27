@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+"""Sandbox wrapper for AI coding agents (Codex, Copilot).
+
+Uses Bubblewrap (bwrap) to run agents in an isolated namespace with
+persistent, project-local state stored in .sandbox/.
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+
+# ---------------------------------------------------------------------------
+# Tool definitions
+# ---------------------------------------------------------------------------
+
+TOOLS = {
+    "codex": {
+        "cli": "codex",
+        "auto_flags": ["--dangerously-bypass-approvals-and-sandbox"],
+        "mise_package": 'npm:@openai/codex',
+        "mise_version": "latest",
+        # Host dirs to bind r/w into sandbox HOME (relative to host HOME)
+        "host_home_mounts": [".codex"],
+    },
+    "copilot": {
+        "cli": "github-copilot-cli",
+        "auto_flags": ["--allow-all", "--no-auto-update"],
+        "mise_package": 'npm:@github/copilot',
+        "mise_version": "latest",
+        "host_home_mounts": [
+            ".copilot",
+            ".config/github-copilot",
+            ".cache/github-copilot",
+            ".config/gh",
+        ],
+    },
+}
+
+# Host directories to mount read-only
+SYSTEM_RO_DIRS = ["/usr", "/bin", "/sbin", "/lib"]
+
+# /etc entries to mount read-only (checked for existence at runtime)
+ETC_RO_ENTRIES = [
+    "resolv.conf", "hosts", "passwd", "group",
+    "ssl", "ca-certificates", "pki", "mavenrc",
+    "alternatives",
+]
+
+# Credential env vars to nullify
+CREDENTIAL_NULLS = {
+    "SSH_AUTH_SOCK": "",
+    "GIT_CONFIG_GLOBAL": "/dev/null",
+    "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
+    "AWS_CONFIG_FILE": "/dev/null",
+    "GOOGLE_APPLICATION_CREDENTIALS": "",
+    "KUBECONFIG": "/dev/null",
+}
+
+DEFAULT_MISE_TOML = """\
+[tools]
+node = "24"
+python = "latest"
+"""
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def die(msg: str) -> None:
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def detect_tool(argv0: str) -> str | None:
+    """Detect tool from invocation name."""
+    base = os.path.basename(argv0)
+    if "codex" in base:
+        return "codex"
+    if "copilot" in base:
+        return "copilot"
+    return None
+
+
+def ensure_sandbox_dir(project: str) -> str:
+    """Create .sandbox/ if needed, return its absolute path."""
+    sandbox = os.path.join(project, ".sandbox")
+    os.makedirs(sandbox, exist_ok=True)
+    return sandbox
+
+
+def ensure_gitignore(project: str) -> None:
+    """Append .sandbox/ to .gitignore if not already present."""
+    gitignore = os.path.join(project, ".gitignore")
+    entry = ".sandbox/"
+    if os.path.exists(gitignore):
+        with open(gitignore) as f:
+            contents = f.read()
+        if entry in contents.splitlines():
+            return
+    with open(gitignore, "a") as f:
+        f.write(f"\n{entry}\n")
+
+
+def ensure_project_mise_config(project: str) -> None:
+    """Create mise.toml with defaults if no mise config exists."""
+    if (os.path.exists(os.path.join(project, "mise.toml")) or
+            os.path.exists(os.path.join(project, ".mise.toml"))):
+        return
+    path = os.path.join(project, "mise.toml")
+    with open(path, "w") as f:
+        f.write(DEFAULT_MISE_TOML)
+    print(f"Created {path} with default toolchain entries")
+
+
+def ensure_sandbox_mise_config(sandbox: str, tool: str,
+                               aws: bool = False,
+                               gh: bool = False) -> None:
+    """Write sandbox-specific mise config with the AI tool entry."""
+    config_dir = os.path.join(sandbox, ".config", "mise")
+    os.makedirs(config_dir, exist_ok=True)
+    config_path = os.path.join(config_dir, "config.toml")
+
+    lines = ["[tools]"]
+
+    tool_def = TOOLS[tool]
+    if tool_def["mise_package"]:
+        lines.append(
+            f'"{tool_def["mise_package"]}" = "{tool_def["mise_version"]}"')
+
+    if aws:
+        lines.append('"aws-cli" = "2"')
+
+    if gh:
+        lines.append('"github-cli" = "latest"')
+
+    content = "\n".join(lines) + "\n"
+    # Only write if content changed
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            if f.read() == content:
+                return
+    with open(config_path, "w") as f:
+        f.write(content)
+
+
+def get_tmp_dir(project: str) -> str:
+    """Return a project-specific /tmp directory on the host."""
+    h = hashlib.sha256(project.encode()).hexdigest()[:16]
+    tmp = os.path.join("/tmp", f"sandbox-{h}")
+    os.makedirs(tmp, exist_ok=True)
+    return tmp
+
+
+def find_mise_binary() -> str | None:
+    """Find the mise binary path."""
+    return shutil.which("mise")
+
+
+def acquire_aws_credentials(profile: str) -> dict[str, str]:
+    """Acquire AWS credentials for the given profile.
+
+    Uses 'aws configure export-credentials' which works universally
+    across credential sources: IAM Identity Center (SSO), IAM users,
+    assumed roles, etc.
+    """
+    # Export credentials as JSON
+    try:
+        result = subprocess.run(
+            ["aws", "configure", "export-credentials",
+             "--profile", profile, "--format", "process"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        die("aws CLI is not installed")
+    except subprocess.TimeoutExpired:
+        die(f"Timed out acquiring AWS credentials for profile '{profile}'")
+
+    if result.returncode != 0:
+        die(f"Failed to export AWS credentials for profile '{profile}':\n"
+            f"{result.stderr.strip()}\n"
+            f"You may need to run: aws sso login --profile {profile}")
+
+    try:
+        creds = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        die(f"Failed to parse AWS credentials output for profile '{profile}'")
+
+    env: dict[str, str] = {}
+    if "AccessKeyId" in creds:
+        env["AWS_ACCESS_KEY_ID"] = creds["AccessKeyId"]
+    if "SecretAccessKey" in creds:
+        env["AWS_SECRET_ACCESS_KEY"] = creds["SecretAccessKey"]
+    if "SessionToken" in creds:
+        env["AWS_SESSION_TOKEN"] = creds["SessionToken"]
+
+    if not env.get("AWS_ACCESS_KEY_ID"):
+        die(f"No credentials found for AWS profile '{profile}'")
+
+    # Determine the region from the profile
+    try:
+        result = subprocess.run(
+            ["aws", "configure", "get", "region", "--profile", profile],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            env["AWS_DEFAULT_REGION"] = result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return env
+
+
+def acquire_gh_token() -> str | None:
+    """Extract GitHub CLI auth token from the host keyring via 'gh auth token'."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return None
+
+
+def find_docker_socket() -> str | None:
+    """Find the Docker socket path."""
+    for path in ["/var/run/docker.sock", "/run/docker.sock",
+                 f"/run/user/{os.getuid()}/docker.sock"]:
+        if os.path.exists(path):
+            return path
+    host = os.environ.get("DOCKER_HOST", "")
+    if host.startswith("unix://"):
+        path = host[len("unix://"):]
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def is_core_system_dir(path: str) -> bool:
+    """Return True for paths already covered by standard system mounts."""
+    core_dirs = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+    return path in core_dirs or path.startswith(tuple(d + "/" for d in core_dirs))
+
+
+def ensure_ns_dir(args: list[str], path: str, created: set[str]) -> None:
+    """Ensure an absolute directory path exists inside the sandbox namespace."""
+    if not path or not path.startswith("/"):
+        return
+    parts = path.split("/")
+    chain = ""
+    for part in parts[1:]:
+        if not part:
+            continue
+        chain += "/" + part
+        if chain in created:
+            continue
+        args += ["--dir", chain]
+        created.add(chain)
+
+
+def paths_overlap(path_a: str, path_b: str) -> bool:
+    """Return True when either path is equal to or nested under the other."""
+    a = os.path.realpath(path_a)
+    b = os.path.realpath(path_b)
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def discover_home_bin_symlink_target_dirs(host_bin_dir: str) -> list[str]:
+    """Return sorted unique real directories targeted by symlinks in ~/bin."""
+    target_dirs: set[str] = set()
+    try:
+        entries = os.listdir(host_bin_dir)
+    except OSError:
+        return []
+
+    for name in entries:
+        link_path = os.path.join(host_bin_dir, name)
+        if not os.path.islink(link_path):
+            continue
+        target_abs = os.path.realpath(link_path)
+        if not os.path.exists(target_abs):
+            continue
+        if os.path.isdir(target_abs):
+            target_dir = os.path.realpath(target_abs)
+        else:
+            target_dir = os.path.realpath(os.path.dirname(target_abs))
+        if os.path.isdir(target_dir):
+            target_dirs.add(target_dir)
+
+    return sorted(target_dirs)
+
+
+# ---------------------------------------------------------------------------
+# bwrap command construction
+# ---------------------------------------------------------------------------
+
+def build_bwrap_args(
+    project: str,
+    sandbox: str,
+    tool: str,
+    *,
+    no_net: bool = False,
+    docker: bool = False,
+    gh_token: str | None = None,
+    aws_env: dict[str, str] | None = None,
+    extra_ro: list[str] | None = None,
+    extra_rw: list[str] | None = None,
+    pass_env: list[str] | None = None,
+    cli_args: list[str] | None = None,
+) -> list[str]:
+    """Build the full bwrap command line."""
+    uid = os.getuid()
+    gid = os.getgid()
+    user = os.environ.get("USER", "sandbox")
+    sandbox_home = f"/home/{user}"
+    tmp_dir = get_tmp_dir(project)
+    mise_bin = find_mise_binary()
+
+    args: list[str] = ["bwrap"]
+
+    # -- Namespace and security --
+    args += ["--unshare-all", "--cap-drop", "ALL"]
+    if not no_net:
+        args += ["--share-net"]
+    args += ["--die-with-parent", "--new-session"]
+    args += ["--uid", str(uid), "--gid", str(gid)]
+
+    # -- Clear environment --
+    args += ["--clearenv"]
+
+    # -- System directories (read-only) --
+    for d in SYSTEM_RO_DIRS:
+        if os.path.exists(d):
+            args += ["--ro-bind", d, d]
+
+    # /lib64 may be a symlink or a real dir
+    if os.path.exists("/lib64"):
+        real = os.path.realpath("/lib64")
+        if os.path.islink("/lib64"):
+            # It's a symlink; the target is already mounted via /usr or similar.
+            args += ["--symlink", os.readlink("/lib64"), "/lib64"]
+        else:
+            args += ["--ro-bind", "/lib64", "/lib64"]
+
+    # /etc entries
+    args += ["--tmpfs", "/etc"]
+    for entry in ETC_RO_ENTRIES:
+        path = f"/etc/{entry}"
+        if os.path.exists(path):
+            args += ["--ro-bind", path, path]
+
+    # /etc/java* (glob)
+    for path in sorted(glob.glob("/etc/java*")):
+        if os.path.exists(path):
+            args += ["--ro-bind", path, path]
+
+    # /proc, /dev, /tmp, /var
+    args += ["--proc", "/proc"]
+    args += ["--dev", "/dev"]
+    args += ["--bind", tmp_dir, "/tmp"]
+    args += ["--tmpfs", "/var"]
+
+    # -- HOME --
+    # HOME must be mounted before the project if the project path is under
+    # sandbox_home, so we can then "poke through" with the project bind.
+    args += ["--bind", sandbox, sandbox_home]
+
+    # -- Project directory (read-write) --
+    # If the project is under sandbox_home, we need intermediate directories
+    # inside .sandbox/ so bwrap has mount points for the project bind.
+    if project.startswith(sandbox_home + "/"):
+        rel = os.path.relpath(project, sandbox_home)
+        os.makedirs(os.path.join(sandbox, rel), exist_ok=True)
+    args += ["--bind", project, project]
+
+    # .git read-only overlay
+    git_dir = os.path.join(project, ".git")
+    if os.path.isdir(git_dir):
+        args += ["--ro-bind", git_dir, git_dir]
+
+    # Hide .sandbox inside the sandbox
+    sandbox_in_project = os.path.join(project, ".sandbox")
+    args += ["--tmpfs", sandbox_in_project]
+
+    # -- mise binary --
+    # mise is in /usr/bin which is already mounted, but if it's elsewhere
+    # we need to mount it explicitly.
+    if mise_bin:
+        mise_real = os.path.realpath(mise_bin)
+        mise_parent = os.path.dirname(mise_real)
+        # Check if it's already covered by system mounts
+        covered = any(mise_real.startswith(d + "/") for d in SYSTEM_RO_DIRS)
+        if not covered and not mise_real.startswith("/lib64"):
+            args += ["--ro-bind", mise_real, mise_real]
+
+    # -- App home directories (auth, config, cache from host) --
+    host_home = os.path.expanduser("~")
+    tool_def = TOOLS[tool]
+    for rel_dir in tool_def.get("host_home_mounts", []):
+        host_dir = os.path.join(host_home, rel_dir)
+        if os.path.exists(host_dir):
+            # Ensure mount point exists inside .sandbox/
+            os.makedirs(os.path.join(sandbox, rel_dir), exist_ok=True)
+            sandbox_dir = f"{sandbox_home}/{rel_dir}"
+            args += ["--bind", host_dir, sandbox_dir]
+
+    # -- Host ~/bin and symlink targets (read-only) --
+    # Expose host ~/bin for custom scripts and mount symlink target dirs
+    # read-only so those symlinks remain usable inside the sandbox.
+    host_bin_dir = os.path.join(host_home, "bin")
+    if os.path.isdir(host_bin_dir):
+        os.makedirs(os.path.join(sandbox, "bin"), exist_ok=True)
+        args += ["--ro-bind", host_bin_dir, f"{sandbox_home}/bin"]
+
+        ns_dirs_created = {
+            "/", "/run", "/etc", "/usr", "/usr/local", "/usr/local/bin",
+            "/bin", "/sbin", "/lib", "/lib64", "/home", sandbox_home,
+            "/tmp", "/var", "/proc", "/dev",
+        }
+        mounted_targets: set[tuple[str, str]] = set()
+
+        for target_dir_abs in discover_home_bin_symlink_target_dirs(host_bin_dir):
+            # Core system paths are already mounted.
+            if is_core_system_dir(target_dir_abs):
+                continue
+
+            # Never remount over the project path; that would downgrade the
+            # project's rw bind to read-only.
+            if paths_overlap(target_dir_abs, project):
+                continue
+
+            # ~/bin itself is already mounted above.
+            if (target_dir_abs == host_bin_dir or
+                    target_dir_abs.startswith(host_bin_dir + "/")):
+                continue
+
+            if target_dir_abs == host_home:
+                target_dir_sb = sandbox_home
+            elif target_dir_abs.startswith(host_home + "/"):
+                target_rel = os.path.relpath(target_dir_abs, host_home)
+                os.makedirs(os.path.join(sandbox, target_rel), exist_ok=True)
+                target_dir_sb = f"{sandbox_home}/{target_rel}"
+            else:
+                target_dir_sb = target_dir_abs
+                ensure_ns_dir(args, target_dir_sb, ns_dirs_created)
+
+            if target_dir_sb == f"{sandbox_home}/bin":
+                continue
+
+            target_key = (target_dir_abs, target_dir_sb)
+            if target_key in mounted_targets:
+                continue
+            args += ["--ro-bind", target_dir_abs, target_dir_sb]
+            mounted_targets.add(target_key)
+
+    # -- Docker (opt-in) --
+    if docker:
+        sock = find_docker_socket()
+        if sock:
+            # Preserve the discovered socket at its original path so rootless
+            # Docker contexts or DOCKER_HOST values keep working.
+            ensure_ns_dir(args, os.path.dirname(sock), {"/", "/run"})
+            if sock != "/run/docker.sock" and sock != "/var/run/docker.sock":
+                args += ["--bind", sock, sock]
+            args += ["--bind", sock, "/run/docker.sock"]
+            # Also mount at /var/run/docker.sock since many tools look there
+            args += ["--dir", "/var/run"]
+            args += ["--bind", sock, "/var/run/docker.sock"]
+        docker_config = os.path.expanduser("~/.docker")
+        if os.path.isdir(docker_config):
+            os.makedirs(os.path.join(sandbox, ".docker"), exist_ok=True)
+            args += ["--bind", docker_config, f"{sandbox_home}/.docker"]
+
+    # -- GitHub CLI (opt-in) --
+    # Mount ~/.config/gh read-only for config; auth is via GH_TOKEN env var
+    # since the host keyring (D-Bus Secret Service) isn't accessible in the
+    # sandbox.
+    if gh_token is not None:
+        gh_config = os.path.expanduser("~/.config/gh")
+        if os.path.isdir(gh_config):
+            os.makedirs(os.path.join(sandbox, ".config", "gh"), exist_ok=True)
+            args += ["--ro-bind", gh_config,
+                      f"{sandbox_home}/.config/gh"]
+
+    # -- Extra mounts --
+    for path in (extra_ro or []):
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path):
+            args += ["--ro-bind", abs_path, abs_path]
+        else:
+            print(f"warning: --ro path does not exist: {path}",
+                  file=sys.stderr)
+
+    for path in (extra_rw or []):
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path):
+            args += ["--bind", abs_path, abs_path]
+        else:
+            print(f"warning: --rw path does not exist: {path}",
+                  file=sys.stderr)
+
+    # -- Environment variables --
+    env_vars: dict[str, str] = {}
+
+    # Core
+    env_vars["HOME"] = sandbox_home
+    env_vars["USER"] = user
+    env_vars["LOGNAME"] = user
+    env_vars["TERM"] = os.environ.get("TERM", "xterm-256color")
+    env_vars["LANG"] = os.environ.get("LANG", "en_US.UTF-8")
+
+    # XDG
+    env_vars["XDG_CACHE_HOME"] = f"{sandbox_home}/.cache"
+    env_vars["XDG_CONFIG_HOME"] = f"{sandbox_home}/.config"
+    env_vars["XDG_DATA_HOME"] = f"{sandbox_home}/.local/share"
+    env_vars["XDG_STATE_HOME"] = f"{sandbox_home}/.local/state"
+
+    # PATH: mise shims, home bin, system paths
+    path_parts = [
+        f"{sandbox_home}/.local/share/mise/shims",
+        f"{sandbox_home}/.local/bin",
+        f"{sandbox_home}/bin",
+        "/usr/local/sbin", "/usr/local/bin",
+        "/usr/sbin", "/usr/bin",
+        "/sbin", "/bin",
+    ]
+    env_vars["PATH"] = ":".join(path_parts)
+
+    # TMPDIR
+    env_vars["TMPDIR"] = "/tmp"
+
+    # Credential nullification
+    env_vars.update(CREDENTIAL_NULLS)
+
+    # AWS credentials (from STS) or nullification
+    if aws_env:
+        env_vars.update(aws_env)
+
+    # GitHub CLI token (extracted from host keyring)
+    if gh_token:
+        env_vars["GH_TOKEN"] = gh_token
+
+    # Preserve DOCKER_HOST for rootless setups when --docker is enabled and
+    # the discovered socket has been mounted at its original path.
+    if docker:
+        docker_host = os.environ.get("DOCKER_HOST")
+        if docker_host:
+            env_vars["DOCKER_HOST"] = docker_host
+
+    # Pass-through env vars
+    for var in (pass_env or []):
+        val = os.environ.get(var)
+        if val is not None:
+            env_vars[var] = val
+
+    # Set all env vars via --setenv
+    for key, val in env_vars.items():
+        args += ["--setenv", key, val]
+
+    # -- Working directory --
+    args += ["--chdir", project]
+
+    # -- Command to run inside sandbox --
+    # If extra args are given, they replace the tool command entirely.
+    # Otherwise, run the default tool CLI with auto-flags.
+    tool_def = TOOLS[tool]
+    extra = list(cli_args or [])
+
+    if extra:
+        # Extra args = the command to run (replaces tool)
+        cmd_parts = [shell_quote(a) for a in extra]
+        tool_cmd = " ".join(cmd_parts)
+    else:
+        # Default: run the tool with auto-flags
+        parts = [tool_def["cli"]] + list(tool_def["auto_flags"])
+        tool_cmd = " ".join(shell_quote(a) for a in parts)
+
+    # Build the inner command
+    # Use mise activate to set up PATH properly, then exec the command
+    inner_parts = [
+        # Trust the project directory for mise
+        'export MISE_TRUSTED_CONFIG_PATHS="$PWD"',
+        # Install toolchains (idempotent, non-fatal so partial failures
+        # don't prevent the agent from launching)
+        'mise install --yes 2>&1 || true',
+        # Activate mise in the current shell to get proper PATH
+        'eval "$(mise activate bash --shims)"',
+    ]
+
+    inner_parts.append(f'exec {tool_cmd}')
+
+    inner_script = " && ".join(inner_parts)
+    args += ["bash", "-c", inner_script]
+
+    return args
+
+
+def shell_quote(s: str) -> str:
+    """Quote a string for shell use."""
+    if s and all(c.isalnum() or c in "-_=/.:" for c in s):
+        return s
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=os.path.basename(argv[0]),
+        description="Run an AI coding agent in a sandboxed environment.",
+        add_help=True,
+    )
+    parser.add_argument(
+        "--project", default=os.getcwd(),
+        help="Project directory (default: $PWD)",
+    )
+    parser.add_argument(
+        "--tool", choices=["codex", "copilot"],
+        help="Explicit tool selection (overrides invocation name)",
+    )
+    parser.add_argument(
+        "--no-net", action="store_true",
+        help="Disable network access inside the sandbox",
+    )
+    parser.add_argument(
+        "--docker", action="store_true",
+        help="Mount Docker socket and config into the sandbox",
+    )
+    parser.add_argument(
+        "--gh", action="store_true",
+        help="Mount gh config (read-only) and pass auth token into sandbox",
+    )
+    parser.add_argument(
+        "--aws", metavar="PROFILE",
+        help="Acquire temporary AWS credentials via STS for the given profile",
+    )
+    parser.add_argument(
+        "--ro", action="append", default=[], metavar="PATH",
+        help="Extra read-only bind mount (repeatable)",
+    )
+    parser.add_argument(
+        "--rw", action="append", default=[], metavar="PATH",
+        help="Extra read-write bind mount (repeatable)",
+    )
+    parser.add_argument(
+        "--pass-env", action="append", default=[], metavar="VAR",
+        help="Pass host environment variable into sandbox (repeatable)",
+    )
+    parser.add_argument(
+        "--reset", action="store_true",
+        help="Remove .sandbox/ and start fresh",
+    )
+    # Everything after -- goes to the tool
+    parser.add_argument(
+        "extra", nargs=argparse.REMAINDER,
+        help=argparse.SUPPRESS,
+    )
+
+    args = parser.parse_args(argv[1:])
+
+    # Strip leading '--' from extra args
+    if args.extra and args.extra[0] == "--":
+        args.extra = args.extra[1:]
+
+    return args
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    args = parse_args(sys.argv)
+
+    # Determine tool
+    tool = args.tool or detect_tool(sys.argv[0])
+    if not tool:
+        die("Cannot determine tool from invocation name. "
+            "Use --tool codex|copilot or invoke as codex-wrap/copilot-wrap.")
+
+    if tool not in TOOLS:
+        die(f"Unknown tool: {tool}")
+
+    # Resolve project directory
+    project = os.path.abspath(args.project)
+    if not os.path.isdir(project):
+        die(f"Project directory does not exist: {project}")
+
+    # Check bwrap
+    if not shutil.which("bwrap"):
+        die("bubblewrap (bwrap) is not installed. "
+            "Install it with: sudo apt install bubblewrap")
+
+    # Check mise
+    if not find_mise_binary():
+        die("mise is not installed. "
+            "Install it from: https://mise.jdx.dev")
+
+    # Handle --reset
+    sandbox_path = os.path.join(project, ".sandbox")
+    if args.reset:
+        if os.path.exists(sandbox_path):
+            shutil.rmtree(sandbox_path)
+            print("Removed .sandbox/")
+        else:
+            print(".sandbox/ does not exist, nothing to reset")
+        return
+
+    # Set up .sandbox
+    sandbox = ensure_sandbox_dir(project)
+    ensure_gitignore(project)
+
+    # Set up mise configs
+    ensure_project_mise_config(project)
+    ensure_sandbox_mise_config(sandbox, tool, aws=bool(args.aws),
+                               gh=args.gh)
+
+    # Acquire AWS credentials if requested
+    aws_env = None
+    if args.aws:
+        print(f"Acquiring AWS credentials for profile '{args.aws}'...")
+        aws_env = acquire_aws_credentials(args.aws)
+        print("AWS credentials acquired")
+
+    # Acquire GitHub CLI token if requested
+    gh_token = None
+    if args.gh:
+        gh_token = acquire_gh_token()
+        if gh_token:
+            print("GitHub CLI token acquired")
+        else:
+            print("warning: --gh specified but could not extract token "
+                  "(run 'gh auth login' on the host)", file=sys.stderr)
+
+    # Build bwrap command
+    bwrap_args = build_bwrap_args(
+        project=project,
+        sandbox=sandbox,
+        tool=tool,
+        no_net=args.no_net,
+        docker=args.docker,
+        gh_token=gh_token,
+        aws_env=aws_env,
+        extra_ro=args.ro,
+        extra_rw=args.rw,
+        pass_env=args.pass_env,
+        cli_args=args.extra,
+    )
+
+    # Execute
+    os.execvp("bwrap", bwrap_args)
+
+
+if __name__ == "__main__":
+    main()
