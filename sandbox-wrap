@@ -6,13 +6,21 @@ persistent, project-local state stored in .sandbox/.
 """
 
 import argparse
+import fcntl
 import glob
 import hashlib
 import json
 import os
+import selectors
+import re
+import signal
+import socket
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass, field
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +76,44 @@ node = "24"
 python = "latest"
 """
 
+DOCKER_VM_DIRNAME = "docker-vm"
+DOCKER_VM_RUN_DIRNAME = "run"
+DOCKER_VM_DATA_DISK_SIZE = 20 * 1024 * 1024 * 1024
+DOCKER_VM_DATA_DISK_FS = "ext4"
+DOCKER_VM_BOOT_TIMEOUT = 60.0
+DOCKER_VM_SHUTDOWN_TIMEOUT = 10.0
+DOCKER_VM_FAST_SHUTDOWN_TIMEOUT = 1.0
+DOCKER_VM_VSOCK_CID = 3
+DOCKER_VM_VIRTIOFS_NUM_QUEUES = 1
+DOCKER_VM_VIRTIOFS_QUEUE_SIZE = 128
+DOCKER_VM_CLOUD_HYPERVISOR_SECCOMP = os.environ.get(
+    "SANDBOX_WRAP_CLOUD_HYPERVISOR_SECCOMP", "false")
+
+HOST_TOOL_FALLBACKS = {
+    "virtiofsd": [
+        "/usr/lib/virtiofsd",
+        "/usr/libexec/virtiofsd",
+        "/usr/lib/qemu/virtiofsd",
+        "/usr/local/libexec/virtiofsd",
+        "/usr/local/lib/qemu/virtiofsd",
+    ],
+    "cloud-hypervisor": [
+        "/usr/local/bin/cloud-hypervisor",
+        "/usr/bin/cloud-hypervisor",
+    ],
+    "mkfs.ext4": [
+        "/usr/sbin/mkfs.ext4",
+        "/sbin/mkfs.ext4",
+        "/usr/bin/mkfs.ext4",
+    ],
+}
+
+HOST_TOOL_ENV_OVERRIDES = {
+    "virtiofsd": "SANDBOX_WRAP_VIRTIOFSD_BIN",
+    "cloud-hypervisor": "SANDBOX_WRAP_CLOUD_HYPERVISOR_BIN",
+    "mkfs.ext4": "SANDBOX_WRAP_MKFS_EXT4_BIN",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -76,6 +122,834 @@ python = "latest"
 def die(msg: str) -> None:
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def resolve_host_binary(name: str) -> str | None:
+    """Resolve a host binary from PATH or common distro-specific locations."""
+    override_var = HOST_TOOL_ENV_OVERRIDES.get(name)
+    if override_var:
+        override_path = os.environ.get(override_var)
+        if override_path:
+            if os.path.isfile(override_path) and os.access(override_path, os.X_OK):
+                return override_path
+            raise DockerVmError(
+                f"{override_var} is set to a non-executable path: {override_path}"
+            )
+    path = shutil.which(name)
+    if path:
+        return path
+    for candidate in HOST_TOOL_FALLBACKS.get(name, []):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def is_rw_accessible(path: str) -> bool:
+    """Return True when a path exists and is readable/writable."""
+    return os.path.exists(path) and os.access(path, os.R_OK | os.W_OK)
+
+
+def read_tail(path: str, max_bytes: int = 4096) -> str:
+    """Return the last bytes of a log file as text, best-effort."""
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            data = f.read()
+    except OSError:
+        return ""
+    return data.decode("utf-8", "replace").strip()
+
+
+def parse_http_response(response: bytes) -> tuple[int, dict[str, str], bytes]:
+    """Parse a minimal HTTP response and return status, headers, and body."""
+    header_blob, _, body_blob = response.partition(b"\r\n\r\n")
+    if not header_blob:
+        raise DockerVmError("Empty HTTP response")
+    lines = header_blob.splitlines()
+    status_line = lines[0].decode("utf-8", "replace")
+    try:
+        status_code = int(status_line.split()[1])
+    except (IndexError, ValueError) as exc:
+        raise DockerVmError(f"Unexpected HTTP response: {status_line}") from exc
+
+    headers: dict[str, str] = {}
+    for line in lines[1:]:
+        try:
+            key, value = line.decode("utf-8", "replace").split(":", 1)
+        except ValueError:
+            continue
+        headers[key.strip().lower()] = value.strip()
+    return status_code, headers, body_blob
+
+
+def read_http_response_from_socket(sock: socket.socket, context: str
+                                   ) -> tuple[int, dict[str, str], bytes]:
+    """Read one HTTP response without waiting for the peer to close."""
+    sock.settimeout(2.0)
+    response = bytearray()
+    header_end = -1
+    while header_end == -1:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        response.extend(chunk)
+        header_end = response.find(b"\r\n\r\n")
+
+    if header_end == -1:
+        raise DockerVmError(f"Incomplete HTTP response from {context}")
+
+    status, headers, body = parse_http_response(bytes(response))
+    content_length = headers.get("content-length")
+    expected_length = 0
+    if content_length is not None:
+        try:
+            expected_length = int(content_length)
+        except ValueError as exc:
+            raise DockerVmError(
+                f"Invalid Content-Length from {context}: {content_length}"
+            ) from exc
+        while len(body) < expected_length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            body += chunk
+        if len(body) < expected_length:
+            raise DockerVmError(
+                f"Incomplete HTTP body from {context}: "
+                f"expected {expected_length} bytes, got {len(body)}"
+            )
+        body = body[:expected_length]
+    return status, headers, body
+
+
+def detect_cloud_hypervisor_major_version(binary: str) -> int | None:
+    """Return the Cloud Hypervisor major version from `--version` output."""
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    match = re.search(r"\bv(\d+)(?:\.\d+)?\b", result.stdout)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def ensure_kernel_cmdline_rootfstype_ext4(cmdline: str) -> str:
+    """Add rootfstype=ext4 when the appliance manifest omits it."""
+    if "rootfstype=" in cmdline:
+        return cmdline
+    return cmdline.replace("root=/dev/vda", "root=/dev/vda rootfstype=ext4", 1)
+
+
+def append_kernel_cmdline_arg(cmdline: str, key: str, value: str) -> str:
+    """Append a kernel cmdline key=value argument."""
+    if any(ch.isspace() for ch in value):
+        raise DockerVmError(
+            f"Docker VM does not support whitespace in {key}: {value}"
+        )
+    return f"{cmdline} {key}={value}"
+
+
+class DockerVmError(RuntimeError):
+    """Raised when Docker VM lifecycle management fails."""
+
+
+@dataclass
+class DockerVmPaths:
+    """Project-local paths for the Docker VM runtime."""
+
+    root: str
+    run: str
+    lock: str
+    data_disk: str
+    data_disk_meta: str
+    state: str
+    docker_sock: str
+    ch_api_sock: str
+    ch_vsock_sock: str
+    virtiofs_sock: str
+    cloud_hypervisor_pid: str
+    virtiofsd_pid: str
+    proxy_pid: str
+    cloud_hypervisor_log: str
+    virtiofsd_log: str
+    proxy_log: str
+
+
+@dataclass
+class DockerVmManager:
+    """Manage the per-project Cloud Hypervisor Docker VM runtime."""
+
+    project: str
+    sandbox: str
+    repo_root: str
+    paths: DockerVmPaths = field(init=False)
+    manifest: dict | None = field(default=None, init=False)
+    lock_fd: int | None = field(default=None, init=False)
+    virtiofsd_proc: subprocess.Popen | None = field(default=None, init=False)
+    proxy_proc: subprocess.Popen | None = field(default=None, init=False)
+    cloud_hypervisor_proc: subprocess.Popen | None = field(
+        default=None, init=False)
+    host_tools: dict[str, str] = field(default_factory=dict, init=False)
+    cloud_hypervisor_major_version: int | None = field(default=None, init=False)
+
+    def __post_init__(self) -> None:
+        root = os.path.join(self.sandbox, DOCKER_VM_DIRNAME)
+        run = os.path.join(root, DOCKER_VM_RUN_DIRNAME)
+        self.paths = DockerVmPaths(
+            root=root,
+            run=run,
+            lock=os.path.join(root, "lock"),
+            data_disk=os.path.join(root, "docker-data.raw"),
+            data_disk_meta=os.path.join(root, "docker-data.meta.json"),
+            state=os.path.join(run, "state.json"),
+            docker_sock=os.path.join(run, "docker.sock"),
+            ch_api_sock=os.path.join(run, "ch-api.sock"),
+            ch_vsock_sock=os.path.join(run, "ch-vsock.sock"),
+            virtiofs_sock=os.path.join(run, "virtiofs.sock"),
+            cloud_hypervisor_pid=os.path.join(run, "cloud-hypervisor.pid"),
+            virtiofsd_pid=os.path.join(run, "virtiofsd.pid"),
+            proxy_pid=os.path.join(run, "proxy.pid"),
+            cloud_hypervisor_log=os.path.join(run, "cloud-hypervisor.log"),
+            virtiofsd_log=os.path.join(run, "virtiofsd.log"),
+            proxy_log=os.path.join(run, "proxy.log"),
+        )
+    def load_manifest(self) -> dict:
+        if self.manifest is not None:
+            return self.manifest
+        manifest_path = os.path.join(
+            self.repo_root, "docker", "out", "artifact-manifest.json")
+        if not os.path.exists(manifest_path):
+            raise DockerVmError(
+                f"Docker VM artifact manifest is missing: {manifest_path}\n"
+                "Run docker/build-appliance.sh first."
+            )
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DockerVmError(
+                f"Failed to load Docker VM manifest {manifest_path}: {exc}"
+            ) from exc
+
+        artifacts = manifest.get("artifacts", {})
+        for key in ("kernel", "initrd", "rootfs"):
+            rel = artifacts.get(key)
+            if not rel:
+                raise DockerVmError(
+                    f"Docker VM manifest is missing artifacts.{key}")
+            path = os.path.join(self.repo_root, rel)
+            artifacts[key] = os.path.abspath(path)
+            if not os.path.exists(artifacts[key]):
+                raise DockerVmError(
+                    f"Docker VM artifact is missing: {artifacts[key]}")
+        self.manifest = manifest
+        return manifest
+
+    def ensure_host_prerequisites(self) -> None:
+        self.load_manifest()
+        required_bins = ["cloud-hypervisor", "virtiofsd", "mkfs.ext4"]
+        self.host_tools = {}
+        missing = []
+        for name in required_bins:
+            resolved = resolve_host_binary(name)
+            if resolved:
+                self.host_tools[name] = resolved
+            else:
+                missing.append(name)
+        if missing:
+            raise DockerVmError(
+                "Missing required Docker VM host tools: "
+                + ", ".join(missing)
+            )
+        self.cloud_hypervisor_major_version = detect_cloud_hypervisor_major_version(
+            self.host_tools["cloud-hypervisor"]
+        )
+        if not os.path.exists("/dev/kvm"):
+            raise DockerVmError("/dev/kvm is required for Docker VM support")
+        if not is_rw_accessible("/dev/kvm"):
+            raise DockerVmError(
+                "/dev/kvm exists but is not readable/writable by the current "
+                "user")
+        if not os.path.exists("/dev/vhost-vsock"):
+            raise DockerVmError(
+                "/dev/vhost-vsock is required for Docker VM support")
+        if not is_rw_accessible("/dev/vhost-vsock"):
+            raise DockerVmError(
+                "/dev/vhost-vsock exists but is not readable/writable by the "
+                "current user")
+
+    def ensure_runtime_root(self) -> None:
+        os.makedirs(self.paths.root, exist_ok=True)
+
+    def acquire_lock(self) -> None:
+        self.ensure_runtime_root()
+        fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise DockerVmError(
+                "A Docker sandbox is already active for this project") from exc
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        os.fsync(fd)
+        self.lock_fd = fd
+
+    def release_lock(self) -> None:
+        if self.lock_fd is None:
+            return
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+
+    def reset_is_allowed(self) -> bool:
+        self.ensure_runtime_root()
+        fd = os.open(self.paths.lock, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                return False
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
+
+    def remove_stale_run_dir(self) -> None:
+        if os.path.isdir(self.paths.run):
+            shutil.rmtree(self.paths.run)
+
+    def create_run_dir(self) -> None:
+        os.makedirs(self.paths.run, exist_ok=True)
+
+    def write_state(self, status: str, **extra: object) -> None:
+        state = {
+            "status": status,
+            "project": self.project,
+            "sandbox": self.sandbox,
+            "updated_at": int(time.time()),
+        }
+        state.update(extra)
+        with open(self.paths.state, "w") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    def ensure_data_disk(self) -> None:
+        if os.path.exists(self.paths.data_disk):
+            return
+        subprocess.run(
+            ["truncate", "-s", str(DOCKER_VM_DATA_DISK_SIZE), self.paths.data_disk],
+            check=True,
+        )
+        subprocess.run(
+            [self.host_tools["mkfs.ext4"], "-F", self.paths.data_disk],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        meta = {
+            "format_version": 1,
+            "logical_size_bytes": DOCKER_VM_DATA_DISK_SIZE,
+            "filesystem": DOCKER_VM_DATA_DISK_FS,
+            "created_at": int(time.time()),
+        }
+        with open(self.paths.data_disk_meta, "w") as f:
+            json.dump(meta, f, indent=2, sort_keys=True)
+            f.write("\n")
+
+    def _open_log(self, path: str):
+        return open(path, "a")
+
+    def _write_pid(self, path: str, pid: int) -> None:
+        with open(path, "w") as f:
+            f.write(f"{pid}\n")
+
+    def start_virtiofsd(self) -> None:
+        log = self._open_log(self.paths.virtiofsd_log)
+        cmd = [
+            self.host_tools["virtiofsd"],
+            f"--socket-path={self.paths.virtiofs_sock}",
+            f"--shared-dir={self.project}",
+            "--sandbox=none",
+            "--inode-file-handles=never",
+            "--cache=never",
+            f"--thread-pool-size={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+            "--log-level=debug",
+        ]
+        self.virtiofsd_proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
+        self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
+
+    def start_cloud_hypervisor(self) -> None:
+        log = self._open_log(self.paths.cloud_hypervisor_log)
+        cmd = [
+            self.host_tools["cloud-hypervisor"],
+            "-v",
+            "--api-socket",
+            f"path={self.paths.ch_api_sock}",
+            "--seccomp",
+            DOCKER_VM_CLOUD_HYPERVISOR_SECCOMP,
+        ]
+        self.cloud_hypervisor_proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        self._write_pid(
+            self.paths.cloud_hypervisor_pid, self.cloud_hypervisor_proc.pid)
+        self.wait_for_api_ready(timeout=10.0)
+
+    def wait_for_path(self, path: str, timeout: float) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(path):
+                return
+            self._ensure_processes_alive()
+            time.sleep(0.1)
+        raise DockerVmError(f"Timed out waiting for {path}")
+
+    def _ensure_processes_alive(self) -> None:
+        for name, proc in (
+            ("virtiofsd", self.virtiofsd_proc),
+            ("docker-vm-proxy", self.proxy_proc),
+            ("cloud-hypervisor", self.cloud_hypervisor_proc),
+        ):
+            if proc is not None and proc.poll() is not None:
+                log_path = ""
+                if name == "virtiofsd":
+                    log_path = self.paths.virtiofsd_log
+                elif name == "docker-vm-proxy":
+                    log_path = self.paths.proxy_log
+                elif name == "cloud-hypervisor":
+                    log_path = self.paths.cloud_hypervisor_log
+                log_tail = read_tail(log_path)
+                detail = f"{name} exited unexpectedly"
+                if log_tail:
+                    detail += f":\n{log_tail}"
+                raise DockerVmError(detail)
+
+    def api_request(self, method: str, endpoint: str,
+                    body: dict | None = None) -> tuple[int, bytes]:
+        payload = b""
+        headers = []
+        if body is not None:
+            payload = json.dumps(body).encode()
+            headers.append(b"Content-Type: application/json")
+            headers.append(f"Content-Length: {len(payload)}".encode())
+        request = [
+            f"{method} /api/v1/{endpoint} HTTP/1.1".encode(),
+            b"Host: localhost",
+            b"Accept: application/json",
+        ]
+        request.extend(headers)
+        request.append(b"Connection: close")
+        raw = b"\r\n".join(request) + b"\r\n\r\n" + payload
+
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(self.paths.ch_api_sock)
+            sock.sendall(raw)
+            status_code, _headers, body_blob = read_http_response_from_socket(
+                sock, f"Cloud Hypervisor API endpoint {endpoint}")
+        return status_code, body_blob
+
+    def wait_for_api_ready(self, timeout: float) -> None:
+        deadline = time.time() + timeout
+        last_error: str | None = None
+        while time.time() < deadline:
+            if os.path.exists(self.paths.ch_api_sock):
+                try:
+                    status, _ = self.api_request("GET", "vmm.ping")
+                    if status == 200:
+                        return
+                except (OSError, DockerVmError) as exc:
+                    last_error = str(exc)
+            self._ensure_processes_alive()
+            time.sleep(0.1)
+        detail = "Timed out waiting for Cloud Hypervisor API"
+        if last_error:
+            detail += f" (last probe error: {last_error})"
+        raise DockerVmError(detail)
+
+    def unix_http_request(self, sock_path: str, request: bytes
+                          ) -> tuple[int, bytes]:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.connect(sock_path)
+            sock.sendall(request)
+            status_code, _headers, body_blob = read_http_response_from_socket(
+                sock, sock_path)
+        return status_code, body_blob
+
+    def start_proxy(self) -> None:
+        log = self._open_log(self.paths.proxy_log)
+        wrapper_script = os.path.join(self.repo_root, "sandbox-wrap")
+        cmd = [
+            sys.executable,
+            "-u",
+            wrapper_script,
+            "__docker-vm-proxy",
+            "--listen",
+            self.paths.docker_sock,
+            "--vsock-socket",
+            self.paths.ch_vsock_sock,
+            "--vsock-port",
+            str(self.manifest["cloud_hypervisor"]["vsock_port"]),
+        ]
+        self.proxy_proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        self._write_pid(self.paths.proxy_pid, self.proxy_proc.pid)
+        self.wait_for_path(self.paths.docker_sock, timeout=10.0)
+
+    def wait_for_docker_ready(self, timeout: float) -> None:
+        request = (
+            b"GET /_ping HTTP/1.1\r\n"
+            b"Host: docker\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        deadline = time.time() + timeout
+        last_error: str | None = None
+        while time.time() < deadline:
+            try:
+                status, body = self.unix_http_request(
+                    self.paths.docker_sock, request)
+                if status == 200 and body.strip() == b"OK":
+                    return
+            except (OSError, DockerVmError) as exc:
+                last_error = str(exc)
+            self._ensure_processes_alive()
+            time.sleep(0.2)
+        detail = "Timed out waiting for Docker over the project-local Unix socket"
+        if last_error:
+            detail += f" (last probe error: {last_error})"
+        raise DockerVmError(detail)
+
+    def build_vm_config(self) -> dict:
+        manifest = self.load_manifest()
+        artifacts = manifest["artifacts"]
+        hv = manifest["cloud_hypervisor"]
+        kernel_cmdline = ensure_kernel_cmdline_rootfstype_ext4(
+            hv["kernel_cmdline"]
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_project",
+            self.project,
+        )
+        config = {
+            "cpus": {
+                "boot_vcpus": hv["cpus"],
+                "max_vcpus": hv["cpus"],
+            },
+            "memory": {
+                "size": hv["memory_bytes"],
+                "shared": True,
+            },
+            "disks": [
+                {
+                    "path": artifacts["rootfs"],
+                    "readonly": True,
+                    "image_type": "Raw",
+                    "backing_files": False,
+                },
+                {
+                    "path": self.paths.data_disk,
+                    "readonly": False,
+                    "image_type": "Raw",
+                    "backing_files": False,
+                    "sparse": True,
+                },
+            ],
+            "fs": [
+                {
+                    "tag": hv["virtiofs_tag"],
+                    "socket": self.paths.virtiofs_sock,
+                    "num_queues": DOCKER_VM_VIRTIOFS_NUM_QUEUES,
+                    "queue_size": DOCKER_VM_VIRTIOFS_QUEUE_SIZE,
+                },
+            ],
+            "vsock": {
+                "cid": DOCKER_VM_VSOCK_CID,
+                "socket": self.paths.ch_vsock_sock,
+            },
+            "rng": {
+                "src": "/dev/urandom",
+            },
+            "serial": {
+                "mode": "Null",
+            },
+            "console": {
+                "mode": "Null",
+            },
+        }
+        if ((self.cloud_hypervisor_major_version or 0) >= 28):
+            payload = {
+                "kernel": artifacts["kernel"],
+                "initramfs": artifacts["initrd"],
+                "cmdline": kernel_cmdline,
+            }
+            config["payload"] = payload
+        else:
+            payload = {
+                "kernel": {
+                    "path": artifacts["kernel"],
+                },
+                "initramfs": {
+                    "path": artifacts["initrd"],
+                },
+                "cmdline": {
+                    "args": kernel_cmdline,
+                },
+            }
+            config.update(payload)
+        return config
+
+    def create_vm(self) -> None:
+        status, body = self.api_request("PUT", "vm.create",
+                                        self.build_vm_config())
+        if status not in (200, 204):
+            raise DockerVmError(
+                f"Cloud Hypervisor vm.create failed with {status}: "
+                f"{body.decode('utf-8', 'replace')}"
+            )
+
+    def boot_vm(self) -> None:
+        status, body = self.api_request("PUT", "vm.boot")
+        if status not in (200, 204):
+            raise DockerVmError(
+                f"Cloud Hypervisor vm.boot failed with {status}: "
+                f"{body.decode('utf-8', 'replace')}"
+            )
+
+    def start(self) -> None:
+        self.ensure_host_prerequisites()
+        self.ensure_runtime_root()
+        self.acquire_lock()
+        self.remove_stale_run_dir()
+        self.create_run_dir()
+        self.write_state("starting")
+        self.ensure_data_disk()
+        try:
+            self.start_virtiofsd()
+            self.start_cloud_hypervisor()
+            self.create_vm()
+            self.boot_vm()
+            self.start_proxy()
+            self.wait_for_docker_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
+            self.write_state(
+                "running",
+                cloud_hypervisor_pid=(self.cloud_hypervisor_proc.pid
+                                      if self.cloud_hypervisor_proc else None),
+                proxy_pid=(self.proxy_proc.pid
+                           if self.proxy_proc else None),
+                virtiofsd_pid=(self.virtiofsd_proc.pid
+                               if self.virtiofsd_proc else None),
+            )
+        except Exception:
+            self.write_state("failed")
+            self.shutdown(clean=False, update_status=False)
+            raise
+
+    def shutdown(self, clean: bool, update_status: bool = True) -> None:
+        if update_status and os.path.exists(self.paths.state):
+            try:
+                self.write_state("stopping")
+            except OSError:
+                pass
+
+        timeout = (
+            DOCKER_VM_FAST_SHUTDOWN_TIMEOUT
+            if clean
+            else DOCKER_VM_SHUTDOWN_TIMEOUT
+        )
+
+        if os.path.exists(self.paths.ch_api_sock):
+            for endpoint in ("vm.shutdown", "vmm.shutdown"):
+                try:
+                    self.api_request("PUT", endpoint)
+                except (OSError, DockerVmError):
+                    pass
+
+        # On normal sandbox exit, prefer fast teardown over a long graceful wait.
+        if clean:
+            for proc in (self.proxy_proc,
+                         self.virtiofsd_proc):
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+
+        deadline = time.time() + timeout
+        for proc in (self.cloud_hypervisor_proc,
+                     self.proxy_proc,
+                     self.virtiofsd_proc):
+            if proc is None:
+                continue
+            while proc.poll() is None and time.time() < deadline:
+                time.sleep(0.1)
+            if proc.poll() is None:
+                proc.terminate()
+
+        for proc in (self.proxy_proc,
+                     self.cloud_hypervisor_proc,
+                     self.virtiofsd_proc):
+            if proc is None:
+                continue
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+
+        if clean and os.path.isdir(self.paths.run):
+            shutil.rmtree(self.paths.run, ignore_errors=True)
+        self.release_lock()
+
+
+def proxy_bidirectional(left: socket.socket, right: socket.socket) -> None:
+    """Copy bytes between two connected sockets until one side closes."""
+    sel = selectors.DefaultSelector()
+    sel.register(left, selectors.EVENT_READ, right)
+    sel.register(right, selectors.EVENT_READ, left)
+    try:
+        while True:
+            events = sel.select()
+            if not events:
+                continue
+            for key, _ in events:
+                src = key.fileobj
+                dst = key.data
+                try:
+                    chunk = src.recv(65536)
+                except ConnectionResetError:
+                    print("docker-vm-proxy: peer reset connection", flush=True)
+                    return
+                if not chunk:
+                    return
+                dst.sendall(chunk)
+    finally:
+        for sock_obj in (left, right):
+            try:
+                sel.unregister(sock_obj)
+            except Exception:
+                pass
+            try:
+                sock_obj.close()
+            except OSError:
+                pass
+
+
+def read_vsock_connect_ack(sock: socket.socket) -> int:
+    """Read the Cloud Hypervisor vsock CONNECT acknowledgment."""
+    sock.settimeout(2.0)
+    data = bytearray()
+    while b"\n" not in data:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        data.extend(chunk)
+        if len(data) > 1024:
+            break
+    line = data.decode("utf-8", "replace").strip()
+    match = re.fullmatch(r"OK (\d+)", line)
+    if not match:
+        raise DockerVmError(
+            f"Unexpected Cloud Hypervisor vsock ack: {line or '<empty>'}"
+        )
+    return int(match.group(1))
+
+
+def handle_docker_vm_proxy_client(client: socket.socket, vsock_socket: str,
+                                  vsock_port: int) -> None:
+    """Bridge one host Unix socket client into the guest Docker vsock port."""
+    try:
+        print(
+            f"docker-vm-proxy: accepted client, connecting to guest vsock port {vsock_port}",
+            flush=True,
+        )
+        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        upstream.connect(vsock_socket)
+        upstream.sendall(f"CONNECT {vsock_port}\n".encode())
+        local_port = read_vsock_connect_ack(upstream)
+        print(
+            "docker-vm-proxy: guest vsock connection established "
+            f"(local port {local_port})",
+            flush=True,
+        )
+    except OSError as exc:
+        print(f"docker-vm-proxy: failed to connect upstream: {exc}", flush=True)
+        client.close()
+        return
+    except DockerVmError as exc:
+        print(f"docker-vm-proxy: failed vsock handshake: {exc}", flush=True)
+        try:
+            upstream.close()
+        except OSError:
+            pass
+        client.close()
+        return
+    proxy_bidirectional(client, upstream)
+
+
+def docker_vm_proxy_main(argv: list[str]) -> int:
+    """Run the host Unix-socket proxy for the project-local Docker VM."""
+    parser = argparse.ArgumentParser(
+        prog="sandbox-wrap __docker-vm-proxy",
+        add_help=True,
+    )
+    parser.add_argument("--listen", required=True)
+    parser.add_argument("--vsock-socket", required=True)
+    parser.add_argument("--vsock-port", type=int, required=True)
+    args = parser.parse_args(argv)
+
+    def _stop(_signum, _frame) -> None:
+        raise SystemExit(0)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _stop)
+
+    if os.path.exists(args.listen):
+        os.unlink(args.listen)
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+        listener.bind(args.listen)
+        os.chmod(args.listen, 0o600)
+        listener.listen()
+        try:
+            while True:
+                client, _ = listener.accept()
+                thread = threading.Thread(
+                    target=handle_docker_vm_proxy_client,
+                    args=(client, args.vsock_socket, args.vsock_port),
+                    daemon=True,
+                )
+                thread.start()
+        finally:
+            try:
+                os.unlink(args.listen)
+            except FileNotFoundError:
+                pass
 
 
 def detect_tool(argv0: str) -> str | None:
@@ -231,20 +1105,6 @@ def acquire_gh_token() -> str | None:
     return None
 
 
-def find_docker_socket() -> str | None:
-    """Find the Docker socket path."""
-    for path in ["/var/run/docker.sock", "/run/docker.sock",
-                 f"/run/user/{os.getuid()}/docker.sock"]:
-        if os.path.exists(path):
-            return path
-    host = os.environ.get("DOCKER_HOST", "")
-    if host.startswith("unix://"):
-        path = host[len("unix://"):]
-        if os.path.exists(path):
-            return path
-    return None
-
-
 def is_core_system_dir(path: str) -> bool:
     """Return True for paths already covered by standard system mounts."""
     core_dirs = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
@@ -310,6 +1170,7 @@ def build_bwrap_args(
     *,
     no_net: bool = False,
     docker: bool = False,
+    docker_socket_path: str | None = None,
     gh_token: str | None = None,
     aws_env: dict[str, str] | None = None,
     extra_ro: list[str] | None = None,
@@ -464,17 +1325,17 @@ def build_bwrap_args(
 
     # -- Docker (opt-in) --
     if docker:
-        sock = find_docker_socket()
-        if sock:
-            # Preserve the discovered socket at its original path so rootless
-            # Docker contexts or DOCKER_HOST values keep working.
-            ensure_ns_dir(args, os.path.dirname(sock), {"/", "/run"})
-            if sock != "/run/docker.sock" and sock != "/var/run/docker.sock":
-                args += ["--bind", sock, sock]
-            args += ["--bind", sock, "/run/docker.sock"]
-            # Also mount at /var/run/docker.sock since many tools look there
-            args += ["--dir", "/var/run"]
-            args += ["--bind", sock, "/var/run/docker.sock"]
+        if not docker_socket_path:
+            raise DockerVmError(
+                "VM-backed Docker requires a project-local Docker socket path")
+        sock = os.path.abspath(docker_socket_path)
+        if not os.path.exists(sock):
+            raise DockerVmError(
+                f"Project-local Docker socket does not exist: {sock}")
+        args += ["--bind", sock, "/run/docker.sock"]
+        # Also mount at /var/run/docker.sock since many tools look there
+        args += ["--dir", "/var/run"]
+        args += ["--bind", sock, "/var/run/docker.sock"]
         docker_config = os.path.expanduser("~/.docker")
         if os.path.isdir(docker_config):
             os.makedirs(os.path.join(sandbox, ".docker"), exist_ok=True)
@@ -549,12 +1410,8 @@ def build_bwrap_args(
     if gh_token:
         env_vars["GH_TOKEN"] = gh_token
 
-    # Preserve DOCKER_HOST for rootless setups when --docker is enabled and
-    # the discovered socket has been mounted at its original path.
     if docker:
-        docker_host = os.environ.get("DOCKER_HOST")
-        if docker_host:
-            env_vars["DOCKER_HOST"] = docker_host
+        env_vars["DOCKER_HOST"] = "unix:///run/docker.sock"
 
     # Pass-through env vars
     for var in (pass_env or []):
@@ -635,7 +1492,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--docker", action="store_true",
-        help="Mount Docker socket and config into the sandbox",
+        help="Start a project-local Docker VM and mount its socket "
+             "into the sandbox",
     )
     parser.add_argument(
         "--gh", action="store_true",
@@ -681,7 +1539,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "__docker-vm-proxy":
+        raise SystemExit(docker_vm_proxy_main(sys.argv[2:]))
+
     args = parse_args(sys.argv)
+    repo_root = os.path.dirname(os.path.realpath(__file__))
 
     # Determine tool
     tool = args.tool or detect_tool(sys.argv[0])
@@ -710,6 +1572,12 @@ def main() -> None:
     # Handle --reset
     sandbox_path = os.path.join(project, ".sandbox")
     if args.reset:
+        docker_vm_root = os.path.join(sandbox_path, DOCKER_VM_DIRNAME)
+        if os.path.isdir(docker_vm_root):
+            manager = DockerVmManager(project, sandbox_path, repo_root)
+            if not manager.reset_is_allowed():
+                die("--reset refused because a Docker sandbox is active "
+                    f"for this project ({docker_vm_root})")
         if os.path.exists(sandbox_path):
             shutil.rmtree(sandbox_path)
             print("Removed .sandbox/")
@@ -743,23 +1611,62 @@ def main() -> None:
             print("warning: --gh specified but could not extract token "
                   "(run 'gh auth login' on the host)", file=sys.stderr)
 
-    # Build bwrap command
-    bwrap_args = build_bwrap_args(
-        project=project,
-        sandbox=sandbox,
-        tool=tool,
-        no_net=args.no_net,
-        docker=args.docker,
-        gh_token=gh_token,
-        aws_env=aws_env,
-        extra_ro=args.ro,
-        extra_rw=args.rw,
-        pass_env=args.pass_env,
-        cli_args=args.extra,
-    )
+    docker_vm: DockerVmManager | None = None
+    if args.docker:
+        docker_vm = DockerVmManager(project, sandbox, repo_root)
+        try:
+            docker_vm.start()
+        except DockerVmError as exc:
+            die(str(exc))
 
-    # Execute
-    os.execvp("bwrap", bwrap_args)
+    # Build bwrap command
+    try:
+        bwrap_args = build_bwrap_args(
+            project=project,
+            sandbox=sandbox,
+            tool=tool,
+            no_net=args.no_net,
+            docker=args.docker,
+            docker_socket_path=(docker_vm.paths.docker_sock
+                                if docker_vm else None),
+            gh_token=gh_token,
+            aws_env=aws_env,
+            extra_ro=args.ro,
+            extra_rw=args.rw,
+            pass_env=args.pass_env,
+            cli_args=args.extra,
+        )
+    except DockerVmError as exc:
+        if docker_vm is not None:
+            docker_vm.shutdown(clean=True)
+        die(str(exc))
+
+    if not args.docker:
+        os.execvp("bwrap", bwrap_args)
+
+    sandbox_proc: subprocess.Popen | None = None
+    old_handlers: dict[int, object] = {}
+
+    def _forward_signal(signum, _frame) -> None:
+        if sandbox_proc is not None and sandbox_proc.poll() is None:
+            sandbox_proc.send_signal(signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        old_handlers[sig] = signal.signal(sig, _forward_signal)
+
+    exit_code = 1
+    try:
+        sandbox_proc = subprocess.Popen(bwrap_args)
+        exit_code = sandbox_proc.wait()
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        if docker_vm is not None:
+            docker_vm.shutdown(clean=True)
+
+    if exit_code < 0:
+        raise SystemExit(128 + (-exit_code))
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

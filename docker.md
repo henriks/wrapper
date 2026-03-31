@@ -1,5 +1,10 @@
 ## Spec: immutable Docker appliance VM using Cloud Hypervisor
 
+Note: this file is now historical design context. The implemented build has
+since pivoted from Debian to a smaller Alpine-based appliance. For the current
+build and runtime behavior, see `docker/README.md`, `docker/OPERATIONS.md`, and
+`docker/runtime-contract.md`.
+
 ### 1) Purpose
 
 This design provides a **host-visible Docker socket** for an agent running on Linux, while keeping the Docker daemon itself **inside a lightweight VM**. The VM is treated as an **immutable, throwaway appliance**: no SSH, no interactive administration, no in-place upgrades, and no persistent mutable state except the Docker data disk and any explicit workspace share. Cloud Hypervisor is a good fit because it is a KVM-based VMM aimed at modern cloud workloads, supports direct kernel boot, a local API socket, `virtio-fs`, and `vsock`. ([GitHub][1])

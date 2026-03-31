@@ -1,6 +1,6 @@
 ---
 id: wra-iyae
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-03-27T21:22:04Z
@@ -36,3 +36,9 @@ The contract explicitly says the VM is not persistent across separate sandbox ru
 
 The contract explicitly says --reset removes all VM assets under .sandbox/docker-vm/.
 
+
+## Notes
+
+**2026-03-27T21:26:46Z**
+
+Captured the runtime contract in docker/runtime-contract.md. Key decisions: one active --docker sandbox per project; VM lifetime is exactly the sandbox lifetime; runtime files live under .sandbox/docker-vm/run/ while docker-data.raw persists under .sandbox/docker-vm/; --reset must refuse while the project lock is held; readiness is an HTTP /_ping over the project-local Unix socket.

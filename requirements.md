@@ -42,7 +42,8 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 4. `.sandbox/` shall NOT be visible inside the sandbox; a tmpfs shall be mounted
    over its path within the project directory mount.
 5. `--reset` shall remove the entire `.sandbox/` directory so the next run
-   starts fresh.
+   starts fresh, except that it must fail if an active Docker VM lock is held
+   for the project.
 6. On first run, the script shall append `.sandbox/` to the project's
    `.gitignore` if not already present.
 
@@ -99,8 +100,9 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 
 1. `--ro PATH` — bind-mount a host path read-only (repeatable).
 2. `--rw PATH` — bind-mount a host path read-write (repeatable).
-3. `--docker` — mount the Docker socket and `~/.docker` config into the
-   sandbox. Docker is NOT mounted by default.
+3. `--docker` — start a project-local Docker VM, mount its Unix socket and
+   `~/.docker` config into the sandbox, and tear the VM down when the sandbox
+   exits. Docker is NOT mounted by default.
 
 ---
 
@@ -204,7 +206,7 @@ Options:
   --project PATH        Project directory (default: $PWD)
   --tool codex|copilot  Explicit tool selection (overrides argv[0])
   --no-net              Disable network access
-  --docker              Mount Docker socket and config
+  --docker              Start a project-local Docker VM and mount its socket
   --aws PROFILE         Acquire temporary AWS credentials via STS
   --ro PATH             Extra read-only bind mount (repeatable)
   --rw PATH             Extra read-write bind mount (repeatable)
