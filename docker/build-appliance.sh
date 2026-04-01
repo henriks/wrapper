@@ -10,7 +10,7 @@ readonly OUT_DIR="${SCRIPT_DIR}/out"
 readonly ROOTFS_IMAGE="${OUT_DIR}/rootfs.raw"
 readonly MANIFEST_PATH="${OUT_DIR}/artifact-manifest.json"
 readonly GUEST_INIT_PATH="${ROOTFS_DIR}/usr/local/sbin/agentvm-init"
-readonly GUEST_BRIDGE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-vsock-bridge"
+readonly GUEST_BRIDGE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-socket-bridge"
 readonly MINIROOTFS_TARBALL="${BUILD_DIR}/alpine-minirootfs.tar.gz"
 
 require_root() {
@@ -36,6 +36,7 @@ require_commands() {
 
 require_version_pins() {
   local required=(
+    DOCKER_TCP_PORT
     DOCKER_ENGINE_VERSION
     LINUX_VIRT_VERSION
     MKINITFS_VERSION
@@ -86,9 +87,9 @@ install_guest_assets() {
     "${ROOTFS_DIR}/usr/local/sbin" \
     "${ROOTFS_DIR}/usr/local/libexec"
   install -m 0755 "${SCRIPT_DIR}/guest-init.sh" "${GUEST_INIT_PATH}"
-  install -m 0755 "${SCRIPT_DIR}/guest-vsock-bridge.py" "${GUEST_BRIDGE_PATH}"
+  install -m 0755 "${SCRIPT_DIR}/guest-socket-bridge.py" "${GUEST_BRIDGE_PATH}"
   cat > "${ROOTFS_DIR}/etc/agentvm.env" <<EOF
-VSOCK_PORT=${VSOCK_PORT}
+DOCKER_TCP_PORT=${DOCKER_TCP_PORT}
 VIRTIOFS_TAG=${VIRTIOFS_TAG}
 EOF
   cat > "${ROOTFS_DIR}/etc/mkinitfs/mkinitfs.conf" <<'EOF'
@@ -128,6 +129,8 @@ EOF
   run_in_chroot "apk add --no-cache docker-engine=${DOCKER_ENGINE_VERSION} linux-virt=${LINUX_VIRT_VERSION} mkinitfs=${MKINITFS_VERSION} python3=${PYTHON3_VERSION} e2fsprogs=${E2FSPROGS_VERSION} iproute2=${IPROUTE2_VERSION} util-linux=${UTIL_LINUX_VERSION}"
   run_in_chroot "kernel_version=\$(basename /lib/modules/*) && mkinitfs -b / \"\${kernel_version}\""
   run_in_chroot "rm -rf /var/cache/apk/* /usr/share/man/* /usr/share/doc/* /usr/share/locale/*"
+  rm -f "${ROOTFS_DIR}/etc/resolv.conf"
+  ln -s /run/resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 }
 
 copy_kernel_artifacts() {
@@ -161,17 +164,17 @@ write_manifest() {
     "initrd": "docker/out/initrd.img",
     "rootfs": "docker/out/rootfs.raw"
   },
-  "cloud_hypervisor": {
+  "vm": {
     "cpus": 2,
     "memory_bytes": 2147483648,
     "root_disk_device": "/dev/vda",
     "docker_data_device": "/dev/vdb",
     "virtiofs_tag": "${VIRTIOFS_TAG}",
-    "vsock_port": ${VSOCK_PORT},
     "kernel_cmdline": "console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
   },
   "guest": {
     "docker_socket": "/var/run/docker.sock",
+    "docker_tcp_port": ${DOCKER_TCP_PORT},
     "workspace_mount": "/workspace",
     "docker_data_mount": "/var/lib/docker"
   },

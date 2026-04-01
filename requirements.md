@@ -101,8 +101,12 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 1. `--ro PATH` — bind-mount a host path read-only (repeatable).
 2. `--rw PATH` — bind-mount a host path read-write (repeatable).
 3. `--docker` — start a project-local Docker VM, mount its Unix socket and
-   `~/.docker` config into the sandbox, and tear the VM down when the sandbox
-   exits. Docker is NOT mounted by default.
+   `~/.docker` config into the sandbox, tear the VM down when the sandbox
+   exits, and provide outbound guest networking by default on Linux hosts via
+   QEMU user-mode networking without requiring sudo. Docker is NOT mounted by
+   default.
+4. `--docker-publish HOST:GUEST` — expose a guest TCP port on
+   `127.0.0.1:HOST` while the Docker VM is running.
 
 ---
 

@@ -72,10 +72,12 @@ automating the lookup against Alpine's official package indexes.
 The guest boots with `init=/usr/local/sbin/agentvm-init`. That init:
 
 - mounts the Docker data disk at `/var/lib/docker`
-- mounts the `virtio-fs` workspace share at `/workspace`
-- starts `containerd` via the `docker-engine` package payload
+- mounts the `virtio-fs` workspace share at the original absolute project path
+  seen by the sandboxed Docker client and keeps `/workspace` as a compatibility
+  alias
+- configures the guest NIC for QEMU user-mode networking
 - starts `dockerd`
-- starts `docker/guest-vsock-bridge.py` to forward a vsock port to
+- starts `docker/guest-socket-bridge.py` to forward a guest TCP port to
   `/var/run/docker.sock`
 
 Persistent Docker state belongs only on the separate sparse Docker data disk.

@@ -8,7 +8,7 @@ type: feature
 priority: 1
 assignee: Henrik Saksela
 parent: wra-hggq
-tags: [docker, vm, cloud-hypervisor]
+tags: [docker, vm, qemu]
 ---
 # Implement project-local Cloud Hypervisor lifecycle management
 
@@ -84,3 +84,11 @@ Live use after the Docker VM path started working exposed an interaction bug wit
 **2026-03-31T20:28:00Z**
 
 Live use also showed the wrapper could linger noticeably after the agent process exited because the shutdown path allowed up to 10 seconds for graceful VM teardown before terminating helper processes. Updated `shutdown(clean=True)` to use a fast-path timeout of 1 second on normal sandbox exit and to terminate the host proxy and virtiofsd immediately while the VM shutdown request is in flight. This preserves the slower path for failed-start diagnostics but makes normal agent exit much more responsive.
+
+**2026-03-31T21:55:00Z**
+
+Implemented first-pass guest networking in the launcher using a project-deterministic TAP interface plus host NAT rather than relying on any Cloud Hypervisor user-mode network backend. The wrapper now computes a private /30 IPv4 allocation per project, creates a user-owned TAP device, enables host IPv4 forwarding, installs either nftables or iptables masquerade/forward rules, and passes static guest network parameters plus a deterministic guest MAC on the kernel cmdline. It also adds repeatable `--docker-publish HOST:GUEST` localhost TCP forwarders implemented as host-side proxies into the guest IP. This path requires root or a live `sudo -v` session because TAP/NAT setup is host-global.
+
+**2026-04-01T09:15:00Z**
+
+Implementation pivot after live use: the Cloud Hypervisor backend plus TAP/NAT path was replaced with QEMU plus unprivileged user-mode networking because a live `sudo` session is not an acceptable runtime precondition for `--docker`. The launcher now starts `qemu-system-x86_64` directly, keeps `virtiofsd`, exposes the project-local Docker socket through QEMU `hostfwd=unix:...`, and maps `--docker-publish HOST:GUEST` to additional QEMU `hostfwd=tcp:127.0.0.1:HOST-...` rules. The guest bridge also pivoted from vsock to a guest TCP listener forwarded into `/var/run/docker.sock`, which removes the need for `/dev/vhost-vsock`, the old host-side Docker proxy process, and all host-global TAP/NAT/firewall setup.

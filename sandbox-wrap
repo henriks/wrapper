@@ -83,11 +83,12 @@ DOCKER_VM_DATA_DISK_FS = "ext4"
 DOCKER_VM_BOOT_TIMEOUT = 60.0
 DOCKER_VM_SHUTDOWN_TIMEOUT = 10.0
 DOCKER_VM_FAST_SHUTDOWN_TIMEOUT = 1.0
-DOCKER_VM_VSOCK_CID = 3
 DOCKER_VM_VIRTIOFS_NUM_QUEUES = 1
 DOCKER_VM_VIRTIOFS_QUEUE_SIZE = 128
-DOCKER_VM_CLOUD_HYPERVISOR_SECCOMP = os.environ.get(
-    "SANDBOX_WRAP_CLOUD_HYPERVISOR_SECCOMP", "false")
+DOCKER_VM_USERNET_PREFIX = 24
+DOCKER_VM_USERNET_HOST_IP = "10.0.2.2"
+DOCKER_VM_USERNET_GUEST_IP = "10.0.2.15"
+DOCKER_VM_USERNET_DNS_IP = "10.0.2.3"
 
 HOST_TOOL_FALLBACKS = {
     "virtiofsd": [
@@ -97,9 +98,9 @@ HOST_TOOL_FALLBACKS = {
         "/usr/local/libexec/virtiofsd",
         "/usr/local/lib/qemu/virtiofsd",
     ],
-    "cloud-hypervisor": [
-        "/usr/local/bin/cloud-hypervisor",
-        "/usr/bin/cloud-hypervisor",
+    "qemu-system-x86_64": [
+        "/usr/local/bin/qemu-system-x86_64",
+        "/usr/bin/qemu-system-x86_64",
     ],
     "mkfs.ext4": [
         "/usr/sbin/mkfs.ext4",
@@ -110,7 +111,7 @@ HOST_TOOL_FALLBACKS = {
 
 HOST_TOOL_ENV_OVERRIDES = {
     "virtiofsd": "SANDBOX_WRAP_VIRTIOFSD_BIN",
-    "cloud-hypervisor": "SANDBOX_WRAP_CLOUD_HYPERVISOR_BIN",
+    "qemu-system-x86_64": "SANDBOX_WRAP_QEMU_BIN",
     "mkfs.ext4": "SANDBOX_WRAP_MKFS_EXT4_BIN",
 }
 
@@ -162,6 +163,28 @@ def read_tail(path: str, max_bytes: int = 4096) -> str:
     except OSError:
         return ""
     return data.decode("utf-8", "replace").strip()
+
+
+def parse_forward_spec(spec: str) -> tuple[int, int]:
+    """Parse HOST_PORT:GUEST_PORT forward specs."""
+    parts = spec.split(":", 1)
+    if len(parts) != 2:
+        raise DockerVmError(
+            f"Invalid --docker-publish value '{spec}', expected HOST:GUEST"
+        )
+    try:
+        host_port = int(parts[0], 10)
+        guest_port = int(parts[1], 10)
+    except ValueError as exc:
+        raise DockerVmError(
+            f"Invalid --docker-publish value '{spec}', expected HOST:GUEST"
+        ) from exc
+    for port in (host_port, guest_port):
+        if port < 1 or port > 65535:
+            raise DockerVmError(
+                f"Invalid --docker-publish value '{spec}', ports must be 1-65535"
+            )
+    return host_port, guest_port
 
 
 def parse_http_response(response: bytes) -> tuple[int, dict[str, str], bytes]:
@@ -226,28 +249,18 @@ def read_http_response_from_socket(sock: socket.socket, context: str
     return status, headers, body
 
 
-def detect_cloud_hypervisor_major_version(binary: str) -> int | None:
-    """Return the Cloud Hypervisor major version from `--version` output."""
-    try:
-        result = subprocess.run(
-            [binary, "--version"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    match = re.search(r"\bv(\d+)(?:\.\d+)?\b", result.stdout)
-    if not match:
-        return None
-    return int(match.group(1))
-
-
 def ensure_kernel_cmdline_rootfstype_ext4(cmdline: str) -> str:
     """Add rootfstype=ext4 when the appliance manifest omits it."""
     if "rootfstype=" in cmdline:
         return cmdline
     return cmdline.replace("root=/dev/vda", "root=/dev/vda rootfstype=ext4", 1)
+
+
+def ensure_kernel_cmdline_console_ttys0(cmdline: str) -> str:
+    """Add console=ttyS0 for host-side guest console capture."""
+    if "console=ttyS0" in cmdline:
+        return cmdline
+    return f"console=ttyS0 {cmdline}"
 
 
 def append_kernel_cmdline_arg(cmdline: str, key: str, value: str) -> str:
@@ -263,6 +276,25 @@ class DockerVmError(RuntimeError):
     """Raised when Docker VM lifecycle management fails."""
 
 
+@dataclass(frozen=True)
+class DockerVmForward:
+    """One localhost TCP forward into the guest."""
+
+    host_port: int
+    guest_port: int
+
+
+@dataclass(frozen=True)
+class DockerVmNetwork:
+    """Guest network parameters for QEMU user-mode networking."""
+
+    guest_ip: str
+    prefix_len: int
+    gateway_ip: str
+    guest_mac: str
+    dns_ip: str
+
+
 @dataclass
 class DockerVmPaths:
     """Project-local paths for the Docker VM runtime."""
@@ -274,33 +306,34 @@ class DockerVmPaths:
     data_disk_meta: str
     state: str
     docker_sock: str
-    ch_api_sock: str
-    ch_vsock_sock: str
     virtiofs_sock: str
-    cloud_hypervisor_pid: str
+    qemu_pid: str
     virtiofsd_pid: str
     proxy_pid: str
-    cloud_hypervisor_log: str
+    qemu_log: str
     virtiofsd_log: str
     proxy_log: str
+    console_log: str
 
 
 @dataclass
 class DockerVmManager:
-    """Manage the per-project Cloud Hypervisor Docker VM runtime."""
+    """Manage the per-project QEMU Docker VM runtime."""
 
     project: str
     sandbox: str
     repo_root: str
+    network_enabled: bool = False
+    published_ports: list[DockerVmForward] = field(default_factory=list)
     paths: DockerVmPaths = field(init=False)
     manifest: dict | None = field(default=None, init=False)
     lock_fd: int | None = field(default=None, init=False)
     virtiofsd_proc: subprocess.Popen | None = field(default=None, init=False)
+    qemu_proc: subprocess.Popen | None = field(default=None, init=False)
     proxy_proc: subprocess.Popen | None = field(default=None, init=False)
-    cloud_hypervisor_proc: subprocess.Popen | None = field(
-        default=None, init=False)
     host_tools: dict[str, str] = field(default_factory=dict, init=False)
-    cloud_hypervisor_major_version: int | None = field(default=None, init=False)
+    network: DockerVmNetwork | None = field(default=None, init=False)
+    host_docker_port: int | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         root = os.path.join(self.sandbox, DOCKER_VM_DIRNAME)
@@ -313,15 +346,14 @@ class DockerVmManager:
             data_disk_meta=os.path.join(root, "docker-data.meta.json"),
             state=os.path.join(run, "state.json"),
             docker_sock=os.path.join(run, "docker.sock"),
-            ch_api_sock=os.path.join(run, "ch-api.sock"),
-            ch_vsock_sock=os.path.join(run, "ch-vsock.sock"),
             virtiofs_sock=os.path.join(run, "virtiofs.sock"),
-            cloud_hypervisor_pid=os.path.join(run, "cloud-hypervisor.pid"),
+            qemu_pid=os.path.join(run, "qemu.pid"),
             virtiofsd_pid=os.path.join(run, "virtiofsd.pid"),
             proxy_pid=os.path.join(run, "proxy.pid"),
-            cloud_hypervisor_log=os.path.join(run, "cloud-hypervisor.log"),
+            qemu_log=os.path.join(run, "qemu.log"),
             virtiofsd_log=os.path.join(run, "virtiofsd.log"),
             proxy_log=os.path.join(run, "proxy.log"),
+            console_log=os.path.join(run, "console.log"),
         )
     def load_manifest(self) -> dict:
         if self.manifest is not None:
@@ -357,7 +389,7 @@ class DockerVmManager:
 
     def ensure_host_prerequisites(self) -> None:
         self.load_manifest()
-        required_bins = ["cloud-hypervisor", "virtiofsd", "mkfs.ext4"]
+        required_bins = ["qemu-system-x86_64", "virtiofsd", "mkfs.ext4"]
         self.host_tools = {}
         missing = []
         for name in required_bins:
@@ -371,22 +403,12 @@ class DockerVmManager:
                 "Missing required Docker VM host tools: "
                 + ", ".join(missing)
             )
-        self.cloud_hypervisor_major_version = detect_cloud_hypervisor_major_version(
-            self.host_tools["cloud-hypervisor"]
-        )
         if not os.path.exists("/dev/kvm"):
             raise DockerVmError("/dev/kvm is required for Docker VM support")
         if not is_rw_accessible("/dev/kvm"):
             raise DockerVmError(
                 "/dev/kvm exists but is not readable/writable by the current "
                 "user")
-        if not os.path.exists("/dev/vhost-vsock"):
-            raise DockerVmError(
-                "/dev/vhost-vsock is required for Docker VM support")
-        if not is_rw_accessible("/dev/vhost-vsock"):
-            raise DockerVmError(
-                "/dev/vhost-vsock exists but is not readable/writable by the "
-                "current user")
 
     def ensure_runtime_root(self) -> None:
         os.makedirs(self.paths.root, exist_ok=True)
@@ -472,6 +494,25 @@ class DockerVmManager:
             json.dump(meta, f, indent=2, sort_keys=True)
             f.write("\n")
 
+    def _compute_network(self) -> DockerVmNetwork:
+        digest = hashlib.sha256(self.project.encode()).hexdigest()
+        guest_mac = "02:fc:%s:%s:%s:%s" % (
+            digest[0:2], digest[2:4], digest[4:6], digest[6:8]
+        )
+        return DockerVmNetwork(
+            guest_ip=DOCKER_VM_USERNET_GUEST_IP,
+            prefix_len=DOCKER_VM_USERNET_PREFIX,
+            gateway_ip=DOCKER_VM_USERNET_HOST_IP,
+            guest_mac=guest_mac,
+            dns_ip=DOCKER_VM_USERNET_DNS_IP,
+        )
+
+    def _allocate_host_docker_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
     def _open_log(self, path: str):
         return open(path, "a")
 
@@ -500,25 +541,135 @@ class DockerVmManager:
         self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
         self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
 
-    def start_cloud_hypervisor(self) -> None:
-        log = self._open_log(self.paths.cloud_hypervisor_log)
-        cmd = [
-            self.host_tools["cloud-hypervisor"],
-            "-v",
-            "--api-socket",
-            f"path={self.paths.ch_api_sock}",
-            "--seccomp",
-            DOCKER_VM_CLOUD_HYPERVISOR_SECCOMP,
+    def _build_hostfwd_specs(self, guest_docker_port: int) -> list[str]:
+        if self.host_docker_port is None:
+            raise DockerVmError("Host Docker forward port was not allocated")
+        specs = [
+            f"hostfwd=tcp:127.0.0.1:{self.host_docker_port}-:{guest_docker_port}"
         ]
-        self.cloud_hypervisor_proc = subprocess.Popen(
-            cmd,
+        if self.network_enabled:
+            for forward in self.published_ports:
+                specs.append(
+                    "hostfwd=tcp:127.0.0.1:"
+                    f"{forward.host_port}-:{forward.guest_port}"
+                )
+        return specs
+
+    def build_qemu_command(self) -> list[str]:
+        manifest = self.load_manifest()
+        artifacts = manifest["artifacts"]
+        vm_cfg = manifest.get("vm")
+        if not vm_cfg:
+            raise DockerVmError(
+                "Docker VM manifest is missing the vm stanza. "
+                "Rebuild the appliance with docker/build-appliance.sh."
+            )
+        guest_cfg = manifest.get("guest", {})
+        guest_docker_port = guest_cfg.get("docker_tcp_port")
+        if guest_docker_port is None:
+            raise DockerVmError(
+                "Docker VM manifest is missing guest.docker_tcp_port. "
+                "Rebuild the appliance with docker/build-appliance.sh."
+            )
+        guest_docker_port = int(guest_docker_port)
+        assert self.network is not None
+
+        kernel_cmdline = ensure_kernel_cmdline_rootfstype_ext4(
+            vm_cfg["kernel_cmdline"]
+        )
+        kernel_cmdline = ensure_kernel_cmdline_console_ttys0(kernel_cmdline)
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_project",
+            self.project,
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_guest_ip",
+            self.network.guest_ip,
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_gateway_ip",
+            self.network.gateway_ip,
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_prefix_len",
+            str(self.network.prefix_len),
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_dns",
+            self.network.dns_ip,
+        )
+        kernel_cmdline = append_kernel_cmdline_arg(
+            kernel_cmdline,
+            "agentvm_guest_mac",
+            self.network.guest_mac,
+        )
+
+        hostfwd_specs = self._build_hostfwd_specs(guest_docker_port)
+        nic_parts = [
+            "user",
+            "id=net0",
+            "model=virtio-net-pci",
+            f"mac={self.network.guest_mac}",
+            "ipv6=off",
+            "hostname=agentvm",
+            f"net=10.0.2.0/{DOCKER_VM_USERNET_PREFIX}",
+            f"host={DOCKER_VM_USERNET_HOST_IP}",
+            f"dns={DOCKER_VM_USERNET_DNS_IP}",
+            f"restrict={'off' if self.network_enabled else 'on'}",
+        ]
+        nic_parts.extend(hostfwd_specs)
+
+        memory_bytes = int(vm_cfg["memory_bytes"])
+        memory_mib = max(1, memory_bytes // (1024 * 1024))
+        return [
+            self.host_tools["qemu-system-x86_64"],
+            "-enable-kvm",
+            "-nodefaults",
+            "-no-user-config",
+            "-no-reboot",
+            "-display", "none",
+            "-serial", f"file:{self.paths.console_log}",
+            "-monitor", "none",
+            "-machine", "q35,accel=kvm,memory-backend=mem",
+            "-object",
+            f"memory-backend-memfd,id=mem,size={memory_bytes},share=on",
+            "-m", str(memory_mib),
+            "-smp", str(vm_cfg["cpus"]),
+            "-kernel", artifacts["kernel"],
+            "-initrd", artifacts["initrd"],
+            "-append", kernel_cmdline,
+            "-drive",
+            f"if=none,file={artifacts['rootfs']},format=raw,readonly=on,id=rootfs",
+            "-device", "virtio-blk-pci,drive=rootfs",
+            "-drive",
+            f"if=none,file={self.paths.data_disk},format=raw,id=dockerdata",
+            "-device", "virtio-blk-pci,drive=dockerdata",
+            "-object", "rng-random,id=rng0,filename=/dev/urandom",
+            "-device", "virtio-rng-pci,rng=rng0",
+            "-chardev",
+            f"socket,id=charfs,path={self.paths.virtiofs_sock}",
+            "-device",
+            "vhost-user-fs-pci,"
+            f"chardev=charfs,tag={vm_cfg['virtiofs_tag']},"
+            f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
+            f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+            "-nic", ",".join(nic_parts),
+        ]
+
+    def start_qemu(self) -> None:
+        log = self._open_log(self.paths.qemu_log)
+        self.qemu_proc = subprocess.Popen(
+            self.build_qemu_command(),
             stdout=log,
             stderr=subprocess.STDOUT,
             close_fds=True,
         )
-        self._write_pid(
-            self.paths.cloud_hypervisor_pid, self.cloud_hypervisor_proc.pid)
-        self.wait_for_api_ready(timeout=10.0)
+        self._write_pid(self.paths.qemu_pid, self.qemu_proc.pid)
 
     def wait_for_path(self, path: str, timeout: float) -> None:
         deadline = time.time() + timeout
@@ -530,66 +681,18 @@ class DockerVmManager:
         raise DockerVmError(f"Timed out waiting for {path}")
 
     def _ensure_processes_alive(self) -> None:
-        for name, proc in (
-            ("virtiofsd", self.virtiofsd_proc),
-            ("docker-vm-proxy", self.proxy_proc),
-            ("cloud-hypervisor", self.cloud_hypervisor_proc),
-        ):
+        processes: list[tuple[str, subprocess.Popen | None, str]] = [
+            ("virtiofsd", self.virtiofsd_proc, self.paths.virtiofsd_log),
+            ("qemu", self.qemu_proc, self.paths.qemu_log),
+            ("docker-vm-proxy", self.proxy_proc, self.paths.proxy_log),
+        ]
+        for name, proc, log_path in processes:
             if proc is not None and proc.poll() is not None:
-                log_path = ""
-                if name == "virtiofsd":
-                    log_path = self.paths.virtiofsd_log
-                elif name == "docker-vm-proxy":
-                    log_path = self.paths.proxy_log
-                elif name == "cloud-hypervisor":
-                    log_path = self.paths.cloud_hypervisor_log
                 log_tail = read_tail(log_path)
                 detail = f"{name} exited unexpectedly"
                 if log_tail:
                     detail += f":\n{log_tail}"
                 raise DockerVmError(detail)
-
-    def api_request(self, method: str, endpoint: str,
-                    body: dict | None = None) -> tuple[int, bytes]:
-        payload = b""
-        headers = []
-        if body is not None:
-            payload = json.dumps(body).encode()
-            headers.append(b"Content-Type: application/json")
-            headers.append(f"Content-Length: {len(payload)}".encode())
-        request = [
-            f"{method} /api/v1/{endpoint} HTTP/1.1".encode(),
-            b"Host: localhost",
-            b"Accept: application/json",
-        ]
-        request.extend(headers)
-        request.append(b"Connection: close")
-        raw = b"\r\n".join(request) + b"\r\n\r\n" + payload
-
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.connect(self.paths.ch_api_sock)
-            sock.sendall(raw)
-            status_code, _headers, body_blob = read_http_response_from_socket(
-                sock, f"Cloud Hypervisor API endpoint {endpoint}")
-        return status_code, body_blob
-
-    def wait_for_api_ready(self, timeout: float) -> None:
-        deadline = time.time() + timeout
-        last_error: str | None = None
-        while time.time() < deadline:
-            if os.path.exists(self.paths.ch_api_sock):
-                try:
-                    status, _ = self.api_request("GET", "vmm.ping")
-                    if status == 200:
-                        return
-                except (OSError, DockerVmError) as exc:
-                    last_error = str(exc)
-            self._ensure_processes_alive()
-            time.sleep(0.1)
-        detail = "Timed out waiting for Cloud Hypervisor API"
-        if last_error:
-            detail += f" (last probe error: {last_error})"
-        raise DockerVmError(detail)
 
     def unix_http_request(self, sock_path: str, request: bytes
                           ) -> tuple[int, bytes]:
@@ -601,6 +704,8 @@ class DockerVmManager:
         return status_code, body_blob
 
     def start_proxy(self) -> None:
+        if self.host_docker_port is None:
+            raise DockerVmError("Host Docker forward port was not allocated")
         log = self._open_log(self.paths.proxy_log)
         wrapper_script = os.path.join(self.repo_root, "sandbox-wrap")
         cmd = [
@@ -610,10 +715,10 @@ class DockerVmManager:
             "__docker-vm-proxy",
             "--listen",
             self.paths.docker_sock,
-            "--vsock-socket",
-            self.paths.ch_vsock_sock,
-            "--vsock-port",
-            str(self.manifest["cloud_hypervisor"]["vsock_port"]),
+            "--target-host",
+            "127.0.0.1",
+            "--target-port",
+            str(self.host_docker_port),
         ]
         self.proxy_proc = subprocess.Popen(
             cmd,
@@ -647,103 +752,6 @@ class DockerVmManager:
             detail += f" (last probe error: {last_error})"
         raise DockerVmError(detail)
 
-    def build_vm_config(self) -> dict:
-        manifest = self.load_manifest()
-        artifacts = manifest["artifacts"]
-        hv = manifest["cloud_hypervisor"]
-        kernel_cmdline = ensure_kernel_cmdline_rootfstype_ext4(
-            hv["kernel_cmdline"]
-        )
-        kernel_cmdline = append_kernel_cmdline_arg(
-            kernel_cmdline,
-            "agentvm_project",
-            self.project,
-        )
-        config = {
-            "cpus": {
-                "boot_vcpus": hv["cpus"],
-                "max_vcpus": hv["cpus"],
-            },
-            "memory": {
-                "size": hv["memory_bytes"],
-                "shared": True,
-            },
-            "disks": [
-                {
-                    "path": artifacts["rootfs"],
-                    "readonly": True,
-                    "image_type": "Raw",
-                    "backing_files": False,
-                },
-                {
-                    "path": self.paths.data_disk,
-                    "readonly": False,
-                    "image_type": "Raw",
-                    "backing_files": False,
-                    "sparse": True,
-                },
-            ],
-            "fs": [
-                {
-                    "tag": hv["virtiofs_tag"],
-                    "socket": self.paths.virtiofs_sock,
-                    "num_queues": DOCKER_VM_VIRTIOFS_NUM_QUEUES,
-                    "queue_size": DOCKER_VM_VIRTIOFS_QUEUE_SIZE,
-                },
-            ],
-            "vsock": {
-                "cid": DOCKER_VM_VSOCK_CID,
-                "socket": self.paths.ch_vsock_sock,
-            },
-            "rng": {
-                "src": "/dev/urandom",
-            },
-            "serial": {
-                "mode": "Null",
-            },
-            "console": {
-                "mode": "Null",
-            },
-        }
-        if ((self.cloud_hypervisor_major_version or 0) >= 28):
-            payload = {
-                "kernel": artifacts["kernel"],
-                "initramfs": artifacts["initrd"],
-                "cmdline": kernel_cmdline,
-            }
-            config["payload"] = payload
-        else:
-            payload = {
-                "kernel": {
-                    "path": artifacts["kernel"],
-                },
-                "initramfs": {
-                    "path": artifacts["initrd"],
-                },
-                "cmdline": {
-                    "args": kernel_cmdline,
-                },
-            }
-            config.update(payload)
-        return config
-
-    def create_vm(self) -> None:
-        status, body = self.api_request("PUT", "vm.create",
-                                        self.build_vm_config())
-        if status not in (200, 204):
-            raise DockerVmError(
-                f"Cloud Hypervisor vm.create failed with {status}: "
-                f"{body.decode('utf-8', 'replace')}"
-            )
-
-    def boot_vm(self) -> None:
-        status, body = self.api_request("PUT", "vm.boot")
-        if status not in (200, 204):
-            raise DockerVmError(
-                f"Cloud Hypervisor vm.boot failed with {status}: "
-                f"{body.decode('utf-8', 'replace')}"
-            )
-
     def start(self) -> None:
         self.ensure_host_prerequisites()
         self.ensure_runtime_root()
@@ -752,21 +760,25 @@ class DockerVmManager:
         self.create_run_dir()
         self.write_state("starting")
         self.ensure_data_disk()
+        self.network = self._compute_network()
+        self.host_docker_port = self._allocate_host_docker_port()
         try:
             self.start_virtiofsd()
-            self.start_cloud_hypervisor()
-            self.create_vm()
-            self.boot_vm()
+            self.start_qemu()
             self.start_proxy()
             self.wait_for_docker_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
             self.write_state(
                 "running",
-                cloud_hypervisor_pid=(self.cloud_hypervisor_proc.pid
-                                      if self.cloud_hypervisor_proc else None),
-                proxy_pid=(self.proxy_proc.pid
-                           if self.proxy_proc else None),
+                qemu_pid=(self.qemu_proc.pid if self.qemu_proc else None),
                 virtiofsd_pid=(self.virtiofsd_proc.pid
                                if self.virtiofsd_proc else None),
+                proxy_pid=(self.proxy_proc.pid if self.proxy_proc else None),
+                host_docker_port=self.host_docker_port,
+                guest_network=(vars(self.network) if self.network else None),
+                outbound_network=("enabled" if self.network_enabled
+                                  else "restricted"),
+                published_ports=([vars(p) for p in self.published_ports]
+                                 if self.published_ports else []),
             )
         except Exception:
             self.write_state("failed")
@@ -786,24 +798,14 @@ class DockerVmManager:
             else DOCKER_VM_SHUTDOWN_TIMEOUT
         )
 
-        if os.path.exists(self.paths.ch_api_sock):
-            for endpoint in ("vm.shutdown", "vmm.shutdown"):
-                try:
-                    self.api_request("PUT", endpoint)
-                except (OSError, DockerVmError):
-                    pass
-
         # On normal sandbox exit, prefer fast teardown over a long graceful wait.
         if clean:
-            for proc in (self.proxy_proc,
-                         self.virtiofsd_proc):
+            for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
                 if proc is not None and proc.poll() is None:
                     proc.terminate()
 
         deadline = time.time() + timeout
-        for proc in (self.cloud_hypervisor_proc,
-                     self.proxy_proc,
-                     self.virtiofsd_proc):
+        for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
             if proc is None:
                 continue
             while proc.poll() is None and time.time() < deadline:
@@ -811,9 +813,7 @@ class DockerVmManager:
             if proc.poll() is None:
                 proc.terminate()
 
-        for proc in (self.proxy_proc,
-                     self.cloud_hypervisor_proc,
-                     self.virtiofsd_proc):
+        for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
             if proc is None:
                 continue
             try:
@@ -827,26 +827,55 @@ class DockerVmManager:
         self.release_lock()
 
 
-def proxy_bidirectional(left: socket.socket, right: socket.socket) -> None:
-    """Copy bytes between two connected sockets until one side closes."""
+def proxy_bidirectional(left: socket.socket, right: socket.socket,
+                        left_name: str = "left", right_name: str = "right"
+                        ) -> None:
+    """Copy bytes between two connected sockets with TCP-style half-close."""
     sel = selectors.DefaultSelector()
     sel.register(left, selectors.EVENT_READ, right)
     sel.register(right, selectors.EVENT_READ, left)
+    closed_read: set[socket.socket] = set()
+    names = {left: left_name, right: right_name}
     try:
-        while True:
+        while len(closed_read) < 2:
             events = sel.select()
             if not events:
                 continue
             for key, _ in events:
                 src = key.fileobj
+                if src in closed_read:
+                    continue
                 dst = key.data
                 try:
                     chunk = src.recv(65536)
                 except ConnectionResetError:
-                    print("docker-vm-proxy: peer reset connection", flush=True)
-                    return
+                    print(
+                        "docker-vm-proxy: peer reset connection on "
+                        f"{names[src]}",
+                        flush=True,
+                    )
+                    chunk = b""
                 if not chunk:
-                    return
+                    print(
+                        f"docker-vm-proxy: EOF on {names[src]}, "
+                        f"shutting down write side of {names[dst]}",
+                        flush=True,
+                    )
+                    closed_read.add(src)
+                    try:
+                        sel.unregister(src)
+                    except Exception:
+                        pass
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    continue
+                print(
+                    f"docker-vm-proxy: relaying {len(chunk)} bytes "
+                    f"{names[src]} -> {names[dst]}",
+                    flush=True,
+                )
                 dst.sendall(chunk)
     finally:
         for sock_obj in (left, right):
@@ -860,56 +889,22 @@ def proxy_bidirectional(left: socket.socket, right: socket.socket) -> None:
                 pass
 
 
-def read_vsock_connect_ack(sock: socket.socket) -> int:
-    """Read the Cloud Hypervisor vsock CONNECT acknowledgment."""
-    sock.settimeout(2.0)
-    data = bytearray()
-    while b"\n" not in data:
-        chunk = sock.recv(1024)
-        if not chunk:
-            break
-        data.extend(chunk)
-        if len(data) > 1024:
-            break
-    line = data.decode("utf-8", "replace").strip()
-    match = re.fullmatch(r"OK (\d+)", line)
-    if not match:
-        raise DockerVmError(
-            f"Unexpected Cloud Hypervisor vsock ack: {line or '<empty>'}"
-        )
-    return int(match.group(1))
-
-
-def handle_docker_vm_proxy_client(client: socket.socket, vsock_socket: str,
-                                  vsock_port: int) -> None:
-    """Bridge one host Unix socket client into the guest Docker vsock port."""
+def handle_docker_vm_proxy_client(client: socket.socket, target_host: str,
+                                  target_port: int) -> None:
+    """Bridge one host Unix socket client into the forwarded guest Docker TCP port."""
     try:
         print(
-            f"docker-vm-proxy: accepted client, connecting to guest vsock port {vsock_port}",
+            "docker-vm-proxy: accepted client, connecting to "
+            f"{target_host}:{target_port}",
             flush=True,
         )
-        upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        upstream.connect(vsock_socket)
-        upstream.sendall(f"CONNECT {vsock_port}\n".encode())
-        local_port = read_vsock_connect_ack(upstream)
-        print(
-            "docker-vm-proxy: guest vsock connection established "
-            f"(local port {local_port})",
-            flush=True,
-        )
+        upstream = socket.create_connection((target_host, target_port), timeout=2.0)
+        print("docker-vm-proxy: upstream tcp connection established", flush=True)
     except OSError as exc:
         print(f"docker-vm-proxy: failed to connect upstream: {exc}", flush=True)
         client.close()
         return
-    except DockerVmError as exc:
-        print(f"docker-vm-proxy: failed vsock handshake: {exc}", flush=True)
-        try:
-            upstream.close()
-        except OSError:
-            pass
-        client.close()
-        return
-    proxy_bidirectional(client, upstream)
+    proxy_bidirectional(client, upstream, "client", "upstream")
 
 
 def docker_vm_proxy_main(argv: list[str]) -> int:
@@ -919,8 +914,8 @@ def docker_vm_proxy_main(argv: list[str]) -> int:
         add_help=True,
     )
     parser.add_argument("--listen", required=True)
-    parser.add_argument("--vsock-socket", required=True)
-    parser.add_argument("--vsock-port", type=int, required=True)
+    parser.add_argument("--target-host", required=True)
+    parser.add_argument("--target-port", type=int, required=True)
     args = parser.parse_args(argv)
 
     def _stop(_signum, _frame) -> None:
@@ -941,7 +936,7 @@ def docker_vm_proxy_main(argv: list[str]) -> int:
                 client, _ = listener.accept()
                 thread = threading.Thread(
                     target=handle_docker_vm_proxy_client,
-                    args=(client, args.vsock_socket, args.vsock_port),
+                    args=(client, args.target_host, args.target_port),
                     daemon=True,
                 )
                 thread.start()
@@ -1496,6 +1491,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "into the sandbox",
     )
     parser.add_argument(
+        "--docker-publish", action="append", default=[], metavar="HOST:GUEST",
+        help="Expose guest TCP port GUEST on host localhost:HOST "
+             "(repeatable, Docker VM only)",
+    )
+    parser.add_argument(
         "--gh", action="store_true",
         help="Mount gh config (read-only) and pass auth token into sandbox",
     )
@@ -1613,7 +1613,20 @@ def main() -> None:
 
     docker_vm: DockerVmManager | None = None
     if args.docker:
-        docker_vm = DockerVmManager(project, sandbox, repo_root)
+        if args.docker_publish and args.no_net:
+            die("--docker-publish requires Docker VM networking; "
+                "do not combine it with --no-net")
+        published_ports = [
+            DockerVmForward(*parse_forward_spec(spec))
+            for spec in args.docker_publish
+        ]
+        docker_vm = DockerVmManager(
+            project,
+            sandbox,
+            repo_root,
+            network_enabled=not args.no_net,
+            published_ports=published_ports,
+        )
         try:
             docker_vm.start()
         except DockerVmError as exc:

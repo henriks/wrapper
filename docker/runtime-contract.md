@@ -10,8 +10,7 @@ This document defines the host-side runtime contract for VM-backed Docker in
 - The VM is terminated when the sandbox exits normally or due to a signal.
 - Persistent Docker state is limited to the sparse data disk under
   `.sandbox/docker-vm/`.
-- v1 supports Linux hosts with KVM, Cloud Hypervisor, `virtiofsd`, and
-  `vhost-vsock`.
+- v1 supports Linux hosts with KVM, QEMU, and `virtiofsd`.
 
 ## Runtime Root
 
@@ -31,23 +30,18 @@ Layout:
   run/
     state.json
     docker.sock
-    ch-api.sock
-    ch-vsock.sock
     virtiofs.sock
-    cloud-hypervisor.pid
+    qemu.pid
     virtiofsd.pid
-    proxy.pid
-    cloud-hypervisor.log
+    qemu.log
     virtiofsd.log
-    proxy.log
 ```
 
 Rules:
 
 - `docker-data.raw` is the persistent sparse raw disk mounted in the guest at
   `/var/lib/docker`.
-- `docker-data.meta.json` is persistent metadata for the disk. It must record
-  at least the format version, logical size in bytes, and filesystem type.
+- `docker-data.meta.json` is persistent metadata for the disk.
 - `lock` is the project-level lock file used to prevent concurrent Docker VM
   launches for the same project.
 - `run/` contains transient files for the active sandbox run.
@@ -65,7 +59,7 @@ State machine:
 - `absent`: `.sandbox/docker-vm/run/` does not exist and no lock is held.
 - `starting`: lock is held, `run/` exists, child processes are being started,
   `state.json` has `"status": "starting"`.
-- `running`: host proxy socket exists, Docker readiness check passes, and
+- `running`: host Docker socket exists, Docker readiness check passes, and
   `state.json` has `"status": "running"`.
 - `stopping`: shutdown has started, `state.json` has `"status": "stopping"`.
 - `failed`: startup or runtime supervision failed before clean teardown;
@@ -75,13 +69,13 @@ Transitions:
 
 - `absent -> starting`: wrapper acquires `lock`, removes stale `run/`, creates
   a new `run/`, writes initial `state.json`, and starts helper processes.
-- `starting -> running`: Cloud Hypervisor, `virtiofsd`, and the host proxy are
-  all up and the Docker readiness check succeeds.
-- `starting -> failed`: any required child process exits early, VM boot times
-  out, or readiness check fails.
+- `starting -> running`: QEMU and `virtiofsd` are up and the Docker readiness
+  check succeeds through `.sandbox/docker-vm/run/docker.sock`.
+- `starting -> failed`: any required child process exits early or readiness
+  check fails.
 - `running -> stopping`: sandbox process exits, parent receives `SIGINT`,
   `SIGTERM`, `SIGHUP`, or wrapper detects loss of the sandbox child.
-- `stopping -> absent`: guest shutdown and host cleanup complete.
+- `stopping -> absent`: host cleanup completes.
 - `failed -> absent`: next launch or `--reset` removes stale runtime files.
 
 ## Startup Sequence
@@ -99,10 +93,14 @@ Required sequence:
 6. Ensure `docker-data.raw` and `docker-data.meta.json` exist.
 7. Create `.sandbox/docker-vm/run/`.
 8. Start `virtiofsd`.
-9. Start Cloud Hypervisor and create the VM through its API socket.
-10. Start the host Unix-socket proxy.
-11. Wait for Docker readiness.
-12. Launch `bwrap`, mounting only `.sandbox/docker-vm/run/docker.sock` at
+9. Start QEMU with:
+   - read-only root disk
+   - persistent Docker data disk
+   - virtio-fs workspace sharing
+   - user-mode networking
+   - a host Unix-socket forward at `.sandbox/docker-vm/run/docker.sock`
+10. Wait for Docker readiness through that Unix socket.
+11. Launch `bwrap`, mounting only `.sandbox/docker-vm/run/docker.sock` at
     `/run/docker.sock` and `/var/run/docker.sock`.
 
 Important implication for implementation:
@@ -116,7 +114,7 @@ Important implication for implementation:
 The VM is considered ready only when all of these are true:
 
 - `.sandbox/docker-vm/run/docker.sock` exists.
-- The host proxy process is alive.
+- QEMU is alive.
 - An HTTP `GET /_ping` over the Unix socket returns success from the guest
   Docker daemon.
 
@@ -136,13 +134,10 @@ termination signal.
 Required order:
 
 1. Mark `state.json` as `stopping`.
-2. Ask Cloud Hypervisor to shut the VM down through its API socket.
-3. Wait up to 10 seconds for Cloud Hypervisor to exit.
-4. If the VM or helper processes are still alive, send `SIGTERM`.
-5. If they still remain, send `SIGKILL`.
-6. Remove `docker.sock`, `ch-api.sock`, `ch-vsock.sock`, `virtiofs.sock`, all
-   PID files, and the rest of `run/`.
-7. Release the project lock.
+2. Terminate QEMU and `virtiofsd`.
+3. Wait up to 10 seconds before sending `SIGKILL`.
+4. Remove `docker.sock`, `virtiofs.sock`, PID files, and the rest of `run/`.
+5. Release the project lock.
 
 Clean exit removes `run/` entirely.
 
@@ -166,15 +161,3 @@ v1 allows at most one active `--docker` sandbox per project.
 - If `.sandbox/docker-vm/lock` is currently held, `--reset` must fail with a
   clear error instead of removing active VM state.
 - If no lock is held, `--reset` removes the full `.sandbox/` directory.
-
-## Downstream Contract For Later Tickets
-
-- The image-build ticket must produce immutable appliance artifacts consumable
-  by the launcher, but those artifacts are not stored in `.sandbox/docker-vm/`.
-- The launcher ticket must implement the supervisor model described here rather
-  than a detached background daemon.
-- The socket-proxy ticket must expose exactly one host-visible socket at
-  `.sandbox/docker-vm/run/docker.sock`.
-- The `sandbox-wrap` integration ticket must replace direct host Docker socket
-  mounting and must run `bwrap` as a supervised child process when `--docker`
-  is enabled.

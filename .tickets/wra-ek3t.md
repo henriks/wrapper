@@ -42,3 +42,11 @@ Behavior is now implemented: --docker means VM-backed Docker only; the wrapper s
 **2026-03-27T22:05:06Z**
 
 Updated the written docs to match the implemented VM-backed Docker behavior. Added docker/OPERATIONS.md covering host prerequisites, runtime layout under .sandbox/docker-vm/, start/stop flow, lock-aware --reset semantics, and troubleshooting. Updated docker/README.md to point to the runtime docs, added a historical-context note to docker.md because the implementation pivoted from Debian to Alpine, and updated requirements.md so --docker now means project-local Docker VM rather than direct host socket mounting.
+
+**2026-03-31T21:55:00Z**
+
+Documentation follow-up after adding guest networking: `docker/OPERATIONS.md` now documents the TAP + NAT model, the extra host prerequisites (`ip`, `sysctl`, and `nft` or `iptables`), the need for a live `sudo -v` session when not running as root, and the new `--docker-publish HOST:GUEST` localhost TCP forward flag. `docker/README.md` now describes the guest mounting the workspace at the original project path plus `/workspace`, and `requirements.md` was updated so the Docker VM networking behavior is part of the stated requirements.
+
+**2026-04-01T09:16:00Z**
+
+Documentation pivot after replacing the privileged networking path: `docker/OPERATIONS.md`, `docker/runtime-contract.md`, `docker/README.md`, and `requirements.md` now describe the QEMU backend, unprivileged user-mode networking, the project-local Docker Unix socket exposed through QEMU `hostfwd=unix:...`, and `--docker-publish HOST:GUEST` as QEMU localhost TCP forwards. The old Cloud Hypervisor/TAP/NAT/sudo prerequisites were removed from the current docs because they are no longer part of the supported implementation.

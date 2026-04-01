@@ -6,10 +6,13 @@ This document describes the current VM-backed Docker behavior implemented in
 ## Summary
 
 - `--docker` means VM-backed Docker only.
-- The wrapper starts a project-local Cloud Hypervisor VM before launching
-  `bwrap`.
+- The wrapper starts a project-local QEMU VM before launching `bwrap`.
 - The sandbox sees only the project-local Docker socket at
   `/run/docker.sock` and `/var/run/docker.sock`.
+- Outbound guest networking uses QEMU user-mode networking, so no `sudo`,
+  TAP, `iptables`, or `nft` setup is required.
+- `--docker-publish HOST:GUEST` exposes a guest TCP port on
+  `127.0.0.1:HOST` through QEMU `hostfwd`.
 - The wrapper shuts the VM down when the sandbox exits.
 - Persistent Docker state lives in `.sandbox/docker-vm/docker-data.raw`.
 
@@ -20,11 +23,10 @@ Required on the host:
 - Linux
 - `bwrap`
 - `mise`
-- `cloud-hypervisor`
+- `qemu-system-x86_64`
 - `virtiofsd`
 - `mkfs.ext4`
 - `/dev/kvm`
-- `/dev/vhost-vsock`
 
 The appliance artifacts must also exist under `docker/out/`. Build them with:
 
@@ -51,15 +53,11 @@ Files:
   run/
     state.json
     docker.sock
-    ch-api.sock
-    ch-vsock.sock
     virtiofs.sock
-    cloud-hypervisor.pid
+    qemu.pid
     virtiofsd.pid
-    proxy.pid
-    cloud-hypervisor.log
+    qemu.log
     virtiofsd.log
-    proxy.log
 ```
 
 Meaning:
@@ -78,12 +76,14 @@ Normal flow:
 1. `sandbox-wrap --docker` acquires the project lock.
 2. It creates `.sandbox/docker-vm/run/`.
 3. It starts `virtiofsd`.
-4. It starts Cloud Hypervisor and creates/boots the VM from
-   `docker/out/artifact-manifest.json`.
-5. It starts the host-side proxy at `.sandbox/docker-vm/run/docker.sock`.
-6. It waits for Docker `GET /_ping` to succeed through that socket.
-7. It launches `bwrap` as a child process.
-8. When the sandbox exits, the wrapper shuts the VM and helper processes down
+4. It starts QEMU from `docker/out/artifact-manifest.json`.
+5. QEMU exposes `.sandbox/docker-vm/run/docker.sock` as a host Unix socket
+   that forwards to the guest Docker bridge.
+6. The wrapper waits for Docker `GET /_ping` to succeed through that socket.
+7. If `--docker-publish` was used, the same QEMU user-network backend exposes
+   those forwarded TCP ports on `127.0.0.1`.
+8. It launches `bwrap` as a child process.
+9. When the sandbox exits, the wrapper terminates the VM and helper processes
    and removes `.sandbox/docker-vm/run/`.
 
 Failure flow:
@@ -92,6 +92,17 @@ Failure flow:
   files in place for inspection.
 - The next `--docker` launch removes that stale `run/` directory before
   retrying.
+
+## Networking
+
+The Docker VM always has a QEMU user-network NIC because that is also how the
+host Docker socket is exposed into the guest.
+
+- With normal `--docker`, outbound guest networking is enabled.
+- With `--docker --no-net`, the VM still boots with the same internal NIC and
+  Docker socket forward, but guest egress is restricted by QEMU user-network.
+- `--docker-publish HOST:GUEST` adds extra QEMU `hostfwd` rules. These are not
+  available with `--no-net`.
 
 ## Reset Behavior
 
@@ -110,26 +121,22 @@ Safety rule:
 
 Common failures:
 
-- `Missing required Docker VM host tools: cloud-hypervisor, virtiofsd`
+- `Missing required Docker VM host tools: qemu-system-x86_64, virtiofsd`
   Install the missing host binaries before using `--docker`.
 - `/dev/kvm is required for Docker VM support`
   KVM is not available on the host.
-- `/dev/vhost-vsock is required for Docker VM support`
-  Host vsock support is missing.
-- `Docker VM artifact manifest is missing`
-  Run `docker/build-appliance.sh`.
-- Cloud Hypervisor dies with `SIGSYS` or a seccomp violation on the first API
-  request
-  The wrapper currently starts Cloud Hypervisor with `--seccomp false` by
-  default for compatibility. Override this with
-  `SANDBOX_WRAP_CLOUD_HYPERVISOR_SECCOMP=true` only if seccomp is known to work
-  on the host.
+- `Docker VM manifest is missing the vm stanza`
+  Rebuild the appliance with `docker/build-appliance.sh`.
+- `Docker VM manifest is missing guest.docker_tcp_port`
+  Rebuild the appliance with `docker/build-appliance.sh`.
 - Docker startup timeout
   Inspect:
-  - `.sandbox/docker-vm/run/cloud-hypervisor.log`
+  - `.sandbox/docker-vm/run/qemu.log`
   - `.sandbox/docker-vm/run/virtiofsd.log`
-  - `.sandbox/docker-vm/run/proxy.log`
   - `.sandbox/docker-vm/run/state.json`
+- Registry pull or container egress failures
+  Inspect `.sandbox/docker-vm/run/qemu.log` and the guest logs mirrored into
+  the workspace under `.sandbox/docker-vm/run/guest-*.log`.
 
 Manual cleanup:
 
