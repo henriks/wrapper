@@ -4,9 +4,12 @@ set -eu
 . /etc/agentvm.env
 
 readonly DOCKER_TCP_PORT
+readonly PAYLOAD_TCP_PORT
 readonly VIRTIOFS_TAG
+readonly CONFIG_VIRTIOFS_TAG
 readonly GUEST_DOCKERD_LOG=/run/dockerd.log
 readonly GUEST_SOCKET_BRIDGE_LOG=/run/socket-bridge.log
+readonly GUEST_PAYLOAD_SERVER_LOG=/run/payload-server.log
 
 log() {
   echo "agentvm-init: $*"
@@ -46,6 +49,34 @@ load_kernel_module() {
   fi
 }
 
+mount_extra_share() {
+  tag="$1"
+  kind="$2"
+  target="$3"
+  basename_part="$4"
+
+  case "${target}" in
+    /*) ;;
+    *)
+      log "warning: ignoring invalid share target ${target}"
+      return 0
+      ;;
+  esac
+
+  if [ "${kind}" = "dir" ]; then
+    mkdir -p "${target}"
+    mount -t virtiofs "${tag}" "${target}"
+    return 0
+  fi
+
+  temp_mount="/run/agentvm-share-mnts/${tag}"
+  mkdir -p "${temp_mount}"
+  mount -t virtiofs "${tag}" "${temp_mount}"
+  mkdir -p "$(dirname "${target}")"
+  : > "${target}"
+  mount --bind "${temp_mount}/${basename_part}" "${target}"
+}
+
 mirror_log_to_workspace() {
   src="$1"
   dst="$2"
@@ -69,7 +100,7 @@ dump_log_if_present() {
 
 wait_for_critical_exit() {
   while :; do
-    for pid in "${DOCKERD_PID}" "${BRIDGE_PID}"; do
+    for pid in "${DOCKERD_PID}" "${BRIDGE_PID}" "${PAYLOAD_SERVER_PID}"; do
       if ! kill -0 "${pid}" 2>/dev/null; then
         return 0
       fi
@@ -79,6 +110,9 @@ wait_for_critical_exit() {
 }
 
 teardown() {
+  if [ -n "${PAYLOAD_SERVER_PID:-}" ]; then
+    kill "${PAYLOAD_SERVER_PID}" 2>/dev/null || true
+  fi
   if [ -n "${BRIDGE_PID:-}" ]; then
     kill "${BRIDGE_PID}" 2>/dev/null || true
   fi
@@ -108,14 +142,18 @@ case "${PROJECT_PATH}" in
     ;;
 esac
 
-mkdir -p /proc /sys /dev /run /tmp /workspace /var/lib/docker /var/log /sys/fs/cgroup
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /workspace /var/lib/docker /var/log /sys/fs/cgroup
 mount -t proc proc /proc || true
 mount -t sysfs sysfs /sys || true
 mount -t devtmpfs devtmpfs /dev || true
+mount -t devpts devpts /dev/pts || true
+ln -sf /dev/pts/ptmx /dev/ptmx
 mount -t cgroup2 none /sys/fs/cgroup || true
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mount /dev/vdb /var/lib/docker
+mkdir -p /run/agentvm-config /run/agentvm-share-mnts
+mount -t virtiofs "${CONFIG_VIRTIOFS_TAG}" /run/agentvm-config
 
 case "${PROJECT_PATH}" in
   /home/*)
@@ -132,17 +170,30 @@ esac
 HOST_RUN_DIR=${PROJECT_PATH}/.sandbox/docker-vm/run
 HOST_DOCKERD_LOG=${HOST_RUN_DIR}/guest-dockerd.log
 HOST_SOCKET_BRIDGE_LOG=${HOST_RUN_DIR}/guest-socket-bridge.log
-readonly PROJECT_PATH HOST_RUN_DIR HOST_DOCKERD_LOG HOST_SOCKET_BRIDGE_LOG
+HOST_PAYLOAD_SERVER_LOG=${HOST_RUN_DIR}/guest-payload-server.log
+readonly \
+  PROJECT_PATH \
+  HOST_RUN_DIR \
+  HOST_DOCKERD_LOG \
+  HOST_SOCKET_BRIDGE_LOG \
+  HOST_PAYLOAD_SERVER_LOG
 
 mkdir -p "${PROJECT_PATH}"
 mount -t virtiofs "${VIRTIOFS_TAG}" "${PROJECT_PATH}"
 if [ "${PROJECT_PATH}" != "/workspace" ]; then
   mount --bind "${PROJECT_PATH}" /workspace
 fi
+if [ -f /run/agentvm-config/shares.txt ]; then
+  while IFS="$(printf '\t')" read -r tag kind target basename_part; do
+    [ -n "${tag}" ] || continue
+    mount_extra_share "${tag}" "${kind}" "${target}" "${basename_part}"
+  done </run/agentvm-config/shares.txt
+fi
 mkdir -p "${HOST_RUN_DIR}"
-touch "${HOST_DOCKERD_LOG}" "${HOST_SOCKET_BRIDGE_LOG}"
+touch "${HOST_DOCKERD_LOG}" "${HOST_SOCKET_BRIDGE_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
 mirror_log_to_workspace "${GUEST_DOCKERD_LOG}" "${HOST_DOCKERD_LOG}"
 mirror_log_to_workspace "${GUEST_SOCKET_BRIDGE_LOG}" "${HOST_SOCKET_BRIDGE_LOG}"
+mirror_log_to_workspace "${GUEST_PAYLOAD_SERVER_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
 
 modprobe overlay || true
 load_kernel_module virtio_net
@@ -178,8 +229,16 @@ python3 -u /usr/local/libexec/agentvm-socket-bridge \
   >"${GUEST_SOCKET_BRIDGE_LOG}" 2>&1 &
 BRIDGE_PID=$!
 
+log "starting payload server"
+python3 -u /usr/local/libexec/agentvm-payload-server \
+  --tcp-host 0.0.0.0 \
+  --tcp-port "${PAYLOAD_TCP_PORT}" \
+  >"${GUEST_PAYLOAD_SERVER_LOG}" 2>&1 &
+PAYLOAD_SERVER_PID=$!
+
 wait_for_critical_exit
 log "critical service exited"
 dump_log_if_present "${GUEST_DOCKERD_LOG}" dockerd.log
 dump_log_if_present "${GUEST_SOCKET_BRIDGE_LOG}" socket-bridge.log
+dump_log_if_present "${GUEST_PAYLOAD_SERVER_LOG}" payload-server.log
 teardown

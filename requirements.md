@@ -2,10 +2,25 @@
 
 ## Overview
 
-A Python-based sandbox wrapper that uses Linux namespaces (via Bubblewrap) to run
-AI coding agents (OpenAI Codex, GitHub Copilot) in an isolated environment. Sandbox
-state is persistent and project-local, stored in a `.sandbox/` directory within the
-project. Toolchains are managed by mise and installed within the sandbox state.
+A Python-based wrapper that runs AI coding agents in a project-scoped VM.
+Sandbox state is persistent and project-local, stored in a `.sandbox/`
+directory within the project. Toolchains are managed by mise and installed
+within project-local sandbox state.
+
+## Current Target Architecture
+
+The implementation is being rewritten toward a VM-only execution model.
+
+Current target rules:
+
+1. The wrapper's primary execution model is a project-scoped VM, not
+   Bubblewrap.
+2. The selected tool command runs inside the guest.
+3. Docker runs inside the same guest and is available there by default.
+4. The host wrapper is a lifecycle/orchestration layer only.
+5. Where older sections in this document still reflect the Bubblewrap-era
+   design, this section and `docker/runtime-contract.md` take precedence until
+   the docs cleanup ticket completes.
 
 ---
 
@@ -35,12 +50,11 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 1. All mutable sandbox state shall be stored in `.sandbox/` within the project
    directory.
 2. `.sandbox/` shall be created automatically on first run.
-3. `.sandbox/` itself shall serve as `$HOME` inside the sandbox. All
-   sandbox-local state (mise toolchains, caches, configs) lives within it
-   at standard XDG-relative paths (e.g. `.sandbox/.local/share/mise/`,
-   `.sandbox/.config/mise/`, etc.).
-4. `.sandbox/` shall NOT be visible inside the sandbox; a tmpfs shall be mounted
-   over its path within the project directory mount.
+3. `.sandbox/home/` shall serve as the persistent guest `$HOME`. Tool-local
+   state (mise toolchains, caches, configs, and similar per-user data) shall
+   live under that path.
+4. `.sandbox/docker-vm/` shall contain the VM runtime state, lock file, logs,
+   and persistent Docker data disk.
 5. `--reset` shall remove the entire `.sandbox/` directory so the next run
    starts fresh, except that it must fail if an active Docker VM lock is held
    for the project.
@@ -51,15 +65,13 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 
 ## 3. Isolation and Namespace Setup
 
-1. The wrapper shall use Bubblewrap (`bwrap`) for namespace-based isolation.
-2. The wrapper shall fail with a clear error if `bwrap` is not found.
-3. The sandbox shall unshare all namespaces except network (by default).
-4. Network access shall be enabled by default; `--no-net` shall disable it.
-5. All Linux capabilities shall be dropped.
-6. The sandbox process shall die with its parent (`--die-with-parent`).
-7. A new session shall be created (`--new-session`).
-8. The environment shall be cleared (`--clearenv`) and selectively rebuilt
-   (see §7).
+1. The wrapper shall use the VM as the primary isolation boundary.
+2. The wrapper shall fail with a clear error if required VM host tools are not
+   available.
+3. Network access shall be enabled for the guest by default; `--no-net` shall
+   disable guest egress.
+4. The selected agent payload shall run inside the guest, not under a separate
+   host-side namespace sandbox.
 
 ---
 
@@ -84,9 +96,9 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 
 ### 4.3 Persistent Sandbox State (from `.sandbox/`)
 
-1. `$HOME` inside the sandbox shall map directly to `.sandbox/` on the host.
-2. Mise directories use their default XDG-relative paths under `$HOME`, so
-   they naturally reside within `.sandbox/` (no separate mounts needed).
+1. `$HOME` inside the guest shall map to `.sandbox/home/` on the host.
+2. Mise directories use their default XDG-relative paths under that guest
+   home, so they naturally reside within `.sandbox/home/`.
 
 ### 4.4 Ephemeral Mounts
 
@@ -98,15 +110,15 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 
 ### 4.5 Optional / User-Specified Mounts
 
-1. `--ro PATH` — bind-mount a host path read-only (repeatable).
-2. `--rw PATH` — bind-mount a host path read-write (repeatable).
-3. `--docker` — start a project-local Docker VM, mount its Unix socket and
-   `~/.docker` config into the sandbox, tear the VM down when the sandbox
-   exits, and provide outbound guest networking by default on Linux hosts via
-   QEMU user-mode networking without requiring sudo. Docker is NOT mounted by
-   default.
-4. `--docker-publish HOST:GUEST` — expose a guest TCP port on
-   `127.0.0.1:HOST` while the Docker VM is running.
+1. The VM shall always provide the project workspace inside the guest.
+2. The VM shall provide Docker inside the guest as part of the default model.
+3. `--docker-publish HOST:GUEST` shall expose a guest TCP port on
+   `127.0.0.1:HOST` while the VM is running.
+4. `--ro PATH` shall expose an arbitrary host path read-only inside the guest
+   at the same absolute path.
+5. `--rw PATH` shall expose an arbitrary host path read-write inside the guest
+   at the same absolute path.
+6. `--pass-env` is still being removed as part of the VM-only rewrite.
 
 ---
 
@@ -123,27 +135,26 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    ```
 3. The script shall maintain a **separate** mise config for sandbox-specific
    tool entries (e.g. the AI tool npm package) at
-   `.sandbox/.config/mise/config.toml` (the sandbox HOME's standard mise
+   `.sandbox/home/.config/mise/config.toml` (the guest HOME's standard mise
    config path). The project's own mise config is never modified by the
    script for these entries.
 4. The sandbox mise config shall contain the selected AI tool's entry:
    - Codex: `"npm:@openai/codex" = "latest"`
    - Copilot: equivalent entry (TBD)
 5. Mise shall be configured to read **both** the project's mise config and
-   the sandbox HOME's mise config. Since mise reads configs from both the
+   the guest HOME's mise config. Since mise reads configs from both the
    project directory and `$MISE_CONFIG_DIR` by default, this should work
-   naturally with `$HOME` set to `.sandbox/`.
-6. Since `$HOME` maps to `.sandbox/`, mise's default XDG-relative data/state
-   directories (`$HOME/.local/share/mise`, etc.) naturally reside within
-   `.sandbox/` — no explicit `MISE_DATA_DIR`/`MISE_STATE_DIR` overrides are
-   needed.
-7. On each sandbox start, `mise install` shall be run inside the sandbox before
+   naturally with `$HOME` set to the persistent guest home.
+6. Since `$HOME` maps to `.sandbox/home/`, mise's default XDG-relative
+   data/state directories (`$HOME/.local/share/mise`, etc.) naturally reside
+   within `.sandbox/home/` — no explicit `MISE_DATA_DIR`/`MISE_STATE_DIR`
+   overrides are needed.
+7. On each sandbox start, `mise install` shall be run inside the guest before
    launching the target CLI. This is idempotent and typically a no-op after
    the first run.
-8. The sandbox `$PATH` shall include mise shims / tool binary paths so
+8. The guest `$PATH` shall include mise shims / tool binary paths so
    installed tools are available to the agent.
-9. The mise binary itself must be accessible inside the sandbox (via the
-   read-only host system mounts or by explicitly mounting its location).
+9. The mise binary itself must be accessible inside the guest.
 
 ---
 
@@ -184,8 +195,8 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    - `AWS_CONFIG_FILE` → `/dev/null`
    - `GOOGLE_APPLICATION_CREDENTIALS`
    - `KUBECONFIG` → `/dev/null`
-4. `--pass-env VAR` shall pass a named host environment variable into the
-   sandbox (repeatable).
+4. Arbitrary host environment passthrough is not part of the VM-only contract.
+   Any future passthrough support should return as an explicit VM-era feature.
 
 ---
 
@@ -210,11 +221,10 @@ Options:
   --project PATH        Project directory (default: $PWD)
   --tool codex|copilot  Explicit tool selection (overrides argv[0])
   --no-net              Disable network access
-  --docker              Start a project-local Docker VM and mount its socket
+  --docker-publish H:G  Expose a guest TCP port on localhost
   --aws PROFILE         Acquire temporary AWS credentials via STS
-  --ro PATH             Extra read-only bind mount (repeatable)
-  --rw PATH             Extra read-write bind mount (repeatable)
-  --pass-env VAR        Pass host env var into sandbox (repeatable)
+  --ro PATH             Extra read-only guest share (repeatable)
+  --rw PATH             Extra read-write guest share (repeatable)
   --reset               Remove .sandbox/ and start fresh
   --help                Show usage
 ```
@@ -225,7 +235,7 @@ Options:
 
 1. GUI/display passthrough (DISPLAY, WAYLAND, DBUS) is not required.
 2. Persistent sandbox home at an arbitrary path (`--persist PATH`) is replaced
-   by the fixed `.sandbox/` approach (`.sandbox/` is `$HOME` directly).
+   by the fixed project-local `.sandbox/` approach.
 3. Host `~/.cargo`, `~/.rustup`, `~/.m2` are NOT directly mounted; these
-   toolchains are managed by mise inside the sandbox instead.
-4. Host `~/bin` mounting is not included by default (can be added via `--ro`).
+   toolchains are managed by mise inside the guest instead.
+4. Arbitrary environment passthrough is not included by default.

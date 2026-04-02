@@ -15,11 +15,14 @@ import selectors
 import re
 import signal
 import socket
+import struct
 import shutil
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 from dataclasses import dataclass, field
 
 
@@ -33,6 +36,8 @@ TOOLS = {
         "auto_flags": ["--dangerously-bypass-approvals-and-sandbox"],
         "mise_package": 'npm:@openai/codex',
         "mise_version": "latest",
+        "npm_package": "@openai/codex",
+        "npm_version": "latest",
         # Host dirs to bind r/w into sandbox HOME (relative to host HOME)
         "host_home_mounts": [".codex"],
     },
@@ -41,6 +46,8 @@ TOOLS = {
         "auto_flags": ["--allow-all", "--no-auto-update"],
         "mise_package": 'npm:@github/copilot',
         "mise_version": "latest",
+        "npm_package": "@github/copilot",
+        "npm_version": "latest",
         "host_home_mounts": [
             ".copilot",
             ".config/github-copilot",
@@ -89,6 +96,7 @@ DOCKER_VM_USERNET_PREFIX = 24
 DOCKER_VM_USERNET_HOST_IP = "10.0.2.2"
 DOCKER_VM_USERNET_GUEST_IP = "10.0.2.15"
 DOCKER_VM_USERNET_DNS_IP = "10.0.2.3"
+DOCKER_VM_CONFIG_SHARE_TAG = "agentvm-config"
 
 HOST_TOOL_FALLBACKS = {
     "virtiofsd": [
@@ -114,6 +122,8 @@ HOST_TOOL_ENV_OVERRIDES = {
     "qemu-system-x86_64": "SANDBOX_WRAP_QEMU_BIN",
     "mkfs.ext4": "SANDBOX_WRAP_MKFS_EXT4_BIN",
 }
+
+FRAME_HEADER = struct.Struct("!cI")
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +316,11 @@ class DockerVmPaths:
     data_disk_meta: str
     state: str
     docker_sock: str
+    guest_config_dir: str
+    guest_share_manifest: str
+    guest_config_sock: str
+    guest_config_pid: str
+    guest_config_log: str
     virtiofs_sock: str
     qemu_pid: str
     virtiofsd_pid: str
@@ -314,6 +329,25 @@ class DockerVmPaths:
     virtiofsd_log: str
     proxy_log: str
     console_log: str
+    guest_payload_log: str
+    launcher_snapshot: str
+
+
+@dataclass
+class DockerVmGuestShare:
+    """One supplemental host path shared into the guest."""
+
+    tag: str
+    source_path: str
+    shared_dir: str
+    guest_path: str
+    readonly: bool
+    kind: str
+    basename: str
+    socket_path: str
+    pid_path: str
+    log_path: str
+    proc: subprocess.Popen | None = field(default=None, init=False)
 
 
 @dataclass
@@ -323,17 +357,25 @@ class DockerVmManager:
     project: str
     sandbox: str
     repo_root: str
+    tool: str
     network_enabled: bool = False
     published_ports: list[DockerVmForward] = field(default_factory=list)
+    extra_ro: list[str] = field(default_factory=list)
+    extra_rw: list[str] = field(default_factory=list)
+    gh_enabled: bool = False
     paths: DockerVmPaths = field(init=False)
     manifest: dict | None = field(default=None, init=False)
     lock_fd: int | None = field(default=None, init=False)
+    config_share_proc: subprocess.Popen | None = field(default=None, init=False)
     virtiofsd_proc: subprocess.Popen | None = field(default=None, init=False)
     qemu_proc: subprocess.Popen | None = field(default=None, init=False)
     proxy_proc: subprocess.Popen | None = field(default=None, init=False)
+    share_procs: list[subprocess.Popen] = field(default_factory=list, init=False)
     host_tools: dict[str, str] = field(default_factory=dict, init=False)
     network: DockerVmNetwork | None = field(default=None, init=False)
     host_docker_port: int | None = field(default=None, init=False)
+    host_payload_port: int | None = field(default=None, init=False)
+    guest_shares: list["DockerVmGuestShare"] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         root = os.path.join(self.sandbox, DOCKER_VM_DIRNAME)
@@ -346,6 +388,11 @@ class DockerVmManager:
             data_disk_meta=os.path.join(root, "docker-data.meta.json"),
             state=os.path.join(run, "state.json"),
             docker_sock=os.path.join(run, "docker.sock"),
+            guest_config_dir=os.path.join(run, "guest-config"),
+            guest_share_manifest=os.path.join(run, "guest-config", "shares.txt"),
+            guest_config_sock=os.path.join(run, "guest-config.sock"),
+            guest_config_pid=os.path.join(run, "guest-config.pid"),
+            guest_config_log=os.path.join(run, "guest-config.log"),
             virtiofs_sock=os.path.join(run, "virtiofs.sock"),
             qemu_pid=os.path.join(run, "qemu.pid"),
             virtiofsd_pid=os.path.join(run, "virtiofsd.pid"),
@@ -354,6 +401,8 @@ class DockerVmManager:
             virtiofsd_log=os.path.join(run, "virtiofsd.log"),
             proxy_log=os.path.join(run, "proxy.log"),
             console_log=os.path.join(run, "console.log"),
+            guest_payload_log=os.path.join(run, "guest-payload-server.log"),
+            launcher_snapshot=os.path.join(run, "sandbox-wrap.snapshot"),
         )
     def load_manifest(self) -> dict:
         if self.manifest is not None:
@@ -458,6 +507,12 @@ class DockerVmManager:
 
     def create_run_dir(self) -> None:
         os.makedirs(self.paths.run, exist_ok=True)
+        os.makedirs(self.paths.guest_config_dir, exist_ok=True)
+
+    def write_launcher_snapshot(self) -> None:
+        src = os.path.join(self.repo_root, "sandbox-wrap")
+        shutil.copy2(src, self.paths.launcher_snapshot)
+        os.chmod(self.paths.launcher_snapshot, 0o755)
 
     def write_state(self, status: str, **extra: object) -> None:
         state = {
@@ -513,6 +568,12 @@ class DockerVmManager:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
 
+    def _allocate_host_payload_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
+
     def _open_log(self, path: str):
         return open(path, "a")
 
@@ -541,11 +602,138 @@ class DockerVmManager:
         self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
         self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
 
-    def _build_hostfwd_specs(self, guest_docker_port: int) -> list[str]:
+    def start_guest_config_share(self) -> None:
+        log = self._open_log(self.paths.guest_config_log)
+        cmd = [
+            self.host_tools["virtiofsd"],
+            f"--socket-path={self.paths.guest_config_sock}",
+            f"--shared-dir={self.paths.guest_config_dir}",
+            "--sandbox=none",
+            "--inode-file-handles=never",
+            "--cache=never",
+            "--readonly",
+            f"--thread-pool-size={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+            "--log-level=debug",
+        ]
+        self.config_share_proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        self._write_pid(self.paths.guest_config_pid, self.config_share_proc.pid)
+        self.wait_for_path(self.paths.guest_config_sock, timeout=10.0)
+
+    def build_guest_shares(self) -> list[DockerVmGuestShare]:
+        shares: list[DockerVmGuestShare] = []
+        seen_guest_paths: set[str] = set()
+
+        def add_share(source_path: str, guest_path: str, readonly: bool) -> None:
+            abs_source = os.path.abspath(source_path)
+            abs_guest = os.path.abspath(guest_path)
+            if abs_guest in seen_guest_paths:
+                return
+            if not os.path.exists(abs_source):
+                print(
+                    f"warning: skipping missing guest share source: {source_path}",
+                    file=sys.stderr,
+                )
+                return
+            kind = "dir" if os.path.isdir(abs_source) else "file"
+            shared_dir = abs_source if kind == "dir" else os.path.dirname(abs_source)
+            basename = "" if kind == "dir" else os.path.basename(abs_source)
+            tag = f"share{len(shares)}"
+            shares.append(DockerVmGuestShare(
+                tag=tag,
+                source_path=abs_source,
+                shared_dir=shared_dir,
+                guest_path=abs_guest,
+                readonly=readonly,
+                kind=kind,
+                basename=basename,
+                socket_path=os.path.join(self.paths.run, f"{tag}.sock"),
+                pid_path=os.path.join(self.paths.run, f"{tag}.pid"),
+                log_path=os.path.join(self.paths.run, f"{tag}.log"),
+            ))
+            seen_guest_paths.add(abs_guest)
+
+        host_home = os.path.expanduser("~")
+        guest_home = os.path.join(self.project, ".sandbox", "home")
+
+        for rel_dir in TOOLS[self.tool].get("host_home_mounts", []):
+            host_dir = os.path.join(host_home, rel_dir)
+            guest_dir = os.path.join(guest_home, rel_dir)
+            add_share(host_dir, guest_dir, readonly=False)
+
+        docker_config = os.path.join(host_home, ".docker")
+        if os.path.isdir(docker_config):
+            add_share(docker_config, os.path.join(guest_home, ".docker"), readonly=False)
+
+        if self.gh_enabled:
+            gh_config = os.path.join(host_home, ".config", "gh")
+            if os.path.isdir(gh_config):
+                add_share(
+                    gh_config,
+                    os.path.join(guest_home, ".config", "gh"),
+                    readonly=True,
+                )
+
+        for path in self.extra_ro:
+            add_share(path, os.path.abspath(path), readonly=True)
+        for path in self.extra_rw:
+            add_share(path, os.path.abspath(path), readonly=False)
+
+        return shares
+
+    def write_guest_share_manifest(self) -> None:
+        with open(self.paths.guest_share_manifest, "w") as f:
+            for share in self.guest_shares:
+                f.write(
+                    "\t".join([
+                        share.tag,
+                        share.kind,
+                        share.guest_path,
+                        share.basename,
+                    ]) + "\n"
+                )
+
+    def start_guest_shares(self) -> None:
+        self.guest_shares = self.build_guest_shares()
+        self.write_guest_share_manifest()
+        for share in self.guest_shares:
+            log = self._open_log(share.log_path)
+            cmd = [
+                self.host_tools["virtiofsd"],
+                f"--socket-path={share.socket_path}",
+                f"--shared-dir={share.shared_dir}",
+                "--sandbox=none",
+                "--inode-file-handles=never",
+                "--cache=never",
+                f"--thread-pool-size={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+                "--log-level=debug",
+            ]
+            if share.readonly:
+                cmd.append("--readonly")
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+            share.proc = proc
+            self.share_procs.append(proc)
+            self._write_pid(share.pid_path, share.proc.pid)
+            self.wait_for_path(share.socket_path, timeout=10.0)
+
+    def _build_hostfwd_specs(self, guest_docker_port: int,
+                             guest_payload_port: int) -> list[str]:
         if self.host_docker_port is None:
             raise DockerVmError("Host Docker forward port was not allocated")
+        if self.host_payload_port is None:
+            raise DockerVmError("Host payload forward port was not allocated")
         specs = [
-            f"hostfwd=tcp:127.0.0.1:{self.host_docker_port}-:{guest_docker_port}"
+            f"hostfwd=tcp:127.0.0.1:{self.host_docker_port}-:{guest_docker_port}",
+            f"hostfwd=tcp:127.0.0.1:{self.host_payload_port}-:{guest_payload_port}",
         ]
         if self.network_enabled:
             for forward in self.published_ports:
@@ -566,12 +754,19 @@ class DockerVmManager:
             )
         guest_cfg = manifest.get("guest", {})
         guest_docker_port = guest_cfg.get("docker_tcp_port")
+        guest_payload_port = guest_cfg.get("payload_tcp_port")
         if guest_docker_port is None:
             raise DockerVmError(
                 "Docker VM manifest is missing guest.docker_tcp_port. "
                 "Rebuild the appliance with docker/build-appliance.sh."
             )
+        if guest_payload_port is None:
+            raise DockerVmError(
+                "Docker VM manifest is missing guest.payload_tcp_port. "
+                "Rebuild the appliance with docker/build-appliance.sh."
+            )
         guest_docker_port = int(guest_docker_port)
+        guest_payload_port = int(guest_payload_port)
         assert self.network is not None
 
         kernel_cmdline = ensure_kernel_cmdline_rootfstype_ext4(
@@ -609,7 +804,8 @@ class DockerVmManager:
             self.network.guest_mac,
         )
 
-        hostfwd_specs = self._build_hostfwd_specs(guest_docker_port)
+        hostfwd_specs = self._build_hostfwd_specs(
+            guest_docker_port, guest_payload_port)
         nic_parts = [
             "user",
             "id=net0",
@@ -626,7 +822,7 @@ class DockerVmManager:
 
         memory_bytes = int(vm_cfg["memory_bytes"])
         memory_mib = max(1, memory_bytes // (1024 * 1024))
-        return [
+        args = [
             self.host_tools["qemu-system-x86_64"],
             "-enable-kvm",
             "-nodefaults",
@@ -658,8 +854,30 @@ class DockerVmManager:
             f"chardev=charfs,tag={vm_cfg['virtiofs_tag']},"
             f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
             f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
-            "-nic", ",".join(nic_parts),
         ]
+        args += [
+            "-chardev",
+            f"socket,id=charcfg,path={self.paths.guest_config_sock}",
+            "-device",
+            "vhost-user-fs-pci,"
+            "chardev=charcfg,"
+            f"tag={DOCKER_VM_CONFIG_SHARE_TAG},"
+            f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
+            f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+        ]
+        for index, share in enumerate(self.guest_shares):
+            args += [
+                "-chardev",
+                f"socket,id=charshare{index},path={share.socket_path}",
+                "-device",
+                "vhost-user-fs-pci,"
+                f"chardev=charshare{index},"
+                f"tag={share.tag},"
+                f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
+                f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+            ]
+        args += ["-nic", ",".join(nic_parts)]
+        return args
 
     def start_qemu(self) -> None:
         log = self._open_log(self.paths.qemu_log)
@@ -682,10 +900,13 @@ class DockerVmManager:
 
     def _ensure_processes_alive(self) -> None:
         processes: list[tuple[str, subprocess.Popen | None, str]] = [
+            ("guest-config-share", self.config_share_proc, self.paths.guest_config_log),
             ("virtiofsd", self.virtiofsd_proc, self.paths.virtiofsd_log),
             ("qemu", self.qemu_proc, self.paths.qemu_log),
             ("docker-vm-proxy", self.proxy_proc, self.paths.proxy_log),
         ]
+        for share in self.guest_shares:
+            processes.append((share.tag, share.proc, share.log_path))
         for name, proc, log_path in processes:
             if proc is not None and proc.poll() is not None:
                 log_tail = read_tail(log_path)
@@ -703,15 +924,23 @@ class DockerVmManager:
                 sock, sock_path)
         return status_code, body_blob
 
+    def payload_request(self, frame_type: bytes, payload: bytes = b""
+                        ) -> tuple[bytes, bytes]:
+        if self.host_payload_port is None:
+            raise DockerVmError("Host payload forward port was not allocated")
+        with socket.create_connection(("127.0.0.1", self.host_payload_port),
+                                      timeout=2.0) as sock:
+            send_frame(sock, frame_type, payload)
+            return recv_frame(sock)
+
     def start_proxy(self) -> None:
         if self.host_docker_port is None:
             raise DockerVmError("Host Docker forward port was not allocated")
         log = self._open_log(self.paths.proxy_log)
-        wrapper_script = os.path.join(self.repo_root, "sandbox-wrap")
         cmd = [
             sys.executable,
             "-u",
-            wrapper_script,
+            self.paths.launcher_snapshot,
             "__docker-vm-proxy",
             "--listen",
             self.paths.docker_sock,
@@ -752,33 +981,70 @@ class DockerVmManager:
             detail += f" (last probe error: {last_error})"
         raise DockerVmError(detail)
 
+    def wait_for_payload_control_ready(self, timeout: float) -> None:
+        deadline = time.time() + timeout
+        last_error: str | None = None
+        while time.time() < deadline:
+            try:
+                frame_type, payload = self.payload_request(b"P")
+                if frame_type == b"K" and payload == b"ok":
+                    return
+                last_error = (
+                    f"unexpected payload control response: {frame_type!r}"
+                )
+            except (OSError, DockerVmError, EOFError, struct.error) as exc:
+                last_error = str(exc)
+            self._ensure_processes_alive()
+            time.sleep(0.2)
+        detail = "Timed out waiting for guest payload control path"
+        if last_error:
+            detail += f" (last probe error: {last_error})"
+        raise DockerVmError(detail)
+
     def start(self) -> None:
         self.ensure_host_prerequisites()
         self.ensure_runtime_root()
         self.acquire_lock()
         self.remove_stale_run_dir()
         self.create_run_dir()
+        self.write_launcher_snapshot()
         self.write_state("starting")
         self.ensure_data_disk()
         self.network = self._compute_network()
         self.host_docker_port = self._allocate_host_docker_port()
+        self.host_payload_port = self._allocate_host_payload_port()
         try:
             self.start_virtiofsd()
+            self.start_guest_config_share()
+            self.start_guest_shares()
             self.start_qemu()
             self.start_proxy()
             self.wait_for_docker_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
+            self.wait_for_payload_control_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
             self.write_state(
                 "running",
                 qemu_pid=(self.qemu_proc.pid if self.qemu_proc else None),
                 virtiofsd_pid=(self.virtiofsd_proc.pid
                                if self.virtiofsd_proc else None),
+                guest_config_pid=(self.config_share_proc.pid if self.config_share_proc else None),
                 proxy_pid=(self.proxy_proc.pid if self.proxy_proc else None),
                 host_docker_port=self.host_docker_port,
+                host_payload_port=self.host_payload_port,
                 guest_network=(vars(self.network) if self.network else None),
                 outbound_network=("enabled" if self.network_enabled
                                   else "restricted"),
                 published_ports=([vars(p) for p in self.published_ports]
                                  if self.published_ports else []),
+                guest_shares=([
+                    {
+                        "tag": share.tag,
+                        "source_path": share.source_path,
+                        "guest_path": share.guest_path,
+                        "readonly": share.readonly,
+                        "kind": share.kind,
+                    }
+                    for share in self.guest_shares
+                ]),
             )
         except Exception:
             self.write_state("failed")
@@ -800,12 +1066,24 @@ class DockerVmManager:
 
         # On normal sandbox exit, prefer fast teardown over a long graceful wait.
         if clean:
-            for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
+            for proc in (
+                self.qemu_proc,
+                self.virtiofsd_proc,
+                self.config_share_proc,
+                self.proxy_proc,
+                *[share.proc for share in self.guest_shares],
+            ):
                 if proc is not None and proc.poll() is None:
                     proc.terminate()
 
         deadline = time.time() + timeout
-        for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
+        for proc in (
+            self.qemu_proc,
+            self.virtiofsd_proc,
+            self.config_share_proc,
+            self.proxy_proc,
+            *[share.proc for share in self.guest_shares],
+        ):
             if proc is None:
                 continue
             while proc.poll() is None and time.time() < deadline:
@@ -813,7 +1091,13 @@ class DockerVmManager:
             if proc.poll() is None:
                 proc.terminate()
 
-        for proc in (self.qemu_proc, self.virtiofsd_proc, self.proxy_proc):
+        for proc in (
+            self.qemu_proc,
+            self.virtiofsd_proc,
+            self.config_share_proc,
+            self.proxy_proc,
+            *[share.proc for share in self.guest_shares],
+        ):
             if proc is None:
                 continue
             try:
@@ -825,6 +1109,110 @@ class DockerVmManager:
         if clean and os.path.isdir(self.paths.run):
             shutil.rmtree(self.paths.run, ignore_errors=True)
         self.release_lock()
+
+    def run_guest_payload(self, script: str, cwd: str, env: dict[str, str]) -> int:
+        if self.host_payload_port is None:
+            raise DockerVmError("Host payload forward port was not allocated")
+
+        stdin_fd = sys.stdin.fileno()
+        interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        rows, cols = get_terminal_size()
+        request = {
+            "script": script,
+            "cwd": cwd,
+            "env": env,
+            "rows": rows,
+            "cols": cols,
+        }
+        sock = socket.create_connection(("127.0.0.1", self.host_payload_port),
+                                        timeout=10.0)
+        sock.settimeout(None)
+        send_lock = threading.Lock()
+        send_frame(sock, b"R", json.dumps(request).encode("utf-8"), send_lock)
+
+        exit_code = 1
+        done = threading.Event()
+        receiver_error: list[BaseException] = []
+
+        def receiver() -> None:
+            nonlocal exit_code
+            try:
+                while True:
+                    frame_type, payload = recv_frame(sock)
+                    if frame_type == b"O":
+                        sys.stdout.buffer.write(payload)
+                        sys.stdout.buffer.flush()
+                        continue
+                    if frame_type == b"X":
+                        exit_code = int(
+                            json.loads(payload.decode("utf-8"))["exit_code"]
+                        )
+                        return
+                    if frame_type == b"F":
+                        raise DockerVmError(payload.decode("utf-8", "replace"))
+            except EOFError:
+                receiver_error.append(
+                    DockerVmError("Guest payload control connection closed early")
+                )
+            except BaseException as exc:  # noqa: BLE001
+                receiver_error.append(exc)
+            finally:
+                done.set()
+
+        def stdin_sender() -> None:
+            try:
+                while not done.is_set():
+                    chunk = os.read(stdin_fd, 65536)
+                    if not chunk:
+                        return
+                    send_frame(sock, b"I", chunk, send_lock)
+            except OSError:
+                return
+            except BaseException:
+                return
+
+        old_tty = None
+        if interactive:
+            old_tty = termios.tcgetattr(stdin_fd)
+            tty.setraw(stdin_fd)
+
+        old_handlers: dict[int, object] = {}
+
+        def forward_signal(signum, _frame) -> None:
+            if signum == signal.SIGWINCH:
+                resize_rows, resize_cols = get_terminal_size()
+                payload = json.dumps(
+                    {"rows": resize_rows, "cols": resize_cols}
+                ).encode("utf-8")
+                send_frame(sock, b"W", payload, send_lock)
+                return
+            payload = json.dumps({"signal": signum}).encode("utf-8")
+            send_frame(sock, b"S", payload, send_lock)
+
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGWINCH):
+            old_handlers[sig] = signal.signal(sig, forward_signal)
+
+        receiver_thread = threading.Thread(target=receiver, daemon=True)
+        receiver_thread.start()
+        sender_thread = threading.Thread(target=stdin_sender, daemon=True)
+        sender_thread.start()
+
+        try:
+            receiver_thread.join()
+        finally:
+            done.set()
+            for sig, handler in old_handlers.items():
+                signal.signal(sig, handler)
+            if old_tty is not None:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+        if receiver_error:
+            raise DockerVmError(str(receiver_error[0]))
+        return exit_code
 
 
 def proxy_bidirectional(left: socket.socket, right: socket.socket,
@@ -988,18 +1376,19 @@ def ensure_project_mise_config(project: str) -> None:
     print(f"Created {path} with default toolchain entries")
 
 
-def ensure_sandbox_mise_config(sandbox: str, tool: str,
-                               aws: bool = False,
-                               gh: bool = False) -> None:
-    """Write sandbox-specific mise config with the AI tool entry."""
-    config_dir = os.path.join(sandbox, ".config", "mise")
+def ensure_home_mise_config(home_root: str, tool: str,
+                            aws: bool = False,
+                            gh: bool = False,
+                            include_tool: bool = True) -> None:
+    """Write HOME-local mise config with the AI tool entry."""
+    config_dir = os.path.join(home_root, ".config", "mise")
     os.makedirs(config_dir, exist_ok=True)
     config_path = os.path.join(config_dir, "config.toml")
 
     lines = ["[tools]"]
 
     tool_def = TOOLS[tool]
-    if tool_def["mise_package"]:
+    if include_tool and tool_def["mise_package"]:
         lines.append(
             f'"{tool_def["mise_package"]}" = "{tool_def["mise_version"]}"')
 
@@ -1017,6 +1406,13 @@ def ensure_sandbox_mise_config(sandbox: str, tool: str,
                 return
     with open(config_path, "w") as f:
         f.write(content)
+
+
+def ensure_guest_home(sandbox: str) -> str:
+    """Create and return the persistent guest HOME directory."""
+    home_root = os.path.join(sandbox, "home")
+    os.makedirs(home_root, exist_ok=True)
+    return home_root
 
 
 def get_tmp_dir(project: str) -> str:
@@ -1152,6 +1548,109 @@ def discover_home_bin_symlink_target_dirs(host_bin_dir: str) -> list[str]:
             target_dirs.add(target_dir)
 
     return sorted(target_dirs)
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    """Receive exactly size bytes or raise EOFError."""
+    chunks = bytearray()
+    while len(chunks) < size:
+        chunk = sock.recv(size - len(chunks))
+        if not chunk:
+            raise EOFError("unexpected EOF")
+        chunks.extend(chunk)
+    return bytes(chunks)
+
+
+def recv_frame(sock: socket.socket) -> tuple[bytes, bytes]:
+    """Receive one framed payload message."""
+    frame_type, length = FRAME_HEADER.unpack(recv_exact(sock, FRAME_HEADER.size))
+    payload = recv_exact(sock, length) if length else b""
+    return frame_type, payload
+
+
+def send_frame(sock: socket.socket, frame_type: bytes, payload: bytes = b"",
+               lock: threading.Lock | None = None) -> None:
+    """Send one framed payload message."""
+    frame = FRAME_HEADER.pack(frame_type, len(payload)) + payload
+    if lock is None:
+        sock.sendall(frame)
+        return
+    with lock:
+        sock.sendall(frame)
+
+
+def get_terminal_size() -> tuple[int, int]:
+    """Return terminal rows and columns with a safe fallback."""
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+    except OSError:
+        try:
+            size = os.get_terminal_size(sys.stdin.fileno())
+        except OSError:
+            return (24, 80)
+    return (size.lines, size.columns)
+
+
+def build_payload_command(tool: str, cli_args: list[str] | None = None) -> str:
+    """Build the final command string for the selected tool or explicit args."""
+    extra = list(cli_args or [])
+    if extra:
+        return " ".join(shell_quote(a) for a in extra)
+    tool_def = TOOLS[tool]
+    parts = [tool_def["cli"]] + list(tool_def["auto_flags"])
+    return " ".join(shell_quote(a) for a in parts)
+
+
+def build_payload_script(tool: str, cli_args: list[str] | None = None) -> str:
+    """Build the guest-side shell bootstrap script for a payload."""
+    extra = list(cli_args or [])
+    tool_def = TOOLS[tool]
+    tool_cmd = build_payload_command(tool, extra)
+    inner_parts = []
+    if not extra:
+        inner_parts.extend([
+            'export NPM_CONFIG_PREFIX="$HOME/.local"',
+            'mkdir -p "$NPM_CONFIG_PREFIX"',
+            f'if ! command -v {shell_quote(tool_def["cli"])} >/dev/null 2>&1; then npm install --global {shell_quote(tool_def["npm_package"] + "@" + tool_def["npm_version"])}; fi',
+            'hash -r 2>/dev/null || true',
+            'export MISE_TRUSTED_CONFIG_PATHS="$PWD"',
+        ])
+    inner_parts.append(f'exec {tool_cmd}')
+    return " && ".join(inner_parts)
+
+
+def build_guest_env(project: str, tool: str, *,
+                    gh_token: str | None = None,
+                    aws_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the guest payload environment."""
+    user = os.environ.get("USER", "sandbox")
+    guest_home = os.path.join(project, ".sandbox", "home")
+    env_vars: dict[str, str] = {}
+    env_vars["HOME"] = guest_home
+    env_vars["USER"] = user
+    env_vars["LOGNAME"] = user
+    env_vars["TERM"] = os.environ.get("TERM", "xterm-256color")
+    env_vars["LANG"] = os.environ.get("LANG", "en_US.UTF-8")
+    env_vars["XDG_CACHE_HOME"] = f"{guest_home}/.cache"
+    env_vars["XDG_CONFIG_HOME"] = f"{guest_home}/.config"
+    env_vars["XDG_DATA_HOME"] = f"{guest_home}/.local/share"
+    env_vars["XDG_STATE_HOME"] = f"{guest_home}/.local/state"
+    env_vars["PATH"] = ":".join([
+        f"{guest_home}/.local/share/mise/shims",
+        f"{guest_home}/.local/bin",
+        f"{guest_home}/bin",
+        "/usr/local/sbin", "/usr/local/bin",
+        "/usr/sbin", "/usr/bin",
+        "/sbin", "/bin",
+    ])
+    env_vars["TMPDIR"] = "/tmp"
+    env_vars["DOCKER_HOST"] = "unix:///var/run/docker.sock"
+    env_vars.update(CREDENTIAL_NULLS)
+    if aws_env:
+        env_vars.update(aws_env)
+    if gh_token:
+        env_vars["GH_TOKEN"] = gh_token
+    return env_vars
 
 
 # ---------------------------------------------------------------------------
@@ -1421,36 +1920,7 @@ def build_bwrap_args(
     # -- Working directory --
     args += ["--chdir", project]
 
-    # -- Command to run inside sandbox --
-    # If extra args are given, they replace the tool command entirely.
-    # Otherwise, run the default tool CLI with auto-flags.
-    tool_def = TOOLS[tool]
-    extra = list(cli_args or [])
-
-    if extra:
-        # Extra args = the command to run (replaces tool)
-        cmd_parts = [shell_quote(a) for a in extra]
-        tool_cmd = " ".join(cmd_parts)
-    else:
-        # Default: run the tool with auto-flags
-        parts = [tool_def["cli"]] + list(tool_def["auto_flags"])
-        tool_cmd = " ".join(shell_quote(a) for a in parts)
-
-    # Build the inner command
-    # Use mise activate to set up PATH properly, then exec the command
-    inner_parts = [
-        # Trust the project directory for mise
-        'export MISE_TRUSTED_CONFIG_PATHS="$PWD"',
-        # Install toolchains (idempotent, non-fatal so partial failures
-        # don't prevent the agent from launching)
-        'mise install --yes 2>&1 || true',
-        # Activate mise in the current shell to get proper PATH
-        'eval "$(mise activate bash --shims)"',
-    ]
-
-    inner_parts.append(f'exec {tool_cmd}')
-
-    inner_script = " && ".join(inner_parts)
+    inner_script = build_payload_script(tool, cli_args)
     args += ["bash", "-c", inner_script]
 
     return args
@@ -1574,7 +2044,7 @@ def main() -> None:
     if args.reset:
         docker_vm_root = os.path.join(sandbox_path, DOCKER_VM_DIRNAME)
         if os.path.isdir(docker_vm_root):
-            manager = DockerVmManager(project, sandbox_path, repo_root)
+            manager = DockerVmManager(project, sandbox_path, repo_root, tool)
             if not manager.reset_is_allowed():
                 die("--reset refused because a Docker sandbox is active "
                     f"for this project ({docker_vm_root})")
@@ -1590,9 +2060,19 @@ def main() -> None:
     ensure_gitignore(project)
 
     # Set up mise configs
-    ensure_project_mise_config(project)
-    ensure_sandbox_mise_config(sandbox, tool, aws=bool(args.aws),
-                               gh=args.gh)
+    if not args.docker:
+        ensure_project_mise_config(project)
+    if args.docker:
+        guest_home = ensure_guest_home(sandbox)
+        ensure_home_mise_config(
+            guest_home,
+            tool,
+            aws=bool(args.aws),
+            gh=args.gh,
+            include_tool=False,
+        )
+    else:
+        ensure_home_mise_config(sandbox, tool, aws=bool(args.aws), gh=args.gh)
 
     # Acquire AWS credentials if requested
     aws_env = None
@@ -1624,13 +2104,40 @@ def main() -> None:
             project,
             sandbox,
             repo_root,
+            tool,
             network_enabled=not args.no_net,
             published_ports=published_ports,
+            extra_ro=args.ro,
+            extra_rw=args.rw,
+            gh_enabled=args.gh,
         )
         try:
             docker_vm.start()
         except DockerVmError as exc:
             die(str(exc))
+
+        guest_script = build_payload_script(tool, args.extra)
+        guest_env = build_guest_env(
+            project,
+            tool,
+            gh_token=gh_token,
+            aws_env=aws_env,
+        )
+        exit_code = 1
+        try:
+            exit_code = docker_vm.run_guest_payload(
+                guest_script,
+                cwd=project,
+                env=guest_env,
+            )
+        except DockerVmError as exc:
+            die(str(exc))
+        finally:
+            docker_vm.shutdown(clean=True)
+
+        if exit_code < 0:
+            raise SystemExit(128 + (-exit_code))
+        raise SystemExit(exit_code)
 
     # Build bwrap command
     try:
