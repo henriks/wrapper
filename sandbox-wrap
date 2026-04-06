@@ -589,10 +589,14 @@ def build_bwrap_args(
     args += ["--chdir", project]
 
     # -- Command to run inside sandbox --
-    # Extra args are passed through to the selected tool CLI.
-    tool_cmd = " ".join(
-        shell_quote(arg) for arg in build_tool_command(tool, cli_args)
-    )
+    # If extra args are given, they replace the default tool command entirely.
+    extra = list(cli_args or [])
+    if extra:
+        tool_cmd = " ".join(shell_quote(arg) for arg in extra)
+    else:
+        tool_cmd = " ".join(
+            shell_quote(arg) for arg in build_tool_command(tool)
+        )
 
     # Build the inner command
     # Use mise activate to set up PATH properly, then exec the command

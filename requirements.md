@@ -27,8 +27,8 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    default flags (e.g. `--allow-all`, `--no-auto-update`).
 7. In Pi mode, the script shall run the `pi` CLI with no additional default
    flags.
-8. Arguments after `--` or unrecognized positional arguments shall be passed
-   through to the target CLI.
+8. Arguments after `--` or unrecognized positional arguments shall replace the
+   default tool command and be executed directly inside the sandbox.
 9. `--project PATH` shall set the project directory (default: `$PWD`).
 
 ---
