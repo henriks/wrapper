@@ -3,7 +3,7 @@
 ## Overview
 
 A Python-based sandbox wrapper that uses Linux namespaces (via Bubblewrap) to run
-AI coding agents (OpenAI Codex, GitHub Copilot) in an isolated environment. Sandbox
+AI coding agents (OpenAI Codex, GitHub Copilot, Pi) in an isolated environment. Sandbox
 state is persistent and project-local, stored in a `.sandbox/` directory within the
 project. Toolchains are managed by mise and installed within the sandbox state.
 
@@ -12,21 +12,24 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 ## 1. Entry Points and Invocation
 
 1. The project shall consist of a single Python script.
-2. Two symlinks shall point to the script: `codex-wrap` and `copilot-wrap`.
+2. Three symlinks shall point to the script: `codex-wrap`, `copilot-wrap`, and
+   `pi-wrap`.
 3. The script shall determine its mode from `argv[0]`:
    - Invoked as `codex-wrap` → Codex mode.
    - Invoked as `copilot-wrap` → Copilot mode.
-4. A `--tool codex|copilot` flag shall override the invocation-name detection.
+   - Invoked as `pi-wrap` → Pi mode.
+4. A `--tool codex|copilot|pi` flag shall override the invocation-name
+   detection.
 5. In Codex mode, the script shall run the Codex CLI and automatically include
    `--dangerously-bypass-approvals-and-sandbox` unless already present in the
    user-supplied arguments.
 6. In Copilot mode, the script shall run the Copilot CLI with appropriate
    default flags (e.g. `--allow-all`, `--no-auto-update`).
-7. Arguments after `--` or unrecognized positional arguments shall be passed
+7. In Pi mode, the script shall run the `pi` CLI with no additional default
+   flags.
+8. Arguments after `--` or unrecognized positional arguments shall be passed
    through to the target CLI.
-8. `--project PATH` shall set the project directory (default: `$PWD`).
-9. Copilot support is secondary; if it proves difficult the initial release may
-   be Codex-only.
+9. `--project PATH` shall set the project directory (default: `$PWD`).
 
 ---
 
@@ -56,7 +59,10 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 4. Network access shall be enabled by default; `--no-net` shall disable it.
 5. All Linux capabilities shall be dropped.
 6. The sandbox process shall die with its parent (`--die-with-parent`).
-7. A new session shall be created (`--new-session`).
+7. For non-interactive invocations, a new session shall be created
+   (`--new-session`). For interactive terminal UIs, the wrapper shall keep the
+   caller's terminal session so terminal-generated resize events (`SIGWINCH`)
+   continue to reach the agent.
 8. The environment shall be cleared (`--clearenv`) and selectively rebuilt
    (see §7).
 
@@ -123,6 +129,7 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 4. The sandbox mise config shall contain the selected AI tool's entry:
    - Codex: `"npm:@openai/codex" = "latest"`
    - Copilot: equivalent entry (TBD)
+   - Pi: `"npm:@mariozechner/pi-coding-agent" = "latest"`
 5. Mise shall be configured to read **both** the project's mise config and
    the sandbox HOME's mise config. Since mise reads configs from both the
    project directory and `$MISE_CONFIG_DIR` by default, this should work
@@ -199,10 +206,11 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 ```
 codex-wrap [OPTIONS] [-- EXTRA_ARGS...]
 copilot-wrap [OPTIONS] [-- EXTRA_ARGS...]
+pi-wrap [OPTIONS] [-- EXTRA_ARGS...]
 
 Options:
   --project PATH        Project directory (default: $PWD)
-  --tool codex|copilot  Explicit tool selection (overrides argv[0])
+  --tool codex|copilot|pi  Explicit tool selection (overrides argv[0])
   --no-net              Disable network access
   --docker              Mount Docker socket and config
   --aws PROFILE         Acquire temporary AWS credentials via STS

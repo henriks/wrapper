@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sandbox wrapper for AI coding agents (Codex, Copilot).
+"""Sandbox wrapper for AI coding agents (Codex, Copilot, Pi).
 
 Uses Bubblewrap (bwrap) to run agents in an isolated namespace with
 persistent, project-local state stored in .sandbox/.
@@ -38,6 +38,16 @@ TOOLS = {
             ".config/github-copilot",
             ".cache/github-copilot",
             ".config/gh",
+        ],
+    },
+    "pi": {
+        "cli": "pi",
+        "auto_flags": [],
+        "mise_package": 'npm:@mariozechner/pi-coding-agent',
+        "mise_version": "latest",
+        "host_home_mounts": [
+            ".pi",
+            ".agents",
         ],
     },
 }
@@ -85,6 +95,8 @@ def detect_tool(argv0: str) -> str | None:
         return "codex"
     if "copilot" in base:
         return "copilot"
+    if base == "pi" or base.startswith("pi-") or base.endswith("-pi"):
+        return "pi"
     return None
 
 
@@ -316,6 +328,7 @@ def build_bwrap_args(
     extra_rw: list[str] | None = None,
     pass_env: list[str] | None = None,
     cli_args: list[str] | None = None,
+    interactive_tty: bool = False,
 ) -> list[str]:
     """Build the full bwrap command line."""
     uid = os.getuid()
@@ -331,7 +344,13 @@ def build_bwrap_args(
     args += ["--unshare-all", "--cap-drop", "ALL"]
     if not no_net:
         args += ["--share-net"]
-    args += ["--die-with-parent", "--new-session"]
+    args += ["--die-with-parent"]
+    # Bubblewrap's --new-session prevents terminal-generated SIGWINCH from
+    # reaching full-screen TUIs like pi, so keep the caller's terminal session
+    # for interactive runs and only create a new session for non-interactive
+    # invocations.
+    if not interactive_tty:
+        args += ["--new-session"]
     args += ["--uid", str(uid), "--gid", str(gid)]
 
     # -- Clear environment --
@@ -570,19 +589,10 @@ def build_bwrap_args(
     args += ["--chdir", project]
 
     # -- Command to run inside sandbox --
-    # If extra args are given, they replace the tool command entirely.
-    # Otherwise, run the default tool CLI with auto-flags.
-    tool_def = TOOLS[tool]
-    extra = list(cli_args or [])
-
-    if extra:
-        # Extra args = the command to run (replaces tool)
-        cmd_parts = [shell_quote(a) for a in extra]
-        tool_cmd = " ".join(cmd_parts)
-    else:
-        # Default: run the tool with auto-flags
-        parts = [tool_def["cli"]] + list(tool_def["auto_flags"])
-        tool_cmd = " ".join(shell_quote(a) for a in parts)
+    # Extra args are passed through to the selected tool CLI.
+    tool_cmd = " ".join(
+        shell_quote(arg) for arg in build_tool_command(tool, cli_args)
+    )
 
     # Build the inner command
     # Use mise activate to set up PATH properly, then exec the command
@@ -611,6 +621,19 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def build_tool_command(tool: str, cli_args: list[str] | None = None) -> list[str]:
+    """Build the tool command with tool-specific default flags."""
+    tool_def = TOOLS[tool]
+    extra = list(cli_args or [])
+
+    cmd = [tool_def["cli"]]
+    for flag in tool_def["auto_flags"]:
+        if flag not in extra:
+            cmd.append(flag)
+    cmd.extend(extra)
+    return cmd
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -626,7 +649,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Project directory (default: $PWD)",
     )
     parser.add_argument(
-        "--tool", choices=["codex", "copilot"],
+        "--tool", choices=["codex", "copilot", "pi"],
         help="Explicit tool selection (overrides invocation name)",
     )
     parser.add_argument(
@@ -687,7 +710,8 @@ def main() -> None:
     tool = args.tool or detect_tool(sys.argv[0])
     if not tool:
         die("Cannot determine tool from invocation name. "
-            "Use --tool codex|copilot or invoke as codex-wrap/copilot-wrap.")
+            "Use --tool codex|copilot|pi or invoke as "
+            "codex-wrap/copilot-wrap/pi-wrap.")
 
     if tool not in TOOLS:
         die(f"Unknown tool: {tool}")
@@ -743,6 +767,12 @@ def main() -> None:
             print("warning: --gh specified but could not extract token "
                   "(run 'gh auth login' on the host)", file=sys.stderr)
 
+    interactive_tty = (
+        sys.stdin.isatty() and
+        sys.stdout.isatty() and
+        sys.stderr.isatty()
+    )
+
     # Build bwrap command
     bwrap_args = build_bwrap_args(
         project=project,
@@ -756,6 +786,7 @@ def main() -> None:
         extra_rw=args.rw,
         pass_env=args.pass_env,
         cli_args=args.extra,
+        interactive_tty=interactive_tty,
     )
 
     # Execute
