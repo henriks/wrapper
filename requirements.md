@@ -46,8 +46,7 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    over its path within the project directory mount.
 5. `--reset` shall remove the entire `.sandbox/` directory so the next run
    starts fresh.
-6. On first run, the script shall append `.sandbox/` to the project's
-   `.gitignore` if not already present.
+6. The script shall not modify the project's `.gitignore`.
 
 ---
 
@@ -119,7 +118,6 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    ```toml
    [tools]
    node = "24"
-   python = "latest"
    ```
 3. The script shall maintain a **separate** mise config for sandbox-specific
    tool entries (e.g. the AI tool npm package) at

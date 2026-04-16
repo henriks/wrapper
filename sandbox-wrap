@@ -75,7 +75,6 @@ CREDENTIAL_NULLS = {
 DEFAULT_MISE_TOML = """\
 [tools]
 node = "24"
-python = "latest"
 """
 
 
@@ -747,7 +746,6 @@ def main() -> None:
 
     # Set up .sandbox
     sandbox = ensure_sandbox_dir(project)
-    ensure_gitignore(project)
 
     # Set up mise configs
     ensure_project_mise_config(project)
