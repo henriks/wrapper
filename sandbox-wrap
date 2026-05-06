@@ -29,7 +29,7 @@ TOOLS = {
         "host_home_mounts": [".codex"],
     },
     "copilot": {
-        "cli": "github-copilot-cli",
+        "cli": "copilot",
         "auto_flags": ["--allow-all", "--no-auto-update"],
         "mise_package": 'npm:@github/copilot',
         "mise_version": "latest",
