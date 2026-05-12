@@ -185,6 +185,16 @@ Required output:
 - documented semantic compromises, especially inode identity and hardlink /
   rename behavior
 
+Outcome:
+- completed in `docker/filesystem-semantics-baseline.md`
+- v1 must support normal writable development workflows, not only lookup/read
+- required behavior includes lookup counts, open handles surviving
+  rename/unlink, nested readonly enforcement, file mounts in parent `readdir`,
+  `access` checks, `flush`/`fsync`, and xattr delegation where supported
+- explicit v1 deferrals include POSIX locks, special-device `mknod`, cross-mount
+  hardlinks/renames, live migration state, and rare operations such as
+  `ioctl`, `poll`, `copyfilerange`, and `syncfs`
+
 ## Manifest Design
 
 The host generates an authoritative manifest before backend startup.
@@ -211,6 +221,16 @@ Example entries:
 
 The backend enforces the manifest. It must not invent policy outside what the
 manifest encodes.
+
+Detailed outcome:
+- host manifest and guest bind manifest are defined in
+  `docker/composed-fs-manifest.md`
+- v1 host manifest path:
+  `.sandbox/docker-vm/run/composed-fs-manifest.json`
+- v1 guest bind manifest path:
+  `.sandbox/docker-vm/run/guest-config/composed-binds.json`
+- v1 keeps the existing tiny config share for bind metadata until a replacement
+  boot-config mechanism is documented
 
 ## Overlap and Conflict Rules
 
@@ -248,45 +268,52 @@ Spike 2 may refine this if the public API reality differs.
 
 ### Internal Model
 
-Likely data structures:
+Current data structures:
 - `MountSpec`: manifest entry plus stable mount id
-- `NodeKind`: `SyntheticDir`, `MountRootDir`, `MountRootFile`,
-  `DelegatedHostNode`
-- `Node`: inode number, parent inode, name, mount id, node kind, attributes,
-  lookup count
-- `HandleState`: open file fd, directory iterator, flags, access mode,
+- `NodeKind`: `SyntheticDir`, `OverlayDir`, `MountRoot`, and host-backed
+  delegated nodes
+- `Node`: inode number, node kind, synthetic fallback attributes, and lookup
+  count
+- `MountRuntime`: manifest mount plus root fd opened on backend startup
+- future `HandleState`: open file fd, directory iterator, flags, access mode,
   originating inode
 
 Synthetic nodes exist only in the virtual namespace. Mounted roots are explicit
 manifest entries. Delegated host nodes are descendants under a mounted subtree
 and may be materialized lazily.
 
+Current outcome:
+- implemented in `composed-fs/` and documented in
+  `docker/composed-fs-core.md`
+- `lookup`, `getattr`, and `readdir` now delegate to host-backed subtrees
+- nested mount boundaries are represented by overlay directories that merge
+  host directory entries with mounted child boundaries
+
 ### Inode Identity
 
-The first implementation must choose and document an inode identity policy.
-
-A simple `(mount_id, relative_path)` cache is acceptable only if the spike
-documents the semantic compromises. It is likely insufficient for hardlinks,
-open-then-rename behavior, and stable identity across renames.
-
-Preferred direction:
+Policy:
 - stable synthetic inodes for `/`, synthetic parents, and mount roots
 - delegated host-backed identity based on mount id plus host `dev` / `ino`
-  metadata where practical
+  metadata
 - path metadata retained only for traversal, readdir, and invalidation
 - lookup-count tracking that satisfies the `FileSystem` trait
+
+Known remaining gap:
+- open-handle lifetime and stale inode retirement after unlink/rename are not
+  implemented until the operation-surface ticket adds file/dir handle tables
 
 ### Safe Host Path Resolution
 
 The backend must never resolve guest paths by string-concatenating host paths.
 
 For each host-backed mount:
-- hold a root fd or equivalent safe root reference
-- resolve descendants with fd-relative operations
-- prevent escape via symlinks or `..`
-- preserve mount boundaries for nested ro/rw overrides
-- use `openat2` with appropriate resolution flags when available, with a
-  documented fallback if needed
+- hold a root fd
+- resolve descendants with fd-relative `openat2`
+- reject `..` before host traversal
+- preserve mount boundaries for nested ro/rw overrides through overlay nodes
+- use `RESOLVE_IN_ROOT` and `RESOLVE_NO_MAGICLINKS`
+- fall back to `openat` only after strict component validation if `openat2` is
+  unavailable
 
 The guest is untrusted. Backend path handling is security-sensitive.
 
@@ -361,16 +388,17 @@ Implementation order:
 2. Complete and document the `virtiofsd` crate embedding spike.
 3. Complete and document the filesystem semantics spike.
 4. Define the manifest schema, overlap rules, and bind manifest format.
-5. Implement the composed backend behind a feature flag on the current `q35`
+5. Implement the composed filesystem namespace and safe traversal core.
+6. Implement the composed backend behind a feature flag on the current `q35`
    path.
-6. Add backend correctness and adversarial security tests.
-7. Switch guest init to mount the composed export and bind selected paths.
-8. Validate Docker, payload control, auth/state sharing, and real tool smoke
+7. Add backend correctness and adversarial security tests.
+8. Switch guest init to mount the composed export and bind selected paths.
+9. Validate Docker, payload control, auth/state sharing, and real tool smoke
    commands on `q35 + composed fs`.
-9. Add a `microvm` QEMU command branch using the documented spike result.
-10. Validate `microvm + composed fs`.
-11. Measure startup and readiness times against the current implementation.
-12. Make the composed backend and `microvm` path default only after acceptance
+10. Add a `microvm` QEMU command branch using the documented spike result.
+11. Validate `microvm + composed fs`.
+12. Measure startup and readiness times against the current implementation.
+13. Make the composed backend and `microvm` path default only after acceptance
     criteria are met.
 13. Remove the old per-share export path after a fallback window.
 

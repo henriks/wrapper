@@ -1,6 +1,6 @@
 ---
 id: wra-30di
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-11T20:43:19Z
@@ -22,3 +22,9 @@ Document required behavior for lookup, forget, open, release, flush, fsync, geta
 
 A v1 operation/semantics baseline is documented; deliberate semantic compromises are explicit; backend test tickets are updated with the resulting required coverage.
 
+
+## Notes
+
+**2026-05-12T20:54:03Z**
+
+Filesystem semantics spike completed. Documented baseline in docker/filesystem-semantics-baseline.md and summarized the outcome in plan.md. Key decisions: v1 must support a real writable development filesystem for host-backed mounts, including lookup/forget bookkeeping, open handles surviving rename/unlink, nested readonly enforcement, file mounts visible in parent readdir, access checks, flush/fsync, and xattr delegation where host supports it. Explicitly deferred: POSIX locks, special-device mknod, cross-mount hardlinks/renames, live migration state, ioctl, poll, copyfilerange, syncfs, and possibly fallocate.

@@ -22,3 +22,9 @@ Use the guest bind manifest from the schema ticket. Define parent directory crea
 
 Guest init can mount the composed export and bind workspace, tool state, auth/config, system ro paths, and user --ro/--rw paths; failure behavior is clear in logs; the old share-per-tag logic remains available until fallback removal.
 
+
+## Notes
+
+**2026-05-12T20:57:08Z**
+
+Dependency insight from wra-a9je: guest init should mount composed export tag agentvm at /run/agentvm-host, then read /run/agentvm-config/composed-binds.json from the existing tiny config share. Bind entries are derived from host manifest and include composed_mountpoint, source, target, kind, required, and create_parent. Guest init should process parent-before-child, create target parents, create file placeholders for kind=file, fail required bind errors, and log/skip optional failures. It must not interpret host paths or source classes.

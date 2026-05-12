@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "export_tag": "agentvm",
+  "created_by": "fixture",
+  "mounts": [
+    {
+      "id": "m0001_workspace",
+      "guest_path": "/workspace",
+      "host_path": "/home/hsaksela/ai/wrapper",
+      "kind": "dir",
+      "access": "rw",
+      "source_class": "workspace",
+      "required": true,
+      "bind": true,
+      "metadata": {
+        "uid_gid": "host",
+        "permissions": "host"
+      }
+    },
+    {
+      "id": "m0002_hosts",
+      "guest_path": "/etc/hosts",
+      "host_path": "/etc/hosts",
+      "kind": "file",
+      "access": "ro",
+      "source_class": "system-ro",
+      "required": false,
+      "bind": true,
+      "metadata": {
+        "uid_gid": "host",
+        "permissions": "host"
+      }
+    }
+  ],
+  "synthetic": {
+    "uid": 0,
+    "gid": 0,
+    "dir_mode": "0555"
+  },
+  "protected_guest_paths": [
+    "/run",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/var/lib/docker"
+  ]
+}

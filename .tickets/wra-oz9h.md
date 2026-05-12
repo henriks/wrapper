@@ -22,3 +22,9 @@ Test boot, Docker readiness, payload readiness, project path identity, Docker bi
 
 Validation results are documented in plan.md, an adjacent docker design note, or ticket notes; failures have follow-up tickets; q35 + composed fs is considered usable enough to proceed to microvm implementation.
 
+
+## Notes
+
+**2026-05-12T20:54:34Z**
+
+Dependency insight from wra-30di: q35 + composed fs validation should run the smoke commands from docker/filesystem-semantics-baseline.md, including shell/path basics, open-after-rename/unlink, readonly path write failure, git status/rev-parse/diff, package/tool state writes under HOME, Docker bind mount from PWD, Codex/Copilot state visibility, GitHub config readonly behavior when --gh is used, and xattr smoke where host supports xattrs.

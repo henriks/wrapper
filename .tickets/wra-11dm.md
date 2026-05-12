@@ -22,3 +22,9 @@ Test boot, Docker readiness, payload readiness, networking, hostfwd, --docker-pu
 
 Validation results are documented; any blockers have follow-up tickets; microvm + composed fs is explicitly approved or not approved for default use based on evidence.
 
+
+## Notes
+
+**2026-05-12T20:54:46Z**
+
+Dependency insight from wra-30di: microvm + composed fs validation should reuse the smoke commands from docker/filesystem-semantics-baseline.md after q35 validation passes, especially Docker bind mounts, payload/tool state writes, readonly failures, and open-after-rename/unlink behavior.

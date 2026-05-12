@@ -1,6 +1,6 @@
 ---
 id: wra-jyn1
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-11T20:43:04Z
@@ -28,3 +28,7 @@ All feasibility spike tickets are closed and their outcomes are documented in pl
 **2026-05-12T20:49:03Z**
 
 Progress update: closed wra-mjer and wra-zgpp. Microvm/device feasibility is documented in docker/microvm-spike.md; virtiofsd embedding feasibility is documented in docker/virtiofsd-embedding-spike.md. Remaining child for this discovery epic is wra-30di, the filesystem semantics baseline.
+
+**2026-05-12T20:54:59Z**
+
+All feasibility spike children are now closed. Outcomes are documented in docker/microvm-spike.md, docker/virtiofsd-embedding-spike.md, docker/filesystem-semantics-baseline.md, and summarized in plan.md. Discovery epic acceptance criteria are satisfied.

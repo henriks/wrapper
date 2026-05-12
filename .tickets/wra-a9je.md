@@ -1,6 +1,6 @@
 ---
 id: wra-a9je
-status: open
+status: closed
 deps: [wra-30di]
 links: []
 created: 2026-05-11T20:43:42Z
@@ -22,3 +22,13 @@ Use plan.md as the starting point. Specify overlap and conflict rules precisely:
 
 The manifest schemas and conflict rules are documented; examples cover workspace, .codex, .docker, gh config, system certs, file mounts, user --ro, and user --rw; backend and guest-init implementation tickets have enough detail to start without rediscovery.
 
+
+## Notes
+
+**2026-05-12T20:54:11Z**
+
+Dependency insight from wra-30di: manifest schema must encode source class and readonly/writable policy strongly enough for backend enforcement, especially nested ro inside rw. It must support first-class file mounts and protected internal runtime paths. Synthetic parents must be manifest-derived only; creating arbitrary new files under synthetic parents should fail unless inside a writable mounted subtree. See docker/filesystem-semantics-baseline.md.
+
+**2026-05-12T20:56:57Z**
+
+Manifest schema ticket completed. Documented host manifest and guest bind manifest in docker/composed-fs-manifest.md and summarized paths in plan.md. V1 host manifest path: .sandbox/docker-vm/run/composed-fs-manifest.json. V1 guest bind manifest path: .sandbox/docker-vm/run/guest-config/composed-binds.json. V1 intentionally keeps the tiny config share for bind metadata until a replacement boot-config mechanism is designed.
