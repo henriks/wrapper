@@ -1,6 +1,6 @@
 ---
 id: wra-zgpp
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-11T20:43:19Z
@@ -22,3 +22,9 @@ Build the smallest possible proof of concept that serves a trivial synthetic fil
 
 The API decision is documented with evidence; either a minimal buildable proof of concept exists or a clear blocker/fallback is documented; later backend tickets have notes if their assumptions changed.
 
+
+## Notes
+
+**2026-05-12T20:48:31Z**
+
+Spike completed. Documented outcome in docker/virtiofsd-embedding-spike.md. virtiofsd 1.13.3 exposes the needed public seam: filesystem::FileSystem, SerializableFileSystem, DirectoryIterator, and vhost_user::VhostUserFsBackendBuilder. A temporary local probe in /tmp/virtiofsd-api-probe built successfully against virtiofsd 1.13.3 with default-features=false plus vhost 0.13.0, vhost-user-backend 0.17.0, and vm-memory 0.16.x. The probe constructed VhostUserFsBackend<ProbeFs>, wrapped it in VhostUserDaemon, and created a vhost-user listener socket. Decision: proceed with repo-owned ComposedFs implementing FileSystem + SerializableFileSystem and reuse upstream virtiofsd at the protocol boundary.

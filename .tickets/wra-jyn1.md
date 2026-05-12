@@ -22,3 +22,9 @@ Run small targeted experiments only. Do not implement the production composed fi
 
 All feasibility spike tickets are closed and their outcomes are documented in plan.md, an adjacent docker design note, or ticket notes.
 
+
+## Notes
+
+**2026-05-12T20:49:03Z**
+
+Progress update: closed wra-mjer and wra-zgpp. Microvm/device feasibility is documented in docker/microvm-spike.md; virtiofsd embedding feasibility is documented in docker/virtiofsd-embedding-spike.md. Remaining child for this discovery epic is wra-30di, the filesystem semantics baseline.

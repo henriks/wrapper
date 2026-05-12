@@ -22,3 +22,9 @@ Use virtio-mmio-compatible devices for rootfs, Docker data disk, rng, net, and c
 
 The microvm branch is implemented behind a non-default switch; command construction is covered enough to prevent regressions; deviations from the spike are documented with reasons.
 
+
+## Notes
+
+**2026-05-11T21:22:59Z**
+
+Dependency insight from wra-mjer: implement microvm branch from docker/microvm-spike.md. Required shape: -machine microvm,acpi=off,memory-backend=mem,isa-serial=on; -enable-kvm; likely -cpu host; use virtio-blk-device, virtio-rng-device, vhost-user-fs-device, and -netdev user plus virtio-net-device. Do not use PCI devices. Keep direct kernel/initrd boot and memory-backend-memfd share=on for vhost-user-fs. Hostfwd has been validated for payload control and Docker _ping.

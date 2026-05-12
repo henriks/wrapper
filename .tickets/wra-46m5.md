@@ -22,3 +22,9 @@ Use the documented filesystem semantics baseline. Avoid naive host path string c
 
 Synthetic lookup/readdir, dir mounts, file mounts, nested boundaries, lookup/forget behavior, and safe traversal are implemented and covered by tests; semantic compromises are documented before closing.
 
+
+## Notes
+
+**2026-05-12T20:48:42Z**
+
+Dependency insight from wra-zgpp: upstream FileSystem docs explicitly require lookup-count bookkeeping. Every returned Entry increments lookup count; forget decrements it; inodes with non-zero lookup count can continue receiving requests after unlink/rmdir/rename and open handles delay final forget until release/releasedir. Treat this as a core correctness requirement for ComposedFs, not a cache optimization.

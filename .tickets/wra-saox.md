@@ -22,3 +22,9 @@ Keep this behind a non-default path. Do not implement the full filesystem semant
 
 The backend builds locally; it can start and serve a trivial or minimal manifest-defined namespace; logs and socket paths are documented; any deviations from the spike decision are added as ticket notes.
 
+
+## Notes
+
+**2026-05-12T20:48:38Z**
+
+Dependency insight from wra-zgpp: scaffold the backend using virtiofsd 1.13.3 with default-features=false, plus direct dependencies vhost 0.13.0, vhost-user-backend 0.17.0, and vm-memory 0.16.x with backend-mmap/backend-atomic. Use VhostUserFsBackendBuilder around repo-owned ComposedFs and VhostUserDaemon with GuestMemoryAtomic<GuestMemoryMmap>. See docker/virtiofsd-embedding-spike.md for the compile probe and recommended process wiring.

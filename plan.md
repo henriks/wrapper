@@ -137,6 +137,13 @@ Required output:
 - notes on whether user-mode networking and current `hostfwd` behavior survive
 - notes on device count and any `microvm` limitations
 
+Outcome:
+- completed in `docker/microvm-spike.md`
+- `microvm` is feasible with the current appliance when ACPI is disabled
+- the working command uses non-PCI virtio devices and QEMU user-mode
+  networking with explicit `-netdev` plus `virtio-net-device`
+- hostfwd works for both Docker `_ping` and payload control
+
 ### Spike 2: `virtiofsd` Crate Embedding Feasibility
 
 Purpose:
@@ -152,6 +159,14 @@ Required output:
 - clear decision on whether to use `virtiofsd::vhost_user::VhostUserFsBackend`
   and implement `filesystem::FileSystem`
 - fallback plan if the desired public seams are unavailable or unstable
+
+Outcome:
+- completed in `docker/virtiofsd-embedding-spike.md`
+- `virtiofsd 1.13.3` exposes the needed public protocol-boundary APIs
+- a local compile probe built `VhostUserFsBackend<ProbeFs>`, wrapped it in
+  `VhostUserDaemon`, and created a vhost-user listener socket
+- proceed with a repo-owned `ComposedFs` implementing
+  `filesystem::FileSystem` and `SerializableFileSystem`
 
 ### Spike 3: Filesystem Semantics and Compatibility Baseline
 
