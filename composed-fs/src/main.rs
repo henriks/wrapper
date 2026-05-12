@@ -14,11 +14,11 @@ use serde::Deserialize;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{
-    Context, DirEntry, DirectoryIterator, Entry, FileSystem, FsOptions, OpenOptions,
-    SerializableFileSystem, ROOT_ID,
+    Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, FsOptions, OpenOptions,
+    SerializableFileSystem, SetattrValid, ZeroCopyReader, ZeroCopyWriter, ROOT_ID,
 };
 use virtiofsd::fuse;
-use virtiofsd::soft_idmap::{GuestGid, GuestUid};
+use virtiofsd::soft_idmap::{GuestGid, GuestUid, Id};
 use virtiofsd::vhost_user::VhostUserFsBackendBuilder;
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
 
@@ -198,6 +198,18 @@ struct Namespace {
     synthetic_uid: u32,
     synthetic_gid: u32,
     synthetic_dir_mode: u32,
+}
+
+struct FileHandle {
+    inode: u64,
+    file: File,
+    writable: bool,
+}
+
+#[derive(Default)]
+struct HandleTable {
+    next_handle: u64,
+    files: HashMap<u64, FileHandle>,
 }
 
 impl Namespace {
@@ -494,6 +506,42 @@ impl Namespace {
         }
     }
 
+    fn host_file_location(&self, node: &Node) -> Option<(usize, PathBuf)> {
+        match &node.kind {
+            NodeKind::MountRoot { mount } => Some((*mount, PathBuf::new())),
+            NodeKind::Host {
+                mount,
+                relative_path,
+            } => Some((*mount, relative_path.clone())),
+            _ => None,
+        }
+    }
+
+    fn host_child_location(&self, parent: u64, name: &str) -> io::Result<(usize, PathBuf)> {
+        validate_single_path_component(name)?;
+        let parent = self
+            .nodes
+            .get(&parent)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((mount, relative_path)) = self.host_location(parent) else {
+            return Err(io::Error::from_raw_os_error(libc::EROFS));
+        };
+        Ok((mount, relative_path.join(name)))
+    }
+
+    fn host_mount(&self, mount: usize) -> io::Result<&MountRuntime> {
+        self.mounts
+            .get(mount)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    fn ensure_mount_writable(&self, mount: usize) -> io::Result<()> {
+        match self.host_mount(mount)?.access {
+            AccessMode::Rw => Ok(()),
+            AccessMode::Ro => Err(io::Error::from_raw_os_error(libc::EROFS)),
+        }
+    }
+
     fn lookup_host_child(&mut self, parent: &Node, name: &str) -> io::Result<Option<(u64, Entry)>> {
         let Some((mount_index, parent_relative)) = self.host_location(parent) else {
             return Ok(None);
@@ -558,6 +606,27 @@ impl Namespace {
         inode
     }
 
+    fn entry_for_host_metadata(
+        &mut self,
+        mount_index: usize,
+        relative_path: PathBuf,
+        metadata: &fs::Metadata,
+    ) -> Entry {
+        let inode = self.get_or_create_host_node(mount_index, relative_path, metadata);
+        let node = self
+            .nodes
+            .get_mut(&inode)
+            .expect("host node must exist after insertion");
+        node.lookup_count = node.lookup_count.saturating_add(1);
+        Entry {
+            inode,
+            generation: 0,
+            attr: attr_from_metadata(inode, metadata),
+            attr_timeout: ATTR_TTL,
+            entry_timeout: ENTRY_TTL,
+        }
+    }
+
     fn forget_inode(&mut self, inode: u64, count: u64) {
         if inode == ROOT_ID {
             return;
@@ -587,13 +656,50 @@ impl Namespace {
 #[derive(Clone)]
 struct ComposedFs {
     namespace: Arc<RwLock<Namespace>>,
+    handles: Arc<RwLock<HandleTable>>,
 }
 
 impl ComposedFs {
     fn new(namespace: Namespace) -> Self {
         Self {
             namespace: Arc::new(RwLock::new(namespace)),
+            handles: Arc::new(RwLock::new(HandleTable {
+                next_handle: 1,
+                files: HashMap::new(),
+            })),
         }
+    }
+
+    fn insert_file_handle(&self, inode: u64, file: File, writable: bool) -> u64 {
+        let mut handles = self.handles.write().expect("handle table lock poisoned");
+        let handle = handles.next_handle;
+        handles.next_handle = handles.next_handle.saturating_add(1);
+        handles.files.insert(
+            handle,
+            FileHandle {
+                inode,
+                file,
+                writable,
+            },
+        );
+        handle
+    }
+
+    fn with_file_handle<T>(
+        &self,
+        inode: u64,
+        handle: u64,
+        f: impl FnOnce(&FileHandle) -> io::Result<T>,
+    ) -> io::Result<T> {
+        let handles = self.handles.read().expect("handle table lock poisoned");
+        let file = handles
+            .files
+            .get(&handle)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        if file.inode != inode {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        f(file)
     }
 }
 
@@ -678,6 +784,48 @@ impl FileSystem for ComposedFs {
         Ok((namespace.attr_for(node)?, ATTR_TTL))
     }
 
+    fn setattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        attr: fuse::SetattrIn,
+        _handle: Option<Self::Handle>,
+        valid: SetattrValid,
+    ) -> io::Result<(fuse::Attr, Duration)> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((mount_index, relative_path)) = namespace
+            .host_file_location(node)
+            .or_else(|| namespace.host_location(node))
+        else {
+            if valid.is_empty() {
+                return Ok((namespace.attr_for(node)?, ATTR_TTL));
+            }
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        };
+        if setattr_wants_mutation(valid) {
+            namespace.ensure_mount_writable(mount_index)?;
+        }
+        let mount = namespace.host_mount(mount_index)?;
+        let open_flags = if valid.contains(SetattrValid::SIZE) {
+            libc::O_RDWR
+        } else if matches!(node.kind, NodeKind::MountRoot { mount } if matches!(namespace.mounts[mount].kind, MountKind::Dir))
+            || matches!(node.kind, NodeKind::OverlayDir { .. })
+            || namespace.node_is_dir(node)?
+        {
+            libc::O_RDONLY | libc::O_DIRECTORY
+        } else {
+            libc::O_RDONLY
+        };
+        let file = open_beneath_for_io(mount.root.as_raw_fd(), &relative_path, open_flags, 0)?;
+        apply_setattr(&file, attr, valid)?;
+        let metadata = fstat_file(&file)?;
+        Ok((attr_from_metadata(inode, &metadata), ATTR_TTL))
+    }
+
     fn opendir(
         &self,
         _ctx: Context,
@@ -755,6 +903,378 @@ impl FileSystem for ComposedFs {
         }
 
         Ok(VecDirIter { entries, index: 0 })
+    }
+
+    fn open(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        _kill_priv: bool,
+        flags: u32,
+    ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((mount_index, relative_path)) = namespace.host_file_location(node) else {
+            return Err(io::Error::from_raw_os_error(libc::EISDIR));
+        };
+        if matches!(node.kind, NodeKind::MountRoot { mount } if matches!(namespace.mounts[mount].kind, MountKind::Dir))
+        {
+            return Err(io::Error::from_raw_os_error(libc::EISDIR));
+        }
+        if open_flags_want_write(flags) {
+            namespace.ensure_mount_writable(mount_index)?;
+        }
+        let mount = namespace.host_mount(mount_index)?;
+        let file = open_beneath_for_io(mount.root.as_raw_fd(), &relative_path, flags as i32, 0)?;
+        drop(namespace);
+
+        let handle = self.insert_file_handle(inode, file, open_flags_want_write(flags));
+        Ok((Some(handle), OpenOptions::empty()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        _kill_priv: bool,
+        flags: u32,
+        umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<(Entry, Option<Self::Handle>, OpenOptions)> {
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        let create_flags = flags as i32 | libc::O_CREAT;
+        let create_mode = mode & !umask;
+        let file = open_beneath_for_io(
+            mount.root.as_raw_fd(),
+            &relative_path,
+            create_flags,
+            create_mode,
+        )?;
+        let metadata = fstat_file(&file)?;
+        let entry = namespace.entry_for_host_metadata(mount_index, relative_path, &metadata);
+        let inode = entry.inode;
+        drop(namespace);
+
+        let handle = self.insert_file_handle(inode, file, open_flags_want_write(flags));
+        Ok((entry, Some(handle), OpenOptions::empty()))
+    }
+
+    fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((mount_index, relative_path)) = namespace.host_file_location(node) else {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        let mount = namespace.host_mount(mount_index)?;
+        readlink_beneath(mount.root.as_raw_fd(), &relative_path)
+    }
+
+    fn symlink(
+        &self,
+        _ctx: Context,
+        linkname: &CStr,
+        parent: Self::Inode,
+        name: &CStr,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        symlink_beneath(mount.root.as_raw_fd(), linkname, &relative_path)?;
+        let metadata = stat_beneath(mount.root.as_raw_fd(), &relative_path)?;
+        Ok(namespace.entry_for_host_metadata(mount_index, relative_path, &metadata))
+    }
+
+    fn mkdir(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        mkdir_beneath(mount.root.as_raw_fd(), &relative_path, mode & !umask)?;
+        let metadata = stat_beneath(mount.root.as_raw_fd(), &relative_path)?;
+        Ok(namespace.entry_for_host_metadata(mount_index, relative_path, &metadata))
+    }
+
+    fn mknod(
+        &self,
+        _ctx: Context,
+        parent: Self::Inode,
+        name: &CStr,
+        mode: u32,
+        rdev: u32,
+        umask: u32,
+        _extensions: Extensions,
+    ) -> io::Result<Entry> {
+        let kind = mode & libc::S_IFMT;
+        if kind != 0 && kind != libc::S_IFREG && kind != libc::S_IFIFO {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        }
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        mknod_beneath(mount.root.as_raw_fd(), &relative_path, mode & !umask, rdev)?;
+        let metadata = stat_beneath(mount.root.as_raw_fd(), &relative_path)?;
+        Ok(namespace.entry_for_host_metadata(mount_index, relative_path, &metadata))
+    }
+
+    fn unlink(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        unlink_beneath(mount.root.as_raw_fd(), &relative_path, false)
+    }
+
+    fn rmdir(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<()> {
+        let name = name
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        unlink_beneath(mount.root.as_raw_fd(), &relative_path, true)
+    }
+
+    fn rename(
+        &self,
+        _ctx: Context,
+        olddir: Self::Inode,
+        oldname: &CStr,
+        newdir: Self::Inode,
+        newname: &CStr,
+        flags: u32,
+    ) -> io::Result<()> {
+        let oldname = oldname
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let newname = newname
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (old_mount, old_relative) = namespace.host_child_location(olddir, oldname)?;
+        let (new_mount, new_relative) = namespace.host_child_location(newdir, newname)?;
+        if old_mount != new_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        namespace.ensure_mount_writable(old_mount)?;
+        let mount = namespace.host_mount(old_mount)?;
+        rename_beneath(mount.root.as_raw_fd(), &old_relative, &new_relative, flags)
+    }
+
+    fn link(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        newparent: Self::Inode,
+        newname: &CStr,
+    ) -> io::Result<Entry> {
+        let newname = newname
+            .to_str()
+            .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((old_mount, old_relative)) = namespace.host_file_location(node) else {
+            return Err(io::Error::from_raw_os_error(libc::EPERM));
+        };
+        let (new_mount, new_relative) = namespace.host_child_location(newparent, newname)?;
+        if old_mount != new_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        namespace.ensure_mount_writable(old_mount)?;
+        let mount = namespace.host_mount(old_mount)?;
+        link_beneath(mount.root.as_raw_fd(), &old_relative, &new_relative)?;
+        let metadata = stat_beneath(mount.root.as_raw_fd(), &new_relative)?;
+        Ok(namespace.entry_for_host_metadata(new_mount, new_relative, &metadata))
+    }
+
+    fn read<W: ZeroCopyWriter>(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        mut w: W,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        self.with_file_handle(inode, handle, |file| {
+            w.read_from_file_at(&file.file, size as usize, offset, None)
+        })
+    }
+
+    fn write<R: ZeroCopyReader>(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        mut r: R,
+        size: u32,
+        offset: u64,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
+    ) -> io::Result<usize> {
+        self.with_file_handle(inode, handle, |file| {
+            if !file.writable {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            r.write_to_file_at(&file.file, size as usize, offset, None)
+        })
+    }
+
+    fn flush(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        _lock_owner: u64,
+    ) -> io::Result<()> {
+        self.with_file_handle(inode, handle, |_file| Ok(()))
+    }
+
+    fn fsync(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        datasync: bool,
+        handle: Self::Handle,
+    ) -> io::Result<()> {
+        self.with_file_handle(inode, handle, |file| {
+            if datasync {
+                file.file.sync_data()
+            } else {
+                file.file.sync_all()
+            }
+        })
+    }
+
+    fn statfs(&self, _ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        let Some((mount_index, _relative_path)) = namespace
+            .host_file_location(node)
+            .or_else(|| namespace.host_location(node))
+        else {
+            let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
+            st.f_namemax = 255;
+            st.f_bsize = 4096;
+            return Ok(st);
+        };
+        let mount = namespace.host_mount(mount_index)?;
+        fstatvfs_file(&mount.root)
+    }
+
+    fn access(&self, _ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let node = namespace
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        if mask & libc::W_OK as u32 != 0 {
+            if let Some((mount_index, _relative_path)) = namespace
+                .host_file_location(node)
+                .or_else(|| namespace.host_location(node))
+            {
+                namespace.ensure_mount_writable(mount_index)?;
+            }
+        }
+        let Some((mount_index, relative_path)) = namespace
+            .host_file_location(node)
+            .or_else(|| namespace.host_location(node))
+        else {
+            return Ok(());
+        };
+        let mount = namespace.host_mount(mount_index)?;
+        access_beneath(mount.root.as_raw_fd(), &relative_path, mask as i32)
+    }
+
+    fn lseek(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        handle: Self::Handle,
+        offset: u64,
+        whence: u32,
+    ) -> io::Result<u64> {
+        self.with_file_handle(inode, handle, |file| {
+            let result =
+                unsafe { libc::lseek64(file.file.as_raw_fd(), offset as i64, whence as i32) };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(result as u64)
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn release(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        _flags: u32,
+        handle: Self::Handle,
+        flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
+    ) -> io::Result<()> {
+        let mut handles = self.handles.write().expect("handle table lock poisoned");
+        let file = handles
+            .files
+            .remove(&handle)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+        if file.inode != inode {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        if flush && file.writable {
+            file.file.sync_all()?;
+        }
+        Ok(())
     }
 
     fn releasedir(
@@ -990,6 +1510,24 @@ fn stat_beneath(root_fd: RawFd, relative_path: &Path) -> io::Result<fs::Metadata
 }
 
 fn open_beneath(root_fd: RawFd, relative_path: &Path, flags: i32) -> io::Result<File> {
+    open_beneath_with_mode(root_fd, relative_path, flags, 0)
+}
+
+fn open_beneath_for_io(
+    root_fd: RawFd,
+    relative_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> io::Result<File> {
+    open_beneath_with_mode(root_fd, relative_path, flags, mode)
+}
+
+fn open_beneath_with_mode(
+    root_fd: RawFd,
+    relative_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> io::Result<File> {
     validate_relative_path(relative_path)?;
     let path = if relative_path.as_os_str().is_empty() {
         CString::new(".")?
@@ -998,7 +1536,7 @@ fn open_beneath(root_fd: RawFd, relative_path: &Path, flags: i32) -> io::Result<
     };
     let mut how = unsafe { mem::zeroed::<libc::open_how>() };
     how.flags = (flags | libc::O_CLOEXEC) as u64;
-    how.mode = 0;
+    how.mode = mode as u64;
     how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
     let fd = unsafe {
         libc::syscall(
@@ -1021,16 +1559,188 @@ fn open_beneath(root_fd: RawFd, relative_path: &Path, flags: i32) -> io::Result<
         return Err(error);
     }
 
-    let fd = unsafe { libc::openat(root_fd, path.as_ptr(), flags | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::openat(root_fd, path.as_ptr(), flags | libc::O_CLOEXEC, mode) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+fn open_flags_want_write(flags: u32) -> bool {
+    let access_mode = flags as i32 & libc::O_ACCMODE;
+    access_mode == libc::O_WRONLY
+        || access_mode == libc::O_RDWR
+        || flags & (libc::O_TRUNC as u32 | libc::O_APPEND as u32) != 0
+}
+
 fn fstat_file(file: &File) -> io::Result<fs::Metadata> {
-    let proc_path = format!("/proc/self/fd/{}", file.as_raw_fd());
-    fs::metadata(proc_path)
+    file.metadata()
+}
+
+fn parent_and_leaf(path: &Path) -> io::Result<(PathBuf, CString)> {
+    validate_relative_path(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    if leaf.as_bytes().contains(&0) {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    Ok((parent, CString::new(leaf.as_bytes())?))
+}
+
+fn with_parent_dir<T>(
+    root_fd: RawFd,
+    path: &Path,
+    f: impl FnOnce(RawFd, &CStr) -> io::Result<T>,
+) -> io::Result<T> {
+    let (parent, leaf) = parent_and_leaf(path)?;
+    let parent_dir =
+        open_beneath_with_mode(root_fd, &parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    f(parent_dir.as_raw_fd(), leaf.as_c_str())
+}
+
+fn mkdir_beneath(root_fd: RawFd, path: &Path, mode: u32) -> io::Result<()> {
+    with_parent_dir(root_fd, path, |parent_fd, leaf| {
+        let result = unsafe { libc::mkdirat(parent_fd, leaf.as_ptr(), mode) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+fn mknod_beneath(root_fd: RawFd, path: &Path, mode: u32, rdev: u32) -> io::Result<()> {
+    with_parent_dir(root_fd, path, |parent_fd, leaf| {
+        let result = unsafe { libc::mknodat(parent_fd, leaf.as_ptr(), mode, rdev.into()) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+fn unlink_beneath(root_fd: RawFd, path: &Path, directory: bool) -> io::Result<()> {
+    with_parent_dir(root_fd, path, |parent_fd, leaf| {
+        let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+        let result = unsafe { libc::unlinkat(parent_fd, leaf.as_ptr(), flags) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+fn rename_beneath(root_fd: RawFd, old_path: &Path, new_path: &Path, flags: u32) -> io::Result<()> {
+    let (old_parent, old_leaf) = parent_and_leaf(old_path)?;
+    let (new_parent, new_leaf) = parent_and_leaf(new_path)?;
+    let old_parent =
+        open_beneath_with_mode(root_fd, &old_parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let new_parent =
+        open_beneath_with_mode(root_fd, &new_parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let result = if flags == 0 {
+        unsafe {
+            libc::renameat(
+                old_parent.as_raw_fd(),
+                old_leaf.as_ptr(),
+                new_parent.as_raw_fd(),
+                new_leaf.as_ptr(),
+            )
+        }
+    } else {
+        unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                old_parent.as_raw_fd(),
+                old_leaf.as_ptr(),
+                new_parent.as_raw_fd(),
+                new_leaf.as_ptr(),
+                flags,
+            ) as i32
+        }
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn link_beneath(root_fd: RawFd, old_path: &Path, new_path: &Path) -> io::Result<()> {
+    let (old_parent, old_leaf) = parent_and_leaf(old_path)?;
+    let (new_parent, new_leaf) = parent_and_leaf(new_path)?;
+    let old_parent =
+        open_beneath_with_mode(root_fd, &old_parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let new_parent =
+        open_beneath_with_mode(root_fd, &new_parent, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+    let result = unsafe {
+        libc::linkat(
+            old_parent.as_raw_fd(),
+            old_leaf.as_ptr(),
+            new_parent.as_raw_fd(),
+            new_leaf.as_ptr(),
+            0,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn symlink_beneath(root_fd: RawFd, linkname: &CStr, path: &Path) -> io::Result<()> {
+    with_parent_dir(root_fd, path, |parent_fd, leaf| {
+        let result = unsafe { libc::symlinkat(linkname.as_ptr(), parent_fd, leaf.as_ptr()) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+}
+
+fn readlink_beneath(root_fd: RawFd, path: &Path) -> io::Result<Vec<u8>> {
+    validate_relative_path(path)?;
+    let c_path = if path.as_os_str().is_empty() {
+        CString::new(".")?
+    } else {
+        CString::new(path.as_os_str().as_bytes())?
+    };
+    let mut buffer = vec![0; 4096];
+    let result = unsafe {
+        libc::readlinkat(
+            root_fd,
+            c_path.as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(result as usize);
+    Ok(buffer)
+}
+
+fn access_beneath(root_fd: RawFd, path: &Path, mask: i32) -> io::Result<()> {
+    validate_relative_path(path)?;
+    let c_path = if path.as_os_str().is_empty() {
+        CString::new(".")?
+    } else {
+        CString::new(path.as_os_str().as_bytes())?
+    };
+    let result = unsafe { libc::faccessat(root_fd, c_path.as_ptr(), mask, libc::AT_EACCESS) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn fstatvfs_file(file: &File) -> io::Result<libc::statvfs64> {
+    let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
+    let result = unsafe { libc::fstatvfs64(file.as_raw_fd(), &mut st) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(st)
 }
 
 struct HostDirEntry {
@@ -1111,6 +1821,8 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::FileExt;
+    use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 
     struct TestDir {
         path: PathBuf,
@@ -1177,6 +1889,44 @@ mod tests {
     fn lookup(fs: &ComposedFs, parent: u64, name: &str) -> io::Result<Entry> {
         let name = CString::new(name).expect("test name");
         fs.lookup(ctx(), parent, name.as_c_str())
+    }
+
+    struct VecReader {
+        data: Vec<u8>,
+    }
+
+    impl ZeroCopyReader for VecReader {
+        fn write_to_file_at(
+            &mut self,
+            file: &File,
+            count: usize,
+            offset: u64,
+            _flags: Option<WritevFlags>,
+        ) -> io::Result<usize> {
+            let count = count.min(self.data.len());
+            file.write_at(&self.data[..count], offset)
+        }
+    }
+
+    #[derive(Default)]
+    struct VecWriter {
+        data: Vec<u8>,
+    }
+
+    impl ZeroCopyWriter for VecWriter {
+        fn read_from_file_at(
+            &mut self,
+            file: &File,
+            count: usize,
+            offset: u64,
+            _flags: Option<ReadvFlags>,
+        ) -> io::Result<usize> {
+            let start = self.data.len();
+            self.data.resize(start + count, 0);
+            let read = file.read_at(&mut self.data[start..], offset)?;
+            self.data.truncate(start + read);
+            Ok(read)
+        }
     }
 
     #[test]
@@ -1262,5 +2012,239 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    #[test]
+    fn create_write_read_and_release_host_file() {
+        let test_dir = TestDir::new("io");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let name = CString::new("created.txt").expect("name");
+        let (entry, handle, _options) = fs
+            .create(
+                ctx(),
+                workspace.inode,
+                name.as_c_str(),
+                0o644,
+                false,
+                (libc::O_RDWR | libc::O_TRUNC) as u32,
+                0,
+                Extensions::default(),
+            )
+            .expect("create file");
+        let handle = handle.expect("file handle");
+
+        let written = fs
+            .write(
+                ctx(),
+                entry.inode,
+                handle,
+                VecReader {
+                    data: b"hello composed fs".to_vec(),
+                },
+                17,
+                0,
+                None,
+                false,
+                false,
+                0,
+            )
+            .expect("write file");
+        assert_eq!(written, 17);
+
+        let mut reader = VecWriter::default();
+        let read = fs
+            .read(ctx(), entry.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("read file");
+        assert_eq!(read, 17);
+        assert_eq!(reader.data, b"hello composed fs");
+
+        fs.release(ctx(), entry.inode, 0, handle, true, false, None)
+            .expect("release file");
+        assert_eq!(
+            fs::read_to_string(root.join("created.txt")).expect("read host file"),
+            "hello composed fs"
+        );
+    }
+
+    #[test]
+    fn readonly_mount_rejects_create() {
+        let test_dir = TestDir::new("readonly");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "readonly",
+            "/readonly",
+            &root,
+            AccessMode::Ro,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let readonly = lookup(&fs, ROOT_ID, "readonly").expect("lookup mount");
+        let name = CString::new("blocked").expect("name");
+        let error = match fs.create(
+            ctx(),
+            readonly.inode,
+            name.as_c_str(),
+            0o644,
+            false,
+            libc::O_RDWR as u32,
+            0,
+            Extensions::default(),
+        ) {
+            Ok(_) => panic!("readonly create succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+        assert!(!root.join("blocked").exists());
+    }
+
+    #[test]
+    fn directory_link_rename_and_symlink_operations_use_host_tree() {
+        let test_dir = TestDir::new("mutations");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("source"), b"data").expect("write source");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        let dir_name = CString::new("dir").expect("dir name");
+        fs.mkdir(
+            ctx(),
+            workspace.inode,
+            dir_name.as_c_str(),
+            0o755,
+            0,
+            Extensions::default(),
+        )
+        .expect("mkdir");
+        assert!(root.join("dir").is_dir());
+
+        let source = lookup(&fs, workspace.inode, "source").expect("lookup source");
+        let link_name = CString::new("linked").expect("link name");
+        fs.link(ctx(), source.inode, workspace.inode, link_name.as_c_str())
+            .expect("link");
+        assert_eq!(
+            fs::metadata(root.join("source"))
+                .expect("source metadata")
+                .ino(),
+            fs::metadata(root.join("linked"))
+                .expect("link metadata")
+                .ino()
+        );
+
+        let old_name = CString::new("linked").expect("old name");
+        let new_name = CString::new("renamed").expect("new name");
+        fs.rename(
+            ctx(),
+            workspace.inode,
+            old_name.as_c_str(),
+            workspace.inode,
+            new_name.as_c_str(),
+            0,
+        )
+        .expect("rename");
+        assert!(!root.join("linked").exists());
+        assert!(root.join("renamed").exists());
+
+        let target = CString::new("renamed").expect("target");
+        let symlink_name = CString::new("sym").expect("symlink name");
+        let sym = fs
+            .symlink(
+                ctx(),
+                target.as_c_str(),
+                workspace.inode,
+                symlink_name.as_c_str(),
+                Extensions::default(),
+            )
+            .expect("symlink");
+        assert_eq!(fs.readlink(ctx(), sym.inode).expect("readlink"), b"renamed");
+    }
+
+    #[test]
+    fn readonly_mount_rejects_write_access_probe() {
+        let test_dir = TestDir::new("readonly-access");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "readonly",
+            "/readonly",
+            &root,
+            AccessMode::Ro,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let readonly = lookup(&fs, ROOT_ID, "readonly").expect("lookup mount");
+        let file = lookup(&fs, readonly.inode, "file").expect("lookup file");
+
+        fs.access(ctx(), file.inode, libc::R_OK as u32)
+            .expect("read access");
+        let error = match fs.access(ctx(), file.inode, libc::W_OK as u32) {
+            Ok(_) => panic!("readonly write access succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+    }
+
+    #[test]
+    fn mknod_supports_regular_fallback_and_rejects_special_nodes() {
+        let test_dir = TestDir::new("mknod");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        let regular = CString::new("regular").expect("regular");
+        fs.mknod(
+            ctx(),
+            workspace.inode,
+            regular.as_c_str(),
+            libc::S_IFREG | 0o644,
+            0,
+            0,
+            Extensions::default(),
+        )
+        .expect("regular mknod");
+        assert!(root.join("regular").is_file());
+
+        let special = CString::new("special").expect("special");
+        let error = match fs.mknod(
+            ctx(),
+            workspace.inode,
+            special.as_c_str(),
+            libc::S_IFCHR | 0o644,
+            0,
+            0,
+            Extensions::default(),
+        ) {
+            Ok(_) => panic!("special mknod succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
     }
 }

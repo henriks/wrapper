@@ -36,3 +36,7 @@ Handoff from wra-46m5: namespace/traversal core is implemented and should not be
 **2026-05-12T21:17:22Z**
 
 Started after wra-46m5 closure. Next implementation slice should add handle tables and implement open/create/read/write/flush/fsync/release plus readonly write-intent rejection using the existing MountRuntime access policy. The FileSystem trait signatures for these methods are in virtiofsd 1.13.3 src/filesystem.rs; read/write should use ZeroCopyWriter::read_from_file_at and ZeroCopyReader::write_to_file_at against host File handles.
+
+**2026-05-12T21:27:38Z**
+
+Implemented a first operation-surface slice in composed-fs: file handle table, open/create/read/write/flush/fsync/release, mkdir, regular/FIFO mknod with EPERM for special nodes, unlink/rmdir, rename, link, symlink/readlink, statfs, access, and lseek. Readonly policy now rejects write-intent open/create/write access and mutating namespace operations with EROFS; cross-mount rename/link returns EXDEV. Added unit tests for file IO, readonly create/access rejection, mkdir/link/rename/symlink/readlink, and mknod behavior. Documented implemented slice and remaining work in docker/composed-fs-operations.md. Verified with cargo build --manifest-path composed-fs/Cargo.toml --offline and cargo test --manifest-path composed-fs/Cargo.toml --offline.

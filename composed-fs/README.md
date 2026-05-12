@@ -8,10 +8,13 @@ It currently:
 - opens mount roots as host fds and exposes host-backed lookup/getattr/readdir
 - reuses backend inodes for host nodes using `(mount, dev, ino)`
 - tracks lookup counts for entries returned by `lookup`
+- supports the initial host-backed operation slice: open/create/read/write,
+  mkdir/unlink/rmdir/rename/link/symlink/readlink, statfs/access/lseek, and
+  regular-file `mknod`
 - starts a vhost-user socket using upstream `virtiofsd` protocol-boundary APIs
 
-The backend deliberately does not yet implement the full write/read operation
-surface. That belongs to the follow-up operation-surface ticket.
+The backend deliberately does not yet implement the full v1 operation surface.
+Remaining work is documented in `docker/composed-fs-operations.md`.
 
 Build:
 

@@ -337,12 +337,13 @@ Readonly must hold even if the underlying host path is writable.
 
 ### V1 Operation Surface
 
-The v1 operation list must be finalized by Spike 3. The expected starting set
-is:
+The v1 operation list was finalized by the filesystem semantics baseline. The
+implemented operation slice is documented in `docker/composed-fs-operations.md`.
+
+Implemented:
 - `lookup`
 - `forget`
 - `getattr`
-- `setattr`
 - `access`
 - `opendir`
 - `readdir`
@@ -358,11 +359,20 @@ is:
 - `readlink`
 - `symlink`
 - `mkdir`
+- `mknod` for regular-file fallback and FIFO
 - `unlink`
+- `rmdir`
 - `rename`
+- `link`
+- `lseek`
 
-Advanced xattrs, locks, polling, and live-migration state can be deferred only
-if the compatibility baseline shows the wrapper does not need them.
+Still required before closing the operation-surface ticket:
+- `setattr`
+- xattrs
+- `fsyncdir`
+- stale inode retirement after unlink/rename plus release/forget
+- expected-error documentation for deferred locks, polling, live-migration
+  state, `copyfilerange`, `syncfs`, `tmpfile`, and `fallocate`
 
 ## Guest Init Changes
 
