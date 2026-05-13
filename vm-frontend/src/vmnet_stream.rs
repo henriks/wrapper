@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,12 +39,19 @@ impl VmnetStreamEndpoint {
         let (stream, _addr) = self.listener.accept()?;
         Ok(QemuFrameIo::new(stream, DEFAULT_MAX_FRAME_LEN))
     }
+
+    pub fn accept_one_nonblocking(&self) -> io::Result<VmnetFrameIo> {
+        let (stream, _addr) = self.listener.accept()?;
+        stream.set_nonblocking(true)?;
+        Ok(QemuFrameIo::new(stream, DEFAULT_MAX_FRAME_LEN))
+    }
 }
 
 #[derive(Debug)]
 pub struct QemuFrameIo<T> {
     stream: T,
     max_frame_len: u32,
+    read_buf: Vec<u8>,
 }
 
 pub type VmnetFrameIo = QemuFrameIo<UnixStream>;
@@ -57,6 +64,7 @@ where
         Self {
             stream,
             max_frame_len,
+            read_buf: Vec::new(),
         }
     }
 
@@ -74,6 +82,52 @@ where
 
         let mut frame = vec![0; length as usize];
         read_payload_exact(&mut self.stream, &mut frame)?;
+        Ok(Some(frame))
+    }
+
+    pub fn try_read_frame(&mut self) -> Result<FrameRead, VmnetStreamError> {
+        if let Some(frame) = self.pop_buffered_frame()? {
+            return Ok(FrameRead::Frame(frame));
+        }
+
+        let mut chunk = [0; 8192];
+        loop {
+            match self.stream.read(&mut chunk) {
+                Ok(0) if self.read_buf.is_empty() => return Ok(FrameRead::Eof),
+                Ok(0) => return Err(VmnetStreamError::TruncatedFrame),
+                Ok(count) => {
+                    self.read_buf.extend_from_slice(&chunk[..count]);
+                    if let Some(frame) = self.pop_buffered_frame()? {
+                        return Ok(FrameRead::Frame(frame));
+                    }
+                }
+                Err(error) if would_block(&error) => return Ok(FrameRead::WouldBlock),
+                Err(error) => return Err(VmnetStreamError::Io(error)),
+            }
+        }
+    }
+
+    fn pop_buffered_frame(&mut self) -> Result<Option<Vec<u8>>, VmnetStreamError> {
+        if self.read_buf.len() < 4 {
+            return Ok(None);
+        }
+        let length = u32::from_be_bytes(
+            self.read_buf[0..4]
+                .try_into()
+                .expect("length prefix is four bytes"),
+        );
+        if length == 0 || length > self.max_frame_len {
+            return Err(VmnetStreamError::InvalidFrameLength {
+                length,
+                max: self.max_frame_len,
+            });
+        }
+        let frame_end = 4 + length as usize;
+        if self.read_buf.len() < frame_end {
+            return Ok(None);
+        }
+        let frame = self.read_buf[4..frame_end].to_vec();
+        self.read_buf.drain(..frame_end);
         Ok(Some(frame))
     }
 
@@ -98,6 +152,13 @@ where
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameRead {
+    Frame(Vec<u8>),
+    WouldBlock,
+    Eof,
+}
+
 #[derive(Debug)]
 pub enum VmnetStreamError {
     Io(io::Error),
@@ -111,6 +172,10 @@ impl From<io::Error> for VmnetStreamError {
     fn from(error: io::Error) -> Self {
         Self::Io(error)
     }
+}
+
+fn would_block(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
 fn read_exact_or_eof(
@@ -192,6 +257,7 @@ fn write_pcap_global_header(writer: &mut impl Write, snaplen: u32) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
 
     fn ethernet_frame() -> Vec<u8> {
@@ -225,6 +291,53 @@ mod tests {
             frame.len() as u32
         );
         assert_eq!(&bytes[4..], frame.as_slice());
+    }
+
+    #[test]
+    fn nonblocking_reader_preserves_partial_frame_across_would_block() {
+        let frame = ethernet_frame();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&frame);
+
+        let first = encoded[..6].to_vec();
+        let second = encoded[6..].to_vec();
+        let mut io = QemuFrameIo::new(
+            ScriptedReadWrite::new(vec![
+                ReadStep::Bytes(first),
+                ReadStep::WouldBlock,
+                ReadStep::Bytes(second),
+            ]),
+            DEFAULT_MAX_FRAME_LEN,
+        );
+
+        assert_eq!(io.try_read_frame().expect("first"), FrameRead::WouldBlock);
+        assert_eq!(
+            io.try_read_frame().expect("second"),
+            FrameRead::Frame(frame)
+        );
+    }
+
+    #[test]
+    fn nonblocking_reader_leaves_following_frame_buffered() {
+        let first = ethernet_frame();
+        let second = vec![0xaa, 0xbb, 0xcc, 0xdd];
+        let mut encoded = Vec::new();
+        for frame in [&first, &second] {
+            encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+            encoded.extend_from_slice(frame);
+        }
+        let mut io = QemuFrameIo::new(
+            ScriptedReadWrite::new(vec![ReadStep::Bytes(encoded), ReadStep::WouldBlock]),
+            DEFAULT_MAX_FRAME_LEN,
+        );
+
+        assert_eq!(io.try_read_frame().expect("first"), FrameRead::Frame(first));
+        assert_eq!(
+            io.try_read_frame().expect("second"),
+            FrameRead::Frame(second)
+        );
+        assert_eq!(io.try_read_frame().expect("blocked"), FrameRead::WouldBlock);
     }
 
     #[test]
@@ -281,5 +394,55 @@ mod tests {
             frame.len() as u32
         );
         assert_eq!(&bytes[40..], frame.as_slice());
+    }
+
+    #[derive(Debug)]
+    enum ReadStep {
+        Bytes(Vec<u8>),
+        WouldBlock,
+    }
+
+    #[derive(Debug)]
+    struct ScriptedReadWrite {
+        steps: VecDeque<ReadStep>,
+        written: Vec<u8>,
+    }
+
+    impl ScriptedReadWrite {
+        fn new(steps: Vec<ReadStep>) -> Self {
+            Self {
+                steps: steps.into(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl Read for ScriptedReadWrite {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(ReadStep::Bytes(bytes)) => {
+                    let count = bytes.len().min(buf.len());
+                    buf[..count].copy_from_slice(&bytes[..count]);
+                    if count < bytes.len() {
+                        self.steps
+                            .push_front(ReadStep::Bytes(bytes[count..].to_vec()));
+                    }
+                    Ok(count)
+                }
+                Some(ReadStep::WouldBlock) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+                None => Ok(0),
+            }
+        }
+    }
+
+    impl Write for ScriptedReadWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }

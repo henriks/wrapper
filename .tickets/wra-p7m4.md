@@ -1,6 +1,6 @@
 ---
 id: wra-p7m4
-status: in_progress
+status: closed
 deps: [wra-zqua, wra-cz7d]
 links: []
 created: 2026-05-13T10:22:44Z
@@ -64,3 +64,51 @@ Added GuestTcpCore::send_to_session() and a test that writes HTTP response bytes
 **2026-05-13T11:24:22Z**
 
 Added vm-frontend/src/vmnet_gateway.rs as a frame-pump layer for the future QEMU stream loop. VmnetGateway handles L2 replies first, evaluates initial TCP SYN policy before smoltcp, fails denied SYNs closed with no guest frames, provisions smoltcp listeners for allowed destinations, polls the TCP core, and drains generated guest Ethernet frames. Tests cover denied SYN fail-closed behavior and allowed SYN listener installation/polling. This is still not the full async stream runtime or VM smoke, so wra-p7m4 remains in progress.
+
+**2026-05-13T15:23:29Z**
+
+Added TcpProxyBridge in vm-frontend/src/tcp_proxy.rs and QEMU stream runtime pump in vm-frontend/src/vmnet_runtime.rs. TcpProxyBridge owns host-side upstream connections, discovers established smoltcp sessions from VmnetGateway, reads guest payloads, applies HTTP/1 parsing/log events for TCP/80, writes guest bytes to the upstream connection, reads available upstream bytes, and sends them back into the guest TCP session. run_qemu_stream_until_eof() now connects QemuFrameIo framing to VmnetGateway and TcpProxyBridge, writing all generated guest frames back with QEMU stream length prefixes. Added in-memory tests for HTTP request/response bridging and a dynamic scripted QEMU stream that pumps SYN -> ARP -> ACK -> HTTP through the runtime without hard-coded TCP server sequence numbers. Remaining work before closing: use this runtime from the real frontend launch path, harden nonblocking/partial IO behavior for real TcpStream, and run/document a VM smoke test.
+
+**2026-05-13T15:26:58Z**
+
+Hardened the real upstream socket path for nonblocking operation: StdTcpConnector now sets TcpStream nonblocking and TCP_NODELAY after connect. Added an ignored-by-default loopback test for that behavior because the normal sandbox blocks local TCP bind; it was run explicitly with escalation and passed. Added pump_proxy_once() in vmnet_runtime so launch code can continue polling upstream sockets and writing guest frames even when QEMU has not sent another frame; added a delayed-response test proving upstream WouldBlock can be followed by a later pump that emits guest frames without additional guest input.
+
+**2026-05-13T15:29:05Z**
+
+Added buffered nonblocking QEMU stream support. QemuFrameIo now has try_read_frame() returning Frame/WouldBlock/Eof without discarding partial length or payload bytes, plus VmnetStreamEndpoint::accept_one_nonblocking(). Added run_qemu_stream_tick() so real launch code can run one nonblocking VM network iteration: read at most one guest frame, process gateway output, and pump upstream proxy readiness even when no guest frame is available. Tests cover preserving partial frame bytes across WouldBlock and retaining subsequent frames in the buffer.
+
+**2026-05-13T15:31:25Z**
+
+Integrated the vmnet runtime with the launch/supervisor surface. FrontendConfig::supervisor_plan() now carries a concrete VmnetRuntimeConfig instead of only a socket path, with default deny-by-default VmnetPolicy, network assignment, connect timeout, and idle sleep. Added serve_vmnet_gateway() as the real blocking entrypoint: bind Unix stream socket, accept QEMU nonblocking stream, build VmnetGateway + StdTcpConnector + TcpProxyBridge, then run nonblocking ticks until EOF. Added a minimal agentvm-frontend vmnet-gateway CLI with --socket, guest network overrides, --allow-ip, --allow-domain, and --allow-public-internet so the runtime can be launched directly by a future supervisor/smoke harness.
+
+**2026-05-13T15:34:03Z**
+
+Corrected the VM smoke prerequisite finding: /dev/kvm is present when checked outside the filesystem sandbox. The remaining smoke blocker is not KVM; it is launch integration. Existing sandbox-wrap still builds QEMU with -netdev user and hostfwd, so running it as-is would validate the legacy path rather than the Rust stream gateway. Updated vm-frontend/vmnet-runtime-validation.md with the corrected KVM finding and the required Rust frontend task ordering for the real smoke.
+
+**2026-05-13T15:42:32Z**
+
+Rust launch integration progressed under wra-9ida: agentvm-frontend prepare now writes real runtime manifests and prints a QEMU stream command against docker/out artifacts. Full VM HTTP smoke is still outstanding; do not close this ticket until agentvm-frontend launch has booted the microvm and an outbound HTTP request has traversed the Rust vmnet gateway.
+
+**2026-05-13T15:43:32Z**
+
+Real prepare validation now generates a stream QEMU command with console=ttyS0,115200n8 and .sandbox/docker-vm/docker-data.raw. This removes two likely false-negative smoke failures before the remaining real VM network validation.
+
+**2026-05-13T15:54:10Z**
+
+Bounded Rust launch reached guest network configuration on eth0 through the Rust frontend QEMU stream path, but no guest-originated HTTP request was run. The vmnet TCP/HTTP ticket still needs an end-to-end HTTP smoke from the booted guest before closure.
+
+**2026-05-13T15:55:32Z**
+
+Second bounded launch confirmed state.json writes for the Rust stream path. Guest console again reached network configuration and service startup before intentional timeout; still no guest HTTP egress request yet.
+
+**2026-05-13T15:58:54Z**
+
+Added persistent vmnet event logging. FrontendConfig now passes .sandbox/docker-vm/run/vmnet-events.log into VmnetRuntimeConfig; serve_vmnet_gateway appends concise TcpProxyEvent summaries for connects, denies, HTTP requests, guest payloads, and upstream payloads without dumping Ethernet frame bodies. A bounded KVM launch created the event log (empty because no guest HTTP was triggered yet).
+
+**2026-05-13T16:03:01Z**
+
+Added a narrow guest HTTP smoke hook that does not depend on host-to-guest ingress. docker/guest-init.sh now reads agentvm_http_smoke_url from /proc/cmdline and, after configuring eth0, runs one wget to that URL with output mirrored to .sandbox/docker-vm/run/guest-http-smoke.log. vm-frontend accepts --guest-http-smoke-url and appends the kernel arg; prepare validation confirmed the generated QEMU command includes agentvm_http_smoke_url=http://93.184.216.34/. Appliance artifacts need a rebuild before the guest-side hook is present in the booted init script.
+
+**2026-05-13T16:12:25Z**
+
+VM smoke passed after appliance rebuild using a deterministic local upstream to avoid external network/sandbox variability. Command: agentvm-frontend launch with --guest-http-smoke-url http://198.51.100.10/ --local-http-smoke-upstream 198.51.100.10:80 --allow-public-internet --qemu-timeout-seconds 30. Guest console reported HTTP smoke request completed; guest-http-smoke.log shows HTTP/1.1 200 OK and saved 2 bytes; vmnet-events.log shows tcp_connected, http_request method=GET host=198.51.100.10 path=/, guest_payload, and upstream_payload for 198.51.100.10:80. QEMU exit was the intentional timeout SIGKILL after validation.

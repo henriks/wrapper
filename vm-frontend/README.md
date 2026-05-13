@@ -12,6 +12,10 @@ Current scope:
 - DNS proxy policy hooks backed by `hickory-proto`
 - TCP destination policy and HTTP/1 request parsing backed by `ipnet` and
   `httparse`
+- smoltcp-backed userspace TCP handling and a QEMU stream runtime pump for the
+  rootless vmnet gateway
+- Rust runtime preparation and launch entrypoints that write composed-fs/config
+  manifests and start QEMU with stream networking
 - embedded composed-fs server configuration via `agentvm_composed_fs::ServeConfig`
 - state snapshot fields for the future `state.json` writer
 
@@ -37,8 +41,55 @@ and denies attempts to use non-gateway DNS destinations.
 TCP policy and HTTP interception helpers are in `src/tcp_gateway.rs`. They do
 CIDR-aware allow/deny checks before any host socket is opened, identify
 HTTP/HTTPS interception decisions, expose a host `TcpStream` connector boundary,
-and parse HTTP/1 request method/path/host with `httparse`. The full guest TCP
-state machine is still future work.
+and parse HTTP/1 request method/path/host with `httparse`.
+
+The guest TCP stack and stream runtime are in `src/guest_tcp.rs`,
+`src/vmnet_gateway.rs`, `src/tcp_proxy.rs`, and `src/vmnet_runtime.rs`. They use
+`smoltcp` to terminate guest TCP sessions in userspace, preserve original
+destinations for policy, bridge allowed sessions to ordinary host sockets, and
+write upstream bytes back as guest Ethernet frames. The launched gateway writes
+concise TCP/HTTP event summaries to `.sandbox/docker-vm/run/vmnet-events.log`.
+
+Real VM validation status and the KVM-host smoke procedure are documented in
+`vmnet-runtime-validation.md`.
+
+Prepare manifests and print the Rust stream QEMU command:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  prepare \
+  --project "$PWD" \
+  --run-dir "$PWD/.sandbox/docker-vm/run" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64
+```
+
+The blocking launcher entrypoint is:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  launch \
+  --project "$PWD" \
+  --run-dir "$PWD/.sandbox/docker-vm/run" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64 \
+  --allow-public-internet
+```
+
+For a VM egress smoke after rebuilding the appliance with the current
+`docker/guest-init.sh`, add:
+
+```sh
+  --guest-http-smoke-url http://93.184.216.34/
+```
+
+The guest will run one `wget` after configuring `eth0`, write the guest-side
+result to `.sandbox/docker-vm/run/guest-http-smoke.log`, and the vmnet gateway
+should log the intercepted request in `.sandbox/docker-vm/run/vmnet-events.log`.
+
+The launcher is intentionally Rust-only for the stream path: it does not add a
+QEMU `user` netdev or `hostfwd` fallback. Host-to-guest Docker/payload/published
+ports remain a later frontend-owned listener task.
 
 Validate:
 

@@ -1,0 +1,498 @@
+use std::collections::HashMap;
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::Ipv4Addr;
+
+use smoltcp::iface::SocketHandle;
+use smoltcp::socket::tcp;
+use smoltcp::time::Instant;
+use smoltcp::wire::IpAddress;
+
+use crate::guest_tcp::GuestTcpSession;
+use crate::tcp_gateway::{
+    evaluate_tcp_destination, parse_http_request, HttpParseError, HttpRequestSummary, TcpAction,
+    TcpConnectError, TcpDecision, TcpDestination, TcpUpstreamConnector,
+};
+use crate::vmnet_gateway::VmnetGateway;
+
+pub struct TcpProxyBridge<C>
+where
+    C: TcpUpstreamConnector,
+{
+    connector: C,
+    sessions: HashMap<SocketHandle, UpstreamSession<C::Connection>>,
+}
+
+impl<C> TcpProxyBridge<C>
+where
+    C: TcpUpstreamConnector,
+{
+    pub fn new(connector: C) -> Self {
+        Self {
+            connector,
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn process_gateway(
+        &mut self,
+        gateway: &mut VmnetGateway<'_>,
+        now: Instant,
+    ) -> Vec<TcpProxyEvent>
+    where
+        C::Connection: Read + Write,
+    {
+        let mut events = Vec::new();
+        for active in gateway.active_tcp_sessions() {
+            if active.session.state != tcp::State::Established {
+                continue;
+            }
+            let Some(destination) = destination_from_session(&active.session) else {
+                continue;
+            };
+
+            if !self.sessions.contains_key(&active.handle) {
+                let decision = evaluate_tcp_destination(gateway.policy(), &destination);
+                if decision.action == TcpAction::Deny {
+                    events.push(TcpProxyEvent::Denied {
+                        handle: active.handle,
+                        destination,
+                        decision,
+                    });
+                    continue;
+                }
+                match self.connector.connect(&destination) {
+                    Ok(connection) => {
+                        events.push(TcpProxyEvent::Connected {
+                            handle: active.handle,
+                            destination: destination.clone(),
+                            decision: decision.clone(),
+                        });
+                        self.sessions.insert(
+                            active.handle,
+                            UpstreamSession {
+                                destination,
+                                decision,
+                                connection,
+                                http_buffer: Vec::new(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        events.push(TcpProxyEvent::ConnectFailed {
+                            handle: active.handle,
+                            destination,
+                            error,
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let guest_bytes = match gateway.recv_tcp_session(active.handle) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    events.push(TcpProxyEvent::GuestReadFailed {
+                        handle: active.handle,
+                        error,
+                    });
+                    continue;
+                }
+            };
+            if !guest_bytes.is_empty() {
+                self.process_guest_payload(active.handle, guest_bytes, &mut events);
+            }
+
+            let Some(session) = self.sessions.get_mut(&active.handle) else {
+                continue;
+            };
+            if let Some(upstream_bytes) =
+                read_available(&mut session.connection, &mut events, active.handle)
+            {
+                match gateway.send_tcp_session(active.handle, &upstream_bytes, now) {
+                    Ok(guest_frames) => events.push(TcpProxyEvent::UpstreamPayload {
+                        handle: active.handle,
+                        bytes: upstream_bytes.len(),
+                        guest_frames,
+                    }),
+                    Err(error) => events.push(TcpProxyEvent::GuestWriteFailed {
+                        handle: active.handle,
+                        error,
+                    }),
+                }
+            }
+        }
+        events
+    }
+
+    fn process_guest_payload(
+        &mut self,
+        handle: SocketHandle,
+        guest_bytes: Vec<u8>,
+        events: &mut Vec<TcpProxyEvent>,
+    ) where
+        C::Connection: Write,
+    {
+        let Some(session) = self.sessions.get_mut(&handle) else {
+            return;
+        };
+
+        if session.decision.action == TcpAction::InterceptHttp {
+            session.http_buffer.extend_from_slice(&guest_bytes);
+            match parse_http_request(&session.http_buffer) {
+                Ok(Some(summary)) => events.push(TcpProxyEvent::HttpRequest {
+                    handle,
+                    destination: session.destination.clone(),
+                    summary,
+                }),
+                Ok(None) => events.push(TcpProxyEvent::HttpRequestIncomplete { handle }),
+                Err(HttpParseError::Malformed) => {
+                    events.push(TcpProxyEvent::HttpRequestMalformed { handle })
+                }
+            }
+        }
+
+        match write_all_best_effort(&mut session.connection, &guest_bytes) {
+            Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
+            Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+        }
+    }
+}
+
+struct UpstreamSession<T> {
+    destination: TcpDestination,
+    decision: TcpDecision,
+    connection: T,
+    http_buffer: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TcpProxyEvent {
+    Connected {
+        handle: SocketHandle,
+        destination: TcpDestination,
+        decision: TcpDecision,
+    },
+    Denied {
+        handle: SocketHandle,
+        destination: TcpDestination,
+        decision: TcpDecision,
+    },
+    ConnectFailed {
+        handle: SocketHandle,
+        destination: TcpDestination,
+        error: TcpConnectError,
+    },
+    GuestPayload {
+        handle: SocketHandle,
+        bytes: usize,
+    },
+    HttpRequest {
+        handle: SocketHandle,
+        destination: TcpDestination,
+        summary: HttpRequestSummary,
+    },
+    HttpRequestIncomplete {
+        handle: SocketHandle,
+    },
+    HttpRequestMalformed {
+        handle: SocketHandle,
+    },
+    UpstreamPayload {
+        handle: SocketHandle,
+        bytes: usize,
+        guest_frames: Vec<Vec<u8>>,
+    },
+    GuestReadFailed {
+        handle: SocketHandle,
+        error: tcp::RecvError,
+    },
+    GuestWriteFailed {
+        handle: SocketHandle,
+        error: tcp::SendError,
+    },
+    UpstreamWriteFailed {
+        handle: SocketHandle,
+        error: String,
+    },
+    UpstreamReadFailed {
+        handle: SocketHandle,
+        error: String,
+    },
+}
+
+fn destination_from_session(session: &GuestTcpSession) -> Option<TcpDestination> {
+    let IpAddress::Ipv4(ip) = session.local.addr;
+    Some(TcpDestination {
+        ip: Ipv4Addr::from(ip.octets()),
+        port: session.local.port,
+        domain: None,
+    })
+}
+
+fn write_all_best_effort(connection: &mut impl Write, mut bytes: &[u8]) -> Result<usize, String> {
+    let mut written = 0;
+    while !bytes.is_empty() {
+        match connection.write(bytes) {
+            Ok(0) => break,
+            Ok(count) => {
+                written += count;
+                bytes = &bytes[count..];
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(written)
+}
+
+fn read_available(
+    connection: &mut impl Read,
+    events: &mut Vec<TcpProxyEvent>,
+    handle: SocketHandle,
+) -> Option<Vec<u8>> {
+    let mut buffer = vec![0; 64 * 1024];
+    match connection.read(&mut buffer) {
+        Ok(0) => None,
+        Ok(count) => {
+            buffer.truncate(count);
+            Some(buffer)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
+        Err(error) => {
+            events.push(TcpProxyEvent::UpstreamReadFailed {
+                handle,
+                error: error.to_string(),
+            });
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network_policy::VmnetPolicy;
+    use crate::vmnet_gateway::{GuestFrameOutcome, VmnetGateway};
+    use crate::GuestNetwork;
+    use smoltcp::phy::ChecksumCapabilities;
+    use smoltcp::wire::{
+        EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
+        Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    };
+
+    const GUEST_MAC: EthernetAddress = EthernetAddress([0x02, 0xfc, 0x12, 0x34, 0x56, 0x78]);
+    const GATEWAY_MAC: EthernetAddress = EthernetAddress(crate::guest_tcp::DEFAULT_GATEWAY_MAC);
+    const GUEST_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
+    const GATEWAY_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
+    const PUBLIC_IP: Ipv4Address = Ipv4Address::new(93, 184, 216, 34);
+
+    #[test]
+    fn bridges_http_request_to_upstream_and_response_to_guest() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(FakeConnector {
+            response: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
+        });
+
+        let syn_result = gateway.handle_guest_frame(
+            tcp_frame(80, TcpControl::Syn, TcpSeqNumber(100), None, &[]),
+            Instant::from_millis(1),
+        );
+        assert!(matches!(
+            syn_result.outcome,
+            GuestFrameOutcome::TcpAccepted { .. }
+        ));
+        assert_eq!(
+            &syn_result.guest_frames[0][0..6],
+            EthernetAddress::BROADCAST.as_bytes()
+        );
+
+        let syn_ack_result = gateway.handle_guest_frame(arp_reply_frame(), Instant::from_millis(2));
+        let syn_ack = parse_tcp_reply(&syn_ack_result.guest_frames[0]);
+        let server_ack = syn_ack.seq_number + 1;
+
+        gateway.handle_guest_frame(
+            tcp_frame(
+                80,
+                TcpControl::None,
+                TcpSeqNumber(101),
+                Some(server_ack),
+                &[],
+            ),
+            Instant::from_millis(3),
+        );
+
+        let request = b"GET /health HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        gateway.handle_guest_frame(
+            tcp_frame(
+                80,
+                TcpControl::Psh,
+                TcpSeqNumber(101),
+                Some(server_ack),
+                request,
+            ),
+            Instant::from_millis(4),
+        );
+
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::Connected { destination, .. }
+                if destination.ip == std::net::Ipv4Addr::new(93, 184, 216, 34)
+                    && destination.port == 80
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::HttpRequest { summary, .. }
+                if summary.method == "GET"
+                    && summary.path == "/health"
+                    && summary.host.as_deref() == Some("example.com")
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::GuestPayload { bytes, .. } if *bytes == request.len()
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::UpstreamPayload {
+                bytes,
+                guest_frames,
+                ..
+            } if *bytes > 0 && !guest_frames.is_empty()
+        )));
+    }
+
+    #[derive(Debug, Clone)]
+    struct FakeConnector {
+        response: Vec<u8>,
+    }
+
+    impl TcpUpstreamConnector for FakeConnector {
+        type Connection = MemoryConnection;
+
+        fn connect(
+            &self,
+            _destination: &TcpDestination,
+        ) -> Result<Self::Connection, TcpConnectError> {
+            Ok(MemoryConnection {
+                response: self.response.clone(),
+                written: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MemoryConnection {
+        response: Vec<u8>,
+        written: Vec<u8>,
+    }
+
+    impl Read for MemoryConnection {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.response.is_empty() {
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            let count = self.response.len().min(buf.len());
+            buf[..count].copy_from_slice(&self.response[..count]);
+            self.response.drain(..count);
+            Ok(count)
+        }
+    }
+
+    impl Write for MemoryConnection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn tcp_frame(
+        dst_port: u16,
+        control: TcpControl,
+        seq: TcpSeqNumber,
+        ack: Option<TcpSeqNumber>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let tcp = TcpRepr {
+            src_port: 49152,
+            dst_port,
+            control,
+            seq_number: seq,
+            ack_number: ack,
+            window_len: 4096,
+            window_scale: None,
+            max_seg_size: (control == TcpControl::Syn).then_some(1460),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        let ipv4 = Ipv4Repr {
+            src_addr: GUEST_IP,
+            dst_addr: PUBLIC_IP,
+            next_header: IpProtocol::Tcp,
+            payload_len: tcp.buffer_len(),
+            hop_limit: 64,
+        };
+        let ethernet = EthernetRepr {
+            src_addr: GUEST_MAC,
+            dst_addr: GATEWAY_MAC,
+            ethertype: EthernetProtocol::Ipv4,
+        };
+
+        let mut frame = vec![0; ethernet.buffer_len() + ipv4.buffer_len() + tcp.buffer_len()];
+        ethernet.emit(&mut EthernetFrame::new_unchecked(&mut frame));
+        ipv4.emit(
+            &mut Ipv4Packet::new_unchecked(&mut frame[ethernet.buffer_len()..]),
+            &ChecksumCapabilities::default(),
+        );
+        tcp.emit(
+            &mut TcpPacket::new_unchecked(&mut frame[ethernet.buffer_len() + ipv4.buffer_len()..]),
+            &IpAddress::Ipv4(GUEST_IP),
+            &IpAddress::Ipv4(PUBLIC_IP),
+            &ChecksumCapabilities::default(),
+        );
+        frame
+    }
+
+    fn arp_reply_frame() -> Vec<u8> {
+        let mut frame = Vec::with_capacity(42);
+        frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+        frame.extend_from_slice(GUEST_MAC.as_bytes());
+        frame.extend_from_slice(&0x0806u16.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&2u16.to_be_bytes());
+        frame.extend_from_slice(GUEST_MAC.as_bytes());
+        frame.extend_from_slice(&GUEST_IP.octets());
+        frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+        frame.extend_from_slice(&GATEWAY_IP.octets());
+        frame
+    }
+
+    fn parse_tcp_reply(frame: &[u8]) -> TcpRepr<'_> {
+        let ethernet = EthernetFrame::new_unchecked(frame);
+        let ethernet = EthernetRepr::parse(&ethernet).expect("ethernet");
+        let ip_offset = ethernet.buffer_len();
+        let ipv4 = Ipv4Packet::new_unchecked(&frame[ip_offset..]);
+        let ipv4 = Ipv4Repr::parse(&ipv4, &ChecksumCapabilities::default()).expect("ipv4");
+        let tcp_offset = ip_offset + ipv4.buffer_len();
+        TcpRepr::parse(
+            &TcpPacket::new_unchecked(&frame[tcp_offset..]),
+            &IpAddress::Ipv4(ipv4.src_addr),
+            &IpAddress::Ipv4(ipv4.dst_addr),
+            &ChecksumCapabilities::default(),
+        )
+        .expect("tcp")
+    }
+}

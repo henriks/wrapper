@@ -43,9 +43,53 @@ impl TcpUpstreamConnector for StdTcpConnector {
 
     fn connect(&self, destination: &TcpDestination) -> Result<Self::Connection, TcpConnectError> {
         let addr = SocketAddrV4::new(destination.ip, destination.port);
-        TcpStream::connect_timeout(&addr.into(), self.timeout)
-            .map_err(|_| TcpConnectError::UpstreamUnavailable)
+        connect_socket_addr(addr, self.timeout)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamMapping {
+    pub guest_ip: Ipv4Addr,
+    pub guest_port: u16,
+    pub host_ip: Ipv4Addr,
+    pub host_port: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MappedTcpConnector {
+    pub base: StdTcpConnector,
+    pub mappings: Vec<UpstreamMapping>,
+}
+
+impl TcpUpstreamConnector for MappedTcpConnector {
+    type Connection = TcpStream;
+
+    fn connect(&self, destination: &TcpDestination) -> Result<Self::Connection, TcpConnectError> {
+        if let Some(mapping) = self.mappings.iter().find(|mapping| {
+            mapping.guest_ip == destination.ip && mapping.guest_port == destination.port
+        }) {
+            return connect_socket_addr(
+                SocketAddrV4::new(mapping.host_ip, mapping.host_port),
+                self.base.timeout,
+            );
+        }
+        self.base.connect(destination)
+    }
+}
+
+fn connect_socket_addr(
+    addr: SocketAddrV4,
+    timeout: Duration,
+) -> Result<TcpStream, TcpConnectError> {
+    let stream = TcpStream::connect_timeout(&addr.into(), timeout)
+        .map_err(|_| TcpConnectError::UpstreamUnavailable)?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| TcpConnectError::UpstreamUnavailable)?;
+    stream
+        .set_nodelay(true)
+        .map_err(|_| TcpConnectError::UpstreamUnavailable)?;
+    Ok(stream)
 }
 
 pub fn connect_if_allowed<C>(
@@ -166,6 +210,10 @@ fn ip_in_ranges(ip: Ipv4Addr, ranges: &[String]) -> bool {
 mod tests {
     use super::*;
     use crate::{network_policy::VmnetPolicy, GuestNetwork};
+    use std::io::{ErrorKind, Read};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     struct FakeConnector;
 
@@ -306,5 +354,38 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    #[ignore = "sandbox blocks loopback TCP bind; run explicitly when validating StdTcpConnector"]
+    fn std_connector_returns_nonblocking_tcp_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let accept_thread = thread::spawn(move || {
+            let (_stream, _addr) = listener.accept().expect("accept");
+            accepted_tx.send(()).expect("accepted signal");
+        });
+
+        let connector = StdTcpConnector {
+            timeout: Duration::from_secs(1),
+        };
+        let mut stream = connector
+            .connect(&TcpDestination {
+                ip: match addr.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    std::net::IpAddr::V6(_) => unreachable!("bound IPv4"),
+                },
+                port: addr.port(),
+                domain: None,
+            })
+            .expect("connect");
+        accepted_rx.recv().expect("accepted");
+
+        let mut buf = [0; 1];
+        let error = stream.read(&mut buf).expect_err("nonblocking read");
+        assert_eq!(error.kind(), ErrorKind::WouldBlock);
+
+        accept_thread.join().expect("accept thread");
     }
 }

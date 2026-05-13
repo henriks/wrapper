@@ -85,6 +85,18 @@ impl GuestTcpCore {
         })
     }
 
+    pub fn active_sessions(&self) -> Vec<GuestTcpSessionRef> {
+        self.listeners
+            .iter()
+            .filter_map(|slot| {
+                Some(GuestTcpSessionRef {
+                    handle: slot.handle,
+                    session: self.session(slot.handle)?,
+                })
+            })
+            .collect()
+    }
+
     pub fn listener_state(&self, handle: SocketHandle) -> tcp::State {
         self.sockets.get::<tcp::Socket>(handle).state()
     }
@@ -127,6 +139,12 @@ pub struct GuestTcpSession {
     pub state: tcp::State,
     pub local: IpEndpoint,
     pub remote: IpEndpoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestTcpSessionRef {
+    pub handle: SocketHandle,
+    pub session: GuestTcpSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

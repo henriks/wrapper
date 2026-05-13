@@ -1,7 +1,7 @@
 ---
 id: wra-z9sh
-status: open
-deps: [wra-p7m4, wra-52t3]
+status: in_progress
+deps: [wra-p7m4, wra-52t3, wra-9ida]
 links: []
 created: 2026-05-13T10:23:03Z
 type: feature
@@ -36,3 +36,15 @@ wra-52t3 intentionally keeps QEMU usernet/hostfwd out of the Rust command shape.
 **2026-05-13T10:40:54Z**
 
 wra-40vh maps Docker API, payload control, and --docker-publish to frontend-owned HostListener entries. Docker/payload management listeners should remain separate from guest egress policy and should not use QEMU hostfwd.
+
+**2026-05-13T15:35:58Z**
+
+Dependency moved behind wra-9ida. Host-to-guest Docker/payload/published-port access should build on the Rust stream launch instead of blocking it. Do not duplicate QEMU usernet/hostfwd; document the chosen ingress/control design and validation outcomes when implemented.
+
+**2026-05-13T16:03:01Z**
+
+wra-p7m4 now has a validation-only guest HTTP smoke hook, so outbound HTTP vmnet validation no longer needs to wait for the broader host-to-guest Docker/payload ingress implementation. This ticket should still restore real frontend-owned host listeners for Docker, payload, and published ports after p7m4 closes.
+
+**2026-05-13T16:12:49Z**
+
+Started after wra-p7m4 closed. Existing design points to frontend-owned loopback HostListener entries for Docker, payload, and published ports. The p7m4 local smoke upstream proves the gateway can map a guest destination to a host loopback TcpStream for validation, but production host-to-guest ingress still needs its own listener/session implementation rather than QEMU usernet/hostfwd.

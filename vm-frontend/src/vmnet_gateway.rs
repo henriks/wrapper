@@ -1,8 +1,8 @@
 use smoltcp::time::Instant;
 
 use crate::guest_tcp::{
-    evaluate_tcp_syn_frame, GuestTcpCore, GuestTcpCoreError, QueuedEthernetDevice,
-    DEFAULT_GATEWAY_MAC,
+    evaluate_tcp_syn_frame, GuestTcpCore, GuestTcpCoreError, GuestTcpSessionRef,
+    QueuedEthernetDevice, DEFAULT_GATEWAY_MAC,
 };
 use crate::l2_gateway::{L2Gateway, ParseAddressError};
 use crate::network_policy::VmnetPolicy;
@@ -85,6 +85,32 @@ impl<'a> VmnetGateway<'a> {
             outcome,
             guest_frames,
         }
+    }
+
+    pub fn active_tcp_sessions(&self) -> Vec<GuestTcpSessionRef> {
+        self.tcp_core.active_sessions()
+    }
+
+    pub fn recv_tcp_session(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+    ) -> Result<Vec<u8>, smoltcp::socket::tcp::RecvError> {
+        self.tcp_core.recv_available(handle)
+    }
+
+    pub fn send_tcp_session(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<Vec<Vec<u8>>, smoltcp::socket::tcp::SendError> {
+        self.tcp_core.send_to_session(handle, data)?;
+        self.tcp_core.poll(now, &mut self.tcp_device);
+        Ok(self.drain_tcp_frames())
+    }
+
+    pub fn policy(&self) -> &VmnetPolicy {
+        self.policy
     }
 
     fn drain_tcp_frames(&mut self) -> Vec<Vec<u8>> {

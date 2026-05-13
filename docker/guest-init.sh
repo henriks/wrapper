@@ -185,6 +185,7 @@ GATEWAY_IP=$(get_cmdline_value agentvm_gateway_ip || true)
 PREFIX_LEN=$(get_cmdline_value agentvm_prefix_len || true)
 DNS_IP=$(get_cmdline_value agentvm_dns || true)
 GUEST_MAC=$(get_cmdline_value agentvm_guest_mac || true)
+HTTP_SMOKE_URL=$(get_cmdline_value agentvm_http_smoke_url || true)
 if [ -z "${PROJECT_PATH}" ]; then
   PROJECT_PATH=/workspace
 fi
@@ -261,6 +262,16 @@ if [ -n "${GUEST_IP}" ] && [ -n "${GATEWAY_IP}" ] && [ -n "${PREFIX_LEN}" ] && [
     log "configured network on ${IFACE} (${GUEST_IP}/${PREFIX_LEN} via ${GATEWAY_IP})"
   else
     log "warning: failed to locate guest network interface for ${GUEST_MAC}"
+  fi
+fi
+
+if [ -n "${HTTP_SMOKE_URL}" ]; then
+  log "running HTTP smoke request to ${HTTP_SMOKE_URL}"
+  if wget -S -O /run/agentvm-http-smoke.out "${HTTP_SMOKE_URL}" \
+      >"${HOST_RUN_DIR}/guest-http-smoke.log" 2>&1; then
+    log "HTTP smoke request completed"
+  else
+    log "warning: HTTP smoke request failed"
   fi
 fi
 
