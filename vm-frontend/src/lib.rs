@@ -9,13 +9,16 @@ use crate::vmnet_runtime::{
 };
 
 pub mod dns_proxy;
+pub mod docker_proxy;
 pub mod guest_tcp;
+pub mod host_ingress;
 pub mod l2_gateway;
 pub mod launch;
 pub mod network_policy;
 pub mod runtime_manifest;
 pub mod tcp_gateway;
 pub mod tcp_proxy;
+pub mod tls_mitm;
 pub mod vmnet_gateway;
 pub mod vmnet_runtime;
 pub mod vmnet_stream;
@@ -41,6 +44,7 @@ pub struct RuntimePaths {
     pub config_fs_sock: PathBuf,
     pub vmnet_sock: PathBuf,
     pub vmnet_event_log: PathBuf,
+    pub docker_sock: PathBuf,
 }
 
 impl RuntimePaths {
@@ -62,6 +66,7 @@ impl RuntimePaths {
             config_fs_sock: run_dir.join("guest-config.sock"),
             vmnet_sock: run_dir.join("vmnet.sock"),
             vmnet_event_log: run_dir.join("vmnet-events.log"),
+            docker_sock: run_dir.join("docker.sock"),
             run_dir,
         }
     }

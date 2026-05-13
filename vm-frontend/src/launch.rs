@@ -2,13 +2,18 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use agentvm_composed_fs::serve_vhost_user_fs;
 use serde::{Deserialize, Serialize};
 
-use crate::network_policy::VmnetPolicy;
+use crate::docker_proxy::{start_docker_unix_proxy, DockerUnixProxyConfig};
+use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
 use crate::runtime_manifest::{write_runtime_manifests, RuntimeManifestSummary, RuntimeMount};
 use crate::vmnet_runtime::serve_vmnet_gateway;
 use crate::{FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, VmShape};
@@ -115,7 +120,7 @@ pub fn prepare_frontend_launch(
 pub fn run_frontend_until_qemu_exit(
     config: FrontendConfig,
     mounts: Vec<RuntimeMount>,
-) -> Result<ExitStatus, LaunchError> {
+) -> Result<QemuExit, LaunchError> {
     let policy = VmnetPolicy::default_sandbox(config.network.clone());
     run_frontend_until_qemu_exit_with_policy(config, mounts, policy)
 }
@@ -124,7 +129,7 @@ pub fn run_frontend_until_qemu_exit_with_policy(
     config: FrontendConfig,
     mounts: Vec<RuntimeMount>,
     policy: VmnetPolicy,
-) -> Result<ExitStatus, LaunchError> {
+) -> Result<QemuExit, LaunchError> {
     run_frontend_until_qemu_exit_with_policy_and_timeout(config, mounts, policy, None)
 }
 
@@ -133,19 +138,27 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
     mounts: Vec<RuntimeMount>,
     policy: VmnetPolicy,
     qemu_timeout: Option<Duration>,
-) -> Result<ExitStatus, LaunchError> {
+) -> Result<QemuExit, LaunchError> {
     validate_launch_inputs(&config)?;
     write_launch_state(&config, "starting", None, None, Some(&policy))?;
     prepare_frontend_launch(&config, &mounts)?;
     remove_stale_socket(&config.runtime.composed_fs_sock)?;
     remove_stale_socket(&config.runtime.config_fs_sock)?;
     remove_stale_socket(&config.runtime.vmnet_sock)?;
+    remove_stale_socket(&config.runtime.docker_sock)?;
+    remove_stale_socket(&config.runtime.vmnet_event_log)?;
+
+    let shutting_down = Arc::new(AtomicBool::new(false));
 
     let composed_config = config.composed_fs_server();
+    let composed_shutting_down = shutting_down.clone();
     thread::Builder::new()
         .name("agentvm-composed-fs".to_string())
         .spawn(move || {
             if let Err(error) = serve_vhost_user_fs(composed_config) {
+                if composed_shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
                 eprintln!("agentvm composed fs failed: {error}");
             }
         })
@@ -153,10 +166,14 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
     wait_for_path(&config.runtime.composed_fs_sock, SOCKET_WAIT_TIMEOUT)?;
 
     let config_fs_config = config.config_fs_server();
+    let config_fs_shutting_down = shutting_down.clone();
     thread::Builder::new()
         .name("agentvm-config-fs".to_string())
         .spawn(move || {
             if let Err(error) = serve_vhost_user_fs(config_fs_config) {
+                if config_fs_shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
                 eprintln!("agentvm config fs failed: {error}");
             }
         })
@@ -165,15 +182,28 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
 
     let mut vmnet_config = config.vmnet_gateway_config();
     vmnet_config.policy = policy.clone();
+    let vmnet_shutting_down = shutting_down.clone();
     thread::Builder::new()
         .name("agentvm-vmnet".to_string())
         .spawn(move || {
             if let Err(error) = serve_vmnet_gateway(vmnet_config) {
+                if vmnet_shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
                 eprintln!("agentvm vmnet gateway failed: {error:?}");
             }
         })
         .map_err(LaunchError::Io)?;
     wait_for_path(&config.runtime.vmnet_sock, SOCKET_WAIT_TIMEOUT)?;
+
+    if let Some(docker_tcp_port) = docker_listener_tcp_port(&policy) {
+        start_docker_unix_proxy(DockerUnixProxyConfig {
+            socket_path: config.runtime.docker_sock.clone(),
+            tcp_host: std::net::Ipv4Addr::LOCALHOST,
+            tcp_port: docker_tcp_port,
+        })?;
+        wait_for_path(&config.runtime.docker_sock, SOCKET_WAIT_TIMEOUT)?;
+    }
 
     let process = match config.supervisor_plan().qemu {
         crate::ManagedTask::ChildProcess(process) => process,
@@ -186,33 +216,61 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
         .stderr(Stdio::from(qemu_log))
         .spawn()?;
     write_launch_state(&config, "running", Some(child.id()), None, Some(&policy))?;
-    let status = wait_for_qemu(&mut child, qemu_timeout)?;
+    let qemu_exit = wait_for_qemu(&mut child, qemu_timeout)?;
+    shutting_down.store(true, Ordering::SeqCst);
+    let state_status = if qemu_exit.timed_out {
+        "timed_out"
+    } else {
+        "exited"
+    };
+    let qemu_status = qemu_exit.status.to_string();
     write_launch_state(
         &config,
-        "exited",
+        state_status,
         None,
-        Some(&status.to_string()),
+        Some(&qemu_status),
         Some(&policy),
     )?;
-    Ok(status)
+    Ok(qemu_exit)
+}
+
+#[derive(Debug)]
+pub struct QemuExit {
+    pub status: ExitStatus,
+    pub timed_out: bool,
 }
 
 fn wait_for_qemu(
     child: &mut std::process::Child,
     qemu_timeout: Option<Duration>,
-) -> Result<ExitStatus, LaunchError> {
+) -> Result<QemuExit, LaunchError> {
     let Some(timeout) = qemu_timeout else {
-        return child.wait().map_err(LaunchError::Io);
+        return child
+            .wait()
+            .map(|status| QemuExit {
+                status,
+                timed_out: false,
+            })
+            .map_err(LaunchError::Io);
     };
 
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(status);
+            return Ok(QemuExit {
+                status,
+                timed_out: false,
+            });
         }
         if started.elapsed() >= timeout {
             child.kill()?;
-            return child.wait().map_err(LaunchError::Io);
+            return child
+                .wait()
+                .map(|status| QemuExit {
+                    status,
+                    timed_out: true,
+                })
+                .map_err(LaunchError::Io);
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -243,6 +301,7 @@ struct LaunchState<'a> {
     vmnet_socket: String,
     composed_fs_socket: String,
     config_fs_socket: String,
+    docker_socket: Option<String>,
 }
 
 fn write_launch_state(
@@ -268,6 +327,9 @@ fn write_launch_state(
         vmnet_socket: config.runtime.vmnet_sock.display().to_string(),
         composed_fs_socket: config.runtime.composed_fs_sock.display().to_string(),
         config_fs_socket: config.runtime.config_fs_sock.display().to_string(),
+        docker_socket: policy
+            .and_then(|policy| docker_listener_tcp_port(policy))
+            .map(|_| config.runtime.docker_sock.display().to_string()),
     };
     let bytes = serde_json::to_vec_pretty(&state).map_err(LaunchError::Json)?;
     fs::write(
@@ -289,6 +351,14 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), LaunchError> 
         "timed out waiting for {}",
         path.display()
     )))
+}
+
+fn docker_listener_tcp_port(policy: &VmnetPolicy) -> Option<u16> {
+    policy
+        .host_listeners
+        .iter()
+        .find(|listener| listener.purpose == HostListenerPurpose::DockerApi)
+        .map(|listener| listener.host_port)
 }
 
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
@@ -480,7 +550,10 @@ mod tests {
             )
             .expect("config");
 
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let mut policy = VmnetPolicy::default_sandbox(config.network.clone());
+        policy
+            .host_listeners
+            .push(crate::network_policy::HostListener::docker_api(23750, 1075));
         write_launch_state(&config, "running", Some(1234), None, Some(&policy)).expect("state");
         let state = fs::read_to_string(config.runtime.state_json).expect("state json");
 
@@ -489,6 +562,7 @@ mod tests {
         assert!(state.contains("\"network_backend\": \"stream\""));
         assert!(state.contains("\"egress_default_action\": \"Deny\""));
         assert!(state.contains("guest-config.sock"));
+        assert!(state.contains("docker.sock"));
     }
 
     fn unique_temp_dir() -> PathBuf {

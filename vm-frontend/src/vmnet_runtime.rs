@@ -1,17 +1,20 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::time::Instant;
 
+use crate::host_ingress::{HostIngressBridge, HostIngressEvent, HostIngressListenerSet};
 use crate::network_policy::VmnetPolicy;
 use crate::tcp_gateway::{
     MappedTcpConnector, StdTcpConnector, TcpUpstreamConnector, UpstreamMapping,
 };
 use crate::tcp_proxy::{TcpProxyBridge, TcpProxyEvent};
-use crate::vmnet_gateway::{VmnetGateway, VmnetGatewayError};
+use crate::tls_mitm::{TlsMitmAuthority, TlsMitmError};
+use crate::vmnet_gateway::{GuestFrameOutcome, VmnetGateway, VmnetGatewayError};
 use crate::vmnet_stream::{FrameRead, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError};
 use crate::GuestNetwork;
 
@@ -51,7 +54,9 @@ impl VmnetRuntimeConfig {
 pub struct VmnetRuntimeStats {
     pub guest_frames_read: usize,
     pub guest_frames_written: usize,
+    pub gateway_events: Vec<VmnetGatewayEvent>,
     pub proxy_events: Vec<TcpProxyEvent>,
+    pub host_ingress_events: Vec<HostIngressEvent>,
 }
 
 #[derive(Debug, Default)]
@@ -61,11 +66,30 @@ pub struct VmnetProxyPump {
 }
 
 #[derive(Debug, Default)]
+pub struct VmnetHostIngressPump {
+    pub guest_frames_written: usize,
+    pub events: Vec<HostIngressEvent>,
+}
+
+#[derive(Debug, Default)]
 pub struct VmnetRuntimeTick {
     pub eof: bool,
     pub guest_frame_read: bool,
     pub guest_frames_written: usize,
+    pub gateway_events: Vec<VmnetGatewayEvent>,
     pub proxy_events: Vec<TcpProxyEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmnetGatewayEvent {
+    TcpDenied {
+        destination: crate::tcp_gateway::TcpDestination,
+        decision: crate::tcp_gateway::TcpDecision,
+    },
+    TcpSetupFailed {
+        destination: crate::tcp_gateway::TcpDestination,
+        detail: String,
+    },
 }
 
 pub fn run_qemu_stream_until_eof<T, C, F>(
@@ -85,6 +109,9 @@ where
         stats.guest_frames_read += 1;
 
         let result = gateway.handle_guest_frame(frame, now());
+        if let Some(event) = gateway_event_from_outcome(&result.outcome) {
+            stats.gateway_events.push(event);
+        }
         write_guest_frames(frame_io, &result.guest_frames, &mut stats)?;
 
         let pump = pump_proxy_once(frame_io, gateway, proxy, now())?;
@@ -110,6 +137,9 @@ where
         FrameRead::Frame(frame) => {
             tick.guest_frame_read = true;
             let result = gateway.handle_guest_frame(frame, now);
+            if let Some(event) = gateway_event_from_outcome(&result.outcome) {
+                tick.gateway_events.push(event);
+            }
             let mut stats = VmnetRuntimeStats::default();
             write_guest_frames(frame_io, &result.guest_frames, &mut stats)?;
             tick.guest_frames_written += stats.guest_frames_written;
@@ -137,7 +167,9 @@ pub fn serve_vmnet_gateway(
         },
         mappings: config.upstream_mappings.clone(),
     };
-    let mut proxy = TcpProxyBridge::new(connector);
+    let mut proxy = tcp_proxy_bridge_from_policy(connector, &config.policy)?;
+    let mut host_ingress = HostIngressBridge::new();
+    let host_listeners = HostIngressListenerSet::bind(&config.policy.host_listeners)?;
     let mut stats = VmnetRuntimeStats::default();
     let mut event_log = open_event_log(config.event_log_path.as_deref())?;
 
@@ -155,15 +187,49 @@ pub fn serve_vmnet_gateway(
             stats.guest_frames_read += 1;
         }
         stats.guest_frames_written += tick.guest_frames_written;
+        let host_pump = pump_host_ingress_once(
+            &mut frame_io,
+            &mut gateway,
+            &mut host_ingress,
+            &host_listeners,
+            smoltcp_now(started),
+        )?;
+        stats.guest_frames_written += host_pump.guest_frames_written;
         let idle = !tick.guest_frame_read
             && tick.guest_frames_written == 0
-            && tick.proxy_events.is_empty();
+            && tick.gateway_events.is_empty()
+            && tick.proxy_events.is_empty()
+            && host_pump.events.is_empty();
+        write_gateway_events(&mut event_log, &tick.gateway_events)?;
         write_proxy_events(&mut event_log, &tick.proxy_events)?;
+        write_host_ingress_events(&mut event_log, &host_pump.events)?;
+        stats.gateway_events.extend(tick.gateway_events);
         stats.proxy_events.extend(tick.proxy_events);
+        stats.host_ingress_events.extend(host_pump.events);
         if idle {
             thread::sleep(config.idle_sleep);
         }
     }
+}
+
+fn tcp_proxy_bridge_from_policy<C>(
+    connector: C,
+    policy: &VmnetPolicy,
+) -> Result<TcpProxyBridge<C>, VmnetRuntimeError>
+where
+    C: TcpUpstreamConnector,
+{
+    let Some(ca_cert_path) = policy.tls_mitm.ca_cert_path.as_ref() else {
+        return Ok(TcpProxyBridge::new(connector));
+    };
+    let Some(ca_key_path) = policy.tls_mitm.ca_key_path.as_ref() else {
+        return Ok(TcpProxyBridge::new(connector));
+    };
+    if !policy.tls_mitm.generate_per_host_certs {
+        return Ok(TcpProxyBridge::new(connector));
+    }
+    let authority = Arc::new(TlsMitmAuthority::from_files(ca_cert_path, ca_key_path)?);
+    TcpProxyBridge::with_tls_mitm(connector, authority).map_err(VmnetRuntimeError::from)
 }
 
 pub fn pump_proxy_once<T, C>(
@@ -179,7 +245,9 @@ where
 {
     let mut pump = VmnetProxyPump::default();
     for event in proxy.process_gateway(gateway, now) {
-        if let TcpProxyEvent::UpstreamPayload { guest_frames, .. } = &event {
+        if let TcpProxyEvent::UpstreamPayload { guest_frames, .. }
+        | TcpProxyEvent::TlsHandshakePayload { guest_frames, .. } = &event
+        {
             for frame in guest_frames {
                 frame_io.write_frame(frame)?;
                 pump.guest_frames_written += 1;
@@ -187,6 +255,54 @@ where
         }
         pump.events.push(event);
     }
+    Ok(pump)
+}
+
+pub fn pump_host_ingress_once<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    gateway: &mut VmnetGateway<'_>,
+    bridge: &mut HostIngressBridge<std::net::TcpStream>,
+    listeners: &HostIngressListenerSet,
+    now: Instant,
+) -> Result<VmnetHostIngressPump, VmnetRuntimeError>
+where
+    T: Read + Write,
+{
+    let mut pump = VmnetHostIngressPump::default();
+    for accepted in listeners.accept_pending() {
+        let accepted = accepted?;
+        match bridge.open_session(gateway, accepted.guest_port, accepted.connection, now) {
+            Ok(open) => {
+                for frame in &open.guest_frames {
+                    frame_io.write_frame(frame)?;
+                    pump.guest_frames_written += 1;
+                }
+                pump.events.push(HostIngressEvent::Opened {
+                    handle: open.handle,
+                    guest_port: open.guest_port,
+                    purpose: accepted.purpose,
+                });
+            }
+            Err(error) => pump.events.push(HostIngressEvent::OpenFailed {
+                guest_port: accepted.guest_port,
+                purpose: accepted.purpose,
+                error: format!("{error:?}"),
+            }),
+        }
+    }
+
+    for event in bridge.process_gateway(gateway, now) {
+        if let HostIngressEvent::HostPayload { guest_frames, .. }
+        | HostIngressEvent::HostClosed { guest_frames, .. } = &event
+        {
+            for frame in guest_frames {
+                frame_io.write_frame(frame)?;
+                pump.guest_frames_written += 1;
+            }
+        }
+        pump.events.push(event);
+    }
+
     Ok(pump)
 }
 
@@ -203,6 +319,133 @@ fn write_proxy_events(log: &mut Option<File>, events: &[TcpProxyEvent]) -> io::R
         writeln!(log, "{}", format_proxy_event(event))?;
     }
     log.flush()
+}
+
+fn write_gateway_events(log: &mut Option<File>, events: &[VmnetGatewayEvent]) -> io::Result<()> {
+    let Some(log) = log else {
+        return Ok(());
+    };
+    for event in events {
+        writeln!(log, "{}", format_gateway_event(event))?;
+    }
+    log.flush()
+}
+
+fn format_gateway_event(event: &VmnetGatewayEvent) -> String {
+    match event {
+        VmnetGatewayEvent::TcpDenied {
+            destination,
+            decision,
+        } => format!(
+            "tcp_denied_preaccept dst={}:{} action={:?} reason={}",
+            destination.ip, destination.port, decision.action, decision.reason
+        ),
+        VmnetGatewayEvent::TcpSetupFailed {
+            destination,
+            detail,
+        } => format!(
+            "tcp_setup_failed_preaccept dst={}:{} detail={}",
+            destination.ip, destination.port, detail
+        ),
+    }
+}
+
+fn gateway_event_from_outcome(outcome: &GuestFrameOutcome) -> Option<VmnetGatewayEvent> {
+    match outcome {
+        GuestFrameOutcome::TcpDenied {
+            destination,
+            decision,
+        } => Some(VmnetGatewayEvent::TcpDenied {
+            destination: destination.clone(),
+            decision: decision.clone(),
+        }),
+        GuestFrameOutcome::TcpSetupFailed {
+            destination,
+            detail,
+        } => Some(VmnetGatewayEvent::TcpSetupFailed {
+            destination: destination.clone(),
+            detail: detail.clone(),
+        }),
+        GuestFrameOutcome::L2Response
+        | GuestFrameOutcome::TcpAccepted { .. }
+        | GuestFrameOutcome::TcpProgress
+        | GuestFrameOutcome::Ignored => None,
+    }
+}
+
+fn write_host_ingress_events(
+    log: &mut Option<File>,
+    events: &[HostIngressEvent],
+) -> io::Result<()> {
+    let Some(log) = log else {
+        return Ok(());
+    };
+    for event in events {
+        writeln!(log, "{}", format_host_ingress_event(event))?;
+    }
+    log.flush()
+}
+
+fn format_host_ingress_event(event: &HostIngressEvent) -> String {
+    match event {
+        HostIngressEvent::Opened {
+            handle,
+            guest_port,
+            purpose,
+        } => {
+            format!("host_ingress_opened handle={handle:?} guest_port={guest_port} purpose={purpose:?}")
+        }
+        HostIngressEvent::OpenFailed {
+            guest_port,
+            purpose,
+            error,
+        } => {
+            format!("host_ingress_open_failed guest_port={guest_port} purpose={purpose:?} error={error}")
+        }
+        HostIngressEvent::HostPayload {
+            handle,
+            guest_port,
+            bytes,
+            guest_frames,
+        } => format!(
+            "host_ingress_host_payload handle={handle:?} guest_port={guest_port} bytes={bytes} guest_frames={}",
+            guest_frames.len()
+        ),
+        HostIngressEvent::GuestPayload {
+            handle,
+            guest_port,
+            bytes,
+        } => {
+            format!("host_ingress_guest_payload handle={handle:?} guest_port={guest_port} bytes={bytes}")
+        }
+        HostIngressEvent::HostClosed {
+            handle,
+            guest_port,
+            guest_frames,
+        } => format!(
+            "host_ingress_host_closed handle={handle:?} guest_port={guest_port} guest_frames={}",
+            guest_frames.len()
+        ),
+        HostIngressEvent::GuestClosed {
+            handle,
+            guest_port,
+            state,
+        } => format!(
+            "host_ingress_guest_closed handle={handle:?} guest_port={guest_port} state={state:?}"
+        ),
+        HostIngressEvent::GuestReadFailed { handle, error } => {
+            format!("host_ingress_guest_read_failed handle={handle:?} error={error:?}")
+        }
+        HostIngressEvent::GuestWriteFailed { handle, error } => {
+            format!("host_ingress_guest_write_failed handle={handle:?} error={error:?}")
+        }
+        HostIngressEvent::HostReadFailed { handle, error } => {
+            format!("host_ingress_host_read_failed handle={handle:?} error={error}")
+        }
+        HostIngressEvent::HostWriteFailed { handle, error } => {
+            format!("host_ingress_host_write_failed handle={handle:?} error={error}")
+        }
+    }
 }
 
 fn format_proxy_event(event: &TcpProxyEvent) -> String {
@@ -260,6 +503,27 @@ fn format_proxy_event(event: &TcpProxyEvent) -> String {
             "upstream_payload handle={handle:?} bytes={bytes} guest_frames={}",
             guest_frames.len()
         ),
+        TcpProxyEvent::TlsHandshakePayload {
+            handle,
+            bytes,
+            guest_frames,
+        } => format!(
+            "tls_handshake_payload handle={handle:?} bytes={bytes} guest_frames={}",
+            guest_frames.len()
+        ),
+        TcpProxyEvent::TlsUpstreamPayload { handle, bytes } => {
+            format!("tls_upstream_payload handle={handle:?} bytes={bytes}")
+        }
+        TcpProxyEvent::TlsMitmUnavailable {
+            handle,
+            destination,
+        } => format!(
+            "tls_mitm_unavailable handle={handle:?} dst={}:{}",
+            destination.ip, destination.port
+        ),
+        TcpProxyEvent::TlsMitmFailed { handle, error } => {
+            format!("tls_mitm_failed handle={handle:?} error={error:?}")
+        }
         TcpProxyEvent::GuestReadFailed { handle, error } => {
             format!("guest_read_failed handle={handle:?} error={error:?}")
         }
@@ -295,6 +559,7 @@ pub enum VmnetRuntimeError {
     Io(io::Error),
     Stream(VmnetStreamError),
     Gateway(VmnetGatewayError),
+    TlsMitm(TlsMitmError),
 }
 
 impl From<io::Error> for VmnetRuntimeError {
@@ -312,6 +577,12 @@ impl From<VmnetStreamError> for VmnetRuntimeError {
 impl From<VmnetGatewayError> for VmnetRuntimeError {
     fn from(error: VmnetGatewayError) -> Self {
         Self::Gateway(error)
+    }
+}
+
+impl From<TlsMitmError> for VmnetRuntimeError {
+    fn from(error: TlsMitmError) -> Self {
+        Self::TlsMitm(error)
     }
 }
 

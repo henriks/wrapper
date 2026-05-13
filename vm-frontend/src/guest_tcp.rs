@@ -5,7 +5,9 @@ use smoltcp::iface::{Config, Interface, PollResult, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, PacketMeta, RxToken, TxToken};
 use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Cidr,
+};
 
 use crate::network_policy::VmnetPolicy;
 use crate::tcp_gateway::{evaluate_tcp_destination, TcpDecision, TcpDestination};
@@ -18,11 +20,19 @@ pub struct GuestTcpCore {
     interface: Interface,
     sockets: SocketSet<'static>,
     listeners: Vec<TcpListenerSlot>,
+    host_connections: Vec<TcpConnectionSlot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpListenerSlot {
     port: u16,
+    handle: SocketHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TcpConnectionSlot {
+    guest_port: u16,
+    local_port: u16,
     handle: SocketHandle,
 }
 
@@ -49,6 +59,7 @@ impl GuestTcpCore {
             interface,
             sockets: SocketSet::new(Vec::new()),
             listeners: Vec::new(),
+            host_connections: Vec::new(),
         })
     }
 
@@ -76,6 +87,36 @@ impl GuestTcpCore {
         self.interface.poll(now, device, &mut self.sockets)
     }
 
+    pub fn connect_to_guest(
+        &mut self,
+        network: &GuestNetwork,
+        guest_port: u16,
+        local_port: u16,
+        now: Instant,
+        device: &mut QueuedEthernetDevice,
+    ) -> Result<SocketHandle, GuestTcpConnectError> {
+        let guest_ip = parse_ipv4(&network.guest_ip).map_err(GuestTcpConnectError::Core)?;
+        let mut socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; DEFAULT_TCP_BUFFER_BYTES]),
+            tcp::SocketBuffer::new(vec![0; DEFAULT_TCP_BUFFER_BYTES]),
+        );
+        socket
+            .connect(
+                self.interface.context(),
+                (IpAddress::Ipv4(guest_ip), guest_port),
+                local_port,
+            )
+            .map_err(GuestTcpConnectError::Connect)?;
+        let handle = self.sockets.add(socket);
+        self.host_connections.push(TcpConnectionSlot {
+            guest_port,
+            local_port,
+            handle,
+        });
+        self.poll(now, device);
+        Ok(handle)
+    }
+
     pub fn session(&self, handle: SocketHandle) -> Option<GuestTcpSession> {
         let socket = self.sockets.get::<tcp::Socket>(handle);
         Some(GuestTcpSession {
@@ -87,6 +128,18 @@ impl GuestTcpCore {
 
     pub fn active_sessions(&self) -> Vec<GuestTcpSessionRef> {
         self.listeners
+            .iter()
+            .filter_map(|slot| {
+                Some(GuestTcpSessionRef {
+                    handle: slot.handle,
+                    session: self.session(slot.handle)?,
+                })
+            })
+            .collect()
+    }
+
+    pub fn host_ingress_sessions(&self) -> Vec<GuestTcpSessionRef> {
+        self.host_connections
             .iter()
             .filter_map(|slot| {
                 Some(GuestTcpSessionRef {
@@ -125,6 +178,10 @@ impl GuestTcpCore {
         self.sockets.get_mut::<tcp::Socket>(handle).send_slice(data)
     }
 
+    pub fn close_session(&mut self, handle: SocketHandle) {
+        self.sockets.get_mut::<tcp::Socket>(handle).close();
+    }
+
     pub fn any_ip_enabled(&self) -> bool {
         self.interface.any_ip()
     }
@@ -150,6 +207,12 @@ pub struct GuestTcpSessionRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuestTcpCoreError {
     InvalidIpv4(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuestTcpConnectError {
+    Core(GuestTcpCoreError),
+    Connect(tcp::ConnectError),
 }
 
 pub fn parse_tcp_syn_destination(frame: &[u8]) -> Option<TcpDestination> {
@@ -494,6 +557,37 @@ mod tests {
         assert_eq!(&frame[0..6], GUEST_MAC.as_bytes());
         let tcp = parse_tcp_reply(&frame);
         assert_eq!(tcp.payload, response);
+    }
+
+    #[test]
+    fn host_ingress_connect_to_guest_emits_syn_and_tracks_separate_session() {
+        let network = GuestNetwork::default();
+        let mut device = QueuedEthernetDevice::new(1514);
+        let mut core = GuestTcpCore::new(
+            &network,
+            DEFAULT_GATEWAY_MAC,
+            Instant::from_millis(0),
+            &mut device,
+        )
+        .expect("core");
+
+        let handle = core
+            .connect_to_guest(&network, 1075, 40000, Instant::from_millis(1), &mut device)
+            .expect("connect");
+
+        assert!(core.active_sessions().is_empty());
+        assert_eq!(core.host_ingress_sessions().len(), 1);
+        assert_eq!(core.listener_state(handle), tcp::State::SynSent);
+        let arp_request = device.pop_tx().expect("arp request");
+        assert_eq!(&arp_request[0..6], EthernetAddress::BROADCAST.as_bytes());
+
+        device.push_rx(arp_reply_frame());
+        core.poll(Instant::from_millis(2), &mut device);
+        let syn = device.pop_tx().expect("syn");
+        let syn = parse_tcp_reply(&syn);
+        assert_eq!(syn.src_port, 40000);
+        assert_eq!(syn.dst_port, 1075);
+        assert_eq!(syn.control, TcpControl::Syn);
     }
 
     fn complete_http_handshake(

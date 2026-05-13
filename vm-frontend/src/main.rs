@@ -8,7 +8,9 @@ use std::time::Duration;
 use agentvm_frontend::launch::{
     prepare_frontend_launch, run_frontend_until_qemu_exit_with_policy_and_timeout,
 };
-use agentvm_frontend::network_policy::{EgressAction, EgressReason, VmnetPolicy};
+use agentvm_frontend::network_policy::{
+    EgressAction, EgressReason, HostListener, HostListenerPurpose, VmnetPolicy,
+};
 use agentvm_frontend::runtime_manifest::workspace_mounts;
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
@@ -48,17 +50,23 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
                     .upstream_mappings
                     .push(start_local_http_smoke_upstream(destination)?);
             }
-            let status = run_frontend_until_qemu_exit_with_policy_and_timeout(
+            let qemu_exit = run_frontend_until_qemu_exit_with_policy_and_timeout(
                 config.clone(),
                 workspace_mounts(config.project.clone()),
                 policy,
                 qemu_timeout,
             )
             .map_err(|error| format!("launch failed: {error}"))?;
-            if status.success() {
+            if qemu_exit.status.success() {
                 Ok(())
+            } else if qemu_exit.timed_out {
+                Err(format!(
+                    "qemu timed out after {} seconds and was terminated with status: {}",
+                    qemu_timeout.map_or(0, |timeout| timeout.as_secs()),
+                    qemu_exit.status
+                ))
             } else {
-                Err(format!("qemu exited with status: {status}"))
+                Err(format!("qemu exited with status: {}", qemu_exit.status))
             }
         }
         Some("-h" | "--help") | None => {
@@ -75,6 +83,11 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     let mut allow_ips = Vec::new();
     let mut allow_domains = Vec::new();
     let mut allow_public = false;
+    let mut no_net = false;
+    let mut host_listeners = Vec::new();
+    let mut tls_ca_cert = None;
+    let mut tls_ca_key = None;
+    let mut tls_generate_per_host_certs = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -96,6 +109,33 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
             "--allow-public-internet" => {
                 allow_public = true;
             }
+            "--no-net" => {
+                no_net = true;
+            }
+            "--host-docker-listener" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--host-docker-listener")?)?;
+                host_listeners.push(HostListener::docker_api(host_port, guest_port));
+            }
+            "--host-payload-listener" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--host-payload-listener")?)?;
+                host_listeners.push(HostListener::payload_control(host_port, guest_port));
+            }
+            "--publish" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--publish")?)?;
+                host_listeners.push(HostListener::published_tcp(host_port, guest_port));
+            }
+            "--tls-ca-cert" => {
+                tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
+            }
+            "--tls-ca-key" => {
+                tls_ca_key = Some(PathBuf::from(value(args, &mut index, "--tls-ca-key")?));
+            }
+            "--tls-generate-per-host-certs" => {
+                tls_generate_per_host_certs = true;
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Err("help requested".to_string());
@@ -106,13 +146,27 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     }
 
     let socket_path = socket_path.ok_or_else(|| "--socket is required".to_string())?;
+    validate_no_net_args(
+        no_net,
+        allow_public,
+        &allow_ips,
+        &allow_domains,
+        &host_listeners,
+    )?;
     let mut policy = VmnetPolicy::default_sandbox(network.clone());
     policy.egress.allow_ips = allow_ips;
     policy.egress.allow_domains = allow_domains;
     if allow_public {
         policy.egress.default_action = EgressAction::AllowPublicInternet;
         policy.egress.reason = EgressReason::ExplicitAllowProfile;
+    } else if no_net {
+        policy.egress.default_action = EgressAction::Deny;
+        policy.egress.reason = EgressReason::NoNetFlag;
     }
+    policy.host_listeners = host_listeners;
+    policy.tls_mitm.ca_cert_path = tls_ca_cert;
+    policy.tls_mitm.ca_key_path = tls_ca_key;
+    policy.tls_mitm.generate_per_host_certs = tls_generate_per_host_certs;
 
     Ok(VmnetRuntimeConfig::new(socket_path, network, policy))
 }
@@ -122,8 +176,13 @@ struct PolicyArgs {
     allow_ips: Vec<String>,
     allow_domains: Vec<String>,
     allow_public: bool,
+    no_net: bool,
     qemu_timeout: Option<Duration>,
     local_http_smoke_upstream: Option<(Ipv4Addr, u16)>,
+    host_listeners: Vec<HostListener>,
+    tls_ca_cert: Option<PathBuf>,
+    tls_ca_key: Option<PathBuf>,
+    tls_generate_per_host_certs: bool,
 }
 
 fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyArgs), String> {
@@ -155,6 +214,7 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
                     .push(value(args, &mut index, "--allow-domain")?)
             }
             "--allow-public-internet" => policy.allow_public = true,
+            "--no-net" => policy.no_net = true,
             "--qemu-timeout-seconds" => {
                 let seconds = value(args, &mut index, "--qemu-timeout-seconds")?
                     .parse::<u64>()
@@ -167,6 +227,36 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
                     &mut index,
                     "--local-http-smoke-upstream",
                 )?)?);
+            }
+            "--host-docker-listener" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--host-docker-listener")?)?;
+                policy
+                    .host_listeners
+                    .push(HostListener::docker_api(host_port, guest_port));
+            }
+            "--host-payload-listener" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--host-payload-listener")?)?;
+                policy
+                    .host_listeners
+                    .push(HostListener::payload_control(host_port, guest_port));
+            }
+            "--publish" => {
+                let (host_port, guest_port) =
+                    parse_port_pair(&value(args, &mut index, "--publish")?)?;
+                policy
+                    .host_listeners
+                    .push(HostListener::published_tcp(host_port, guest_port));
+            }
+            "--tls-ca-cert" => {
+                policy.tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
+            }
+            "--tls-ca-key" => {
+                policy.tls_ca_key = Some(PathBuf::from(value(args, &mut index, "--tls-ca-key")?));
+            }
+            "--tls-generate-per-host-certs" => {
+                policy.tls_generate_per_host_certs = true;
             }
             "-h" | "--help" => {
                 print_usage();
@@ -181,6 +271,13 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         FrontendConfig::from_artifact_manifest_file(project, run_dir, qemu, &artifact_manifest)
             .map_err(|error| format!("failed to load frontend config: {error}"))?;
     config.guest_http_smoke_url = guest_http_smoke_url;
+    validate_no_net_args(
+        policy.no_net,
+        policy.allow_public,
+        &policy.allow_ips,
+        &policy.allow_domains,
+        &policy.host_listeners,
+    )?;
     if config.guest_http_smoke_url.is_some() {
         ensure_smoke_hook_artifact_fresh(&artifact_manifest)?;
     }
@@ -196,6 +293,20 @@ fn parse_ip_port(value: &str) -> Result<(Ipv4Addr, u16), String> {
             .map_err(|_| format!("invalid IPv4 address in {value}"))?,
         port.parse()
             .map_err(|_| format!("invalid port in {value}"))?,
+    ))
+}
+
+fn parse_port_pair(value: &str) -> Result<(u16, u16), String> {
+    let (host_port, guest_port) = value
+        .split_once(':')
+        .ok_or_else(|| "expected HOST_PORT:GUEST_PORT".to_string())?;
+    Ok((
+        host_port
+            .parse()
+            .map_err(|_| format!("invalid host port in {value}"))?,
+        guest_port
+            .parse()
+            .map_err(|_| format!("invalid guest port in {value}"))?,
     ))
 }
 
@@ -269,8 +380,37 @@ fn policy_from_args(network: GuestNetwork, args: PolicyArgs) -> VmnetPolicy {
     if args.allow_public {
         policy.egress.default_action = EgressAction::AllowPublicInternet;
         policy.egress.reason = EgressReason::ExplicitAllowProfile;
+    } else if args.no_net {
+        policy.egress.default_action = EgressAction::Deny;
+        policy.egress.reason = EgressReason::NoNetFlag;
     }
+    policy.host_listeners = args.host_listeners;
+    policy.tls_mitm.ca_cert_path = args.tls_ca_cert;
+    policy.tls_mitm.ca_key_path = args.tls_ca_key;
+    policy.tls_mitm.generate_per_host_certs = args.tls_generate_per_host_certs;
     policy
+}
+
+fn validate_no_net_args(
+    no_net: bool,
+    allow_public: bool,
+    allow_ips: &[String],
+    allow_domains: &[String],
+    host_listeners: &[HostListener],
+) -> Result<(), String> {
+    if !no_net {
+        return Ok(());
+    }
+    if allow_public || !allow_ips.is_empty() || !allow_domains.is_empty() {
+        return Err("--no-net cannot be combined with egress allow options".to_string());
+    }
+    if host_listeners
+        .iter()
+        .any(|listener| listener.purpose == HostListenerPurpose::PublishedTcp)
+    {
+        return Err("--no-net cannot be combined with --publish".to_string());
+    }
+    Ok(())
 }
 
 fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -283,8 +423,8 @@ fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, Strin
 fn print_usage() {
     eprintln!(
         "usage: agentvm-frontend <prepare|launch|vmnet-gateway> [options]\n\
-         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--guest-http-smoke-url URL] [--allow-public-internet] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT]\n\
-         vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet]"
+         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
+         vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]"
     );
 }
 
@@ -303,6 +443,17 @@ mod tests {
             "93.184.216.34".to_string(),
             "--allow-domain".to_string(),
             "example.com".to_string(),
+            "--host-docker-listener".to_string(),
+            "23750:2375".to_string(),
+            "--host-payload-listener".to_string(),
+            "12076:1076".to_string(),
+            "--publish".to_string(),
+            "18080:8080".to_string(),
+            "--tls-ca-cert".to_string(),
+            "/tmp/ca.pem".to_string(),
+            "--tls-ca-key".to_string(),
+            "/tmp/ca-key.pem".to_string(),
+            "--tls-generate-per-host-certs".to_string(),
         ])
         .expect("config");
 
@@ -310,6 +461,23 @@ mod tests {
         assert_eq!(config.network.guest_ip, "10.0.2.20");
         assert_eq!(config.policy.egress.allow_ips, vec!["93.184.216.34"]);
         assert_eq!(config.policy.egress.allow_domains, vec!["example.com"]);
+        assert_eq!(
+            config.policy.host_listeners,
+            vec![
+                HostListener::docker_api(23750, 2375),
+                HostListener::payload_control(12076, 1076),
+                HostListener::published_tcp(18080, 8080),
+            ]
+        );
+        assert_eq!(
+            config.policy.tls_mitm.ca_cert_path,
+            Some(PathBuf::from("/tmp/ca.pem"))
+        );
+        assert_eq!(
+            config.policy.tls_mitm.ca_key_path,
+            Some(PathBuf::from("/tmp/ca-key.pem"))
+        );
+        assert!(config.policy.tls_mitm.generate_per_host_certs);
     }
 
     #[test]
@@ -359,6 +527,17 @@ mod tests {
             "--allow-public-internet".to_string(),
             "--guest-http-smoke-url".to_string(),
             "http://93.184.216.34/".to_string(),
+            "--host-docker-listener".to_string(),
+            "23750:2375".to_string(),
+            "--host-payload-listener".to_string(),
+            "12076:1076".to_string(),
+            "--publish".to_string(),
+            "18080:8080".to_string(),
+            "--tls-ca-cert".to_string(),
+            "/tmp/ca.pem".to_string(),
+            "--tls-ca-key".to_string(),
+            "/tmp/ca-key.pem".to_string(),
+            "--tls-generate-per-host-certs".to_string(),
         ])
         .expect("config");
 
@@ -368,6 +547,87 @@ mod tests {
             Some("http://93.184.216.34/")
         );
         assert!(policy.allow_public);
+        assert_eq!(
+            policy.host_listeners,
+            vec![
+                HostListener::docker_api(23750, 2375),
+                HostListener::payload_control(12076, 1076),
+                HostListener::published_tcp(18080, 8080),
+            ]
+        );
+        let runtime_policy = policy_from_args(config.network.clone(), policy);
+        assert_eq!(
+            runtime_policy.tls_mitm.ca_cert_path,
+            Some(PathBuf::from("/tmp/ca.pem"))
+        );
+        assert_eq!(
+            runtime_policy.tls_mitm.ca_key_path,
+            Some(PathBuf::from("/tmp/ca-key.pem"))
+        );
+        assert!(runtime_policy.tls_mitm.generate_per_host_certs);
+    }
+
+    #[test]
+    fn frontend_no_net_sets_policy_reason_and_allows_control_listeners() {
+        let root = frontend_test_root();
+
+        let (config, policy) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/run").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--no-net".to_string(),
+            "--host-docker-listener".to_string(),
+            "23750:2375".to_string(),
+            "--host-payload-listener".to_string(),
+            "12076:1076".to_string(),
+        ])
+        .expect("config");
+
+        let runtime_policy = policy_from_args(config.network.clone(), policy);
+        assert_eq!(runtime_policy.egress.default_action, EgressAction::Deny);
+        assert_eq!(runtime_policy.egress.reason, EgressReason::NoNetFlag);
+        assert_eq!(
+            runtime_policy.host_listeners,
+            vec![
+                HostListener::docker_api(23750, 2375),
+                HostListener::payload_control(12076, 1076),
+            ]
+        );
+    }
+
+    #[test]
+    fn frontend_no_net_rejects_published_ports_and_allow_rules() {
+        let root = frontend_test_root();
+        let base_args = [
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/run").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--no-net".to_string(),
+        ];
+
+        let mut publish_args = base_args.to_vec();
+        publish_args.extend(["--publish".to_string(), "18080:8080".to_string()]);
+        assert_eq!(
+            frontend_config_from_args(&publish_args).expect_err("publish rejected"),
+            "--no-net cannot be combined with --publish"
+        );
+
+        let mut allow_args = base_args.to_vec();
+        allow_args.extend(["--allow-public-internet".to_string()]);
+        assert_eq!(
+            frontend_config_from_args(&allow_args).expect_err("allow rejected"),
+            "--no-net cannot be combined with egress allow options"
+        );
     }
 
     #[test]
@@ -395,6 +655,16 @@ mod tests {
         assert!(parse_ip_port("198.51.100.10").is_err());
     }
 
+    #[test]
+    fn parses_port_pair() {
+        assert_eq!(
+            parse_port_pair("18080:8080").expect("port pair"),
+            (18080, 8080)
+        );
+        assert!(parse_port_pair("18080").is_err());
+        assert!(parse_port_pair("localhost:8080").is_err());
+    }
+
     fn unique_temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "agentvm-frontend-main-test-{}-{}",
@@ -406,5 +676,33 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn frontend_test_root() -> PathBuf {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(root.join("docker/out")).expect("out");
+        std::fs::create_dir_all(root.join("repo")).expect("repo");
+        std::fs::write(root.join("docker/out/vmlinuz"), b"kernel").expect("kernel");
+        std::fs::write(root.join("docker/out/initrd.img"), b"initrd").expect("initrd");
+        std::fs::write(root.join("docker/out/rootfs.raw"), b"rootfs").expect("rootfs");
+        std::fs::write(
+            root.join("docker/out/artifact-manifest.json"),
+            r#"{
+              "schema_version": 1,
+              "artifacts": {
+                "kernel": "docker/out/vmlinuz",
+                "initrd": "docker/out/initrd.img",
+                "rootfs": "docker/out/rootfs.raw"
+              },
+              "vm": {
+                "cpus": 2,
+                "memory_bytes": 2147483648,
+                "virtiofs_tag": "agentvm",
+                "kernel_cmdline": "console=hvc0 root=/dev/vda"
+              }
+            }"#,
+        )
+        .expect("manifest");
+        root
     }
 }

@@ -105,6 +105,28 @@ Docker and payload control:
 No default CA is generated implicitly. HTTPS interception should fail closed
 when policy requires MITM but CA material is missing.
 
+The CLI exposes this as:
+
+- `--tls-ca-cert PATH`
+- `--tls-ca-key PATH`
+- `--tls-generate-per-host-certs`
+
+When TCP/443 interception is enabled, the TCP policy denies the connection
+unless all three values are configured. This avoids silently downgrading to a
+non-inspected TLS tunnel.
+
+The Rust frontend terminates the guest TLS session with per-host certificates
+signed by the configured CA, then opens a separate upstream TLS session using
+the guest-provided SNI as the upstream server name. Upstream certificate
+validation uses the host native root store. Guest TLS sessions without SNI fail
+closed because the frontend cannot safely validate the upstream or generate the
+right leaf certificate.
+
+HTTPS request logging uses the same summary model as HTTP interception:
+method, destination IP/port, Host header, and path. Request/response bodies,
+headers other than Host, cookies, authorization values, and decrypted TLS record
+contents are not written to the vmnet event log by default.
+
 ## Capture
 
 `CapturePolicy` supports optional guest-side pcap capture. Capture sits at the

@@ -1,6 +1,6 @@
 ---
 id: wra-z9sh
-status: in_progress
+status: closed
 deps: [wra-p7m4, wra-52t3, wra-9ida]
 links: []
 created: 2026-05-13T10:23:03Z
@@ -48,3 +48,19 @@ wra-p7m4 now has a validation-only guest HTTP smoke hook, so outbound HTTP vmnet
 **2026-05-13T16:12:49Z**
 
 Started after wra-p7m4 closed. Existing design points to frontend-owned loopback HostListener entries for Docker, payload, and published ports. The p7m4 local smoke upstream proves the gateway can map a guest destination to a host loopback TcpStream for validation, but production host-to-guest ingress still needs its own listener/session implementation rather than QEMU usernet/hostfwd.
+
+**2026-05-13T20:34:23Z**
+
+Implemented the first Rust host-ingress slice: HostIngressBridge opens smoltcp client sessions from frontend-owned loopback listeners into guest TCP ports, keeps those sessions separate from outbound guest-egress proxy sessions, and runtime pumps host payloads into guest frames plus guest responses back to host connections. CLI policy plumbing now exposes --host-docker-listener HOST:GUEST, --host-payload-listener HOST:GUEST, and --publish HOST:GUEST for both launch and standalone vmnet-gateway. This intentionally avoids reintroducing QEMU usernet/hostfwd or any duplicate legacy forwarding path. Remaining validation is end-to-end guest Docker _ping, payload ping/run/exit, and a published localhost port.
+
+**2026-05-13T20:56:13Z**
+
+Implemented frontend-owned host ingress without reintroducing QEMU usernet/hostfwd. Live bounded Rust launches validated: payload ping returned K/ok over --host-payload-listener 12076:1076; payload run/exit returned payload-run-ok with exit code 0; Docker _ping through .sandbox/docker-vm/run/docker.sock returned OK via the new Unix-to-loopback Docker proxy and --host-docker-listener 12375:1075. A published listener --publish 18080:18080 accepted host connections and delivered guest response bytes in vmnet-events.log, but a deterministic one-shot close-based client exposed a guest-FIN-to-host-EOF lifecycle gap. Filed follow-up wra-b6iu for close propagation; do not solve that by adding legacy hostfwd.
+
+**2026-05-13T20:59:42Z**
+
+Follow-up wra-b6iu closed: guest TCP close is now propagated to host ingress clients. Deterministic live publish smoke received HTTP/1.1 200 OK publish-ok and payload exit 0 over --publish 18080:18080; event log recorded host_ingress_guest_closed state=CloseWait.
+
+**2026-05-13T21:45:24Z**
+
+Host-ingress validation in wra-3zt0 confirmed the guest Docker socket bridge listens on guest TCP port 1075. Using --host-docker-listener HOST:2375 opens a frontend connection to an unused guest port and times out; the correct Rust frontend validation shape is --host-docker-listener HOST:1075, with the host-facing Docker API exposed through .sandbox/docker-vm/run/docker.sock by the Docker Unix proxy.

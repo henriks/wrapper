@@ -1,6 +1,6 @@
 # VMNet Runtime Validation
 
-Ticket: `wra-p7m4`
+Tickets: `wra-p7m4`, `wra-pah4`
 
 Date: 2026-05-13
 
@@ -9,8 +9,16 @@ Date: 2026-05-13
 The Rust vmnet runtime is implemented and unit/integration tested. The Rust
 frontend now has `prepare` and `launch` entrypoints that write composed-fs and
 config-fs manifests, start embedded composed-fs/config-fs/vmnet tasks, and build
-QEMU with `-netdev stream`. A real microvm HTTP smoke has still not been run
-from this frontend.
+QEMU with `-netdev stream`.
+
+As of 2026-05-14, a booted `microvm` has validated the Rust stream gateway for
+guest network setup, TCP/80 HTTP interception, local upstream mapping,
+deny-by-default metadata/private range blocking, explicit `--no-net` blocking,
+Docker/payload host listeners, and generic published TCP host ingress. The Rust
+stream path is viable for the tested HTTP egress and host-ingress paths, but it
+is not yet ready to replace the Python frontend wholesale because HTTPS MITM,
+DNS/UDP policy, pcap capture, and long-running lifecycle behavior still need
+booted-VM validation.
 
 Observed local prerequisites:
 
@@ -28,8 +36,8 @@ The first `/dev/kvm` check was sandbox-limited. The corrected host check was:
 crw-rw-rw- 1 root kvm 10, 232 May 13 09:47 /dev/kvm
 ```
 
-Do not close `wra-p7m4` until the Rust vmnet runtime is exercised by a booted
-`microvm`, not merely by the existing Python launcher’s user-mode networking.
+`wra-p7m4` covered the initial runtime implementation. `wra-pah4` is the
+remaining end-to-end validation gate for replacing the Python frontend path.
 
 ## Checks Run
 
@@ -41,11 +49,16 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- prepare --project 
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --allow-public-internet --qemu-timeout-seconds 10
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- prepare --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --allow-public-internet --guest-http-smoke-url http://93.184.216.34/
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --allow-public-internet --guest-http-smoke-url http://198.51.100.10/ --local-http-smoke-upstream 198.51.100.10:80 --qemu-timeout-seconds 30
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --guest-http-smoke-url http://169.254.169.254/ --qemu-timeout-seconds 30
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --no-net --guest-http-smoke-url http://198.51.100.10/ --local-http-smoke-upstream 198.51.100.10:80 --qemu-timeout-seconds 30
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --no-net --host-payload-listener 12076:1076 --qemu-timeout-seconds 60
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --no-net --host-docker-listener 12375:1075 --qemu-timeout-seconds 75
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --publish 12077:1076 --qemu-timeout-seconds 60
 ```
 
 Results:
 
-- `vm-frontend`: 51 library tests passed, 3 binary tests passed, 1 ignored.
+- `vm-frontend`: 64 library tests passed, 8 binary tests passed, 1 ignored.
 - `composed-fs`: 17 passed.
 - QEMU command shape: `qemu-command-shape-ok`.
 - `agentvm-frontend prepare` wrote
@@ -85,6 +98,34 @@ Results:
   `HTTP/1.1 200 OK`, and `vmnet-events.log` contains `tcp_connected`,
   `http_request`, `guest_payload`, and `upstream_payload` for
   `198.51.100.10:80`.
+- A metadata-IP smoke against `http://169.254.169.254/` now fails quickly with
+  guest-side `Connection refused`. The gateway emits a TCP reset for denied
+  pre-accept SYNs and logs
+  `tcp_denied_preaccept dst=169.254.169.254:80 action=Deny reason=destination is in a denied range`.
+  Before this fix, the guest connect hung and no vmnet event was logged.
+- Explicit `--no-net` is accepted by the Rust frontend. A booted smoke with
+  `--no-net`, `--guest-http-smoke-url http://198.51.100.10/`, and a local
+  upstream mapping fails closed before opening the upstream. `state.json`
+  records `egress_default_action=Deny` and `egress_reason=NoNetFlag`; the guest
+  sees `Connection refused`; `vmnet-events.log` records
+  `tcp_denied_preaccept dst=198.51.100.10:80 action=Deny reason=destination denied by egress policy`.
+- Payload host ingress works through a frontend-owned listener. Launching with
+  `--no-net --host-payload-listener 12076:1076`, then sending the payload server
+  ping frame to `127.0.0.1:12076`, returns frame `K` with payload `ok`.
+  `vmnet-events.log` records `host_ingress_opened`,
+  `host_ingress_host_payload`, `host_ingress_guest_payload`, and
+  `host_ingress_guest_closed` for guest port `1076`.
+- Docker host ingress works through the project Unix socket and frontend-owned
+  host listener. Launching with
+  `--no-net --host-docker-listener 12375:1075`, then running
+  `curl --unix-socket .sandbox/docker-vm/run/docker.sock http://docker/_ping`,
+  returns Docker `HTTP/1.1 200 OK` with body `OK`. The correct guest socket
+  bridge port is `1075`, not Docker's conventional `2375`.
+- Published TCP ingress works through the same frontend path. Launching with
+  `--publish 12077:1076`, then sending the payload server ping frame to
+  `127.0.0.1:12077`, returns frame `K` with payload `ok`. The vmnet log records
+  `purpose=PublishedTcp` events and the generated QEMU command still contains
+  no `hostfwd`.
 
 The ignored frontend test is
 `tcp_gateway::tests::std_connector_returns_nonblocking_tcp_stream`; it binds
@@ -104,6 +145,11 @@ escalation and passed.
 - smoltcp TCP state handling through SYN, ARP neighbor resolution, established
   session payload reads, and guest-directed response writes.
 - HTTP/1 request parsing for intercepted TCP/80 traffic.
+- HTTPS MITM primitives: configured CA loading, fail-closed missing-CA policy,
+  per-host certificate generation, guest-side TLS termination, upstream TLS
+  encryption/validation using native roots, and decrypted HTTP summary logging
+  are unit tested. A booted HTTPS guest smoke is still pending because the guest
+  image needs the MITM CA installed.
 - Runtime frame pump from QEMU stream framing to vmnet gateway to TCP proxy
   bridge and back to guest frames.
 - Delayed upstream responses via `pump_proxy_once()` without requiring another
@@ -193,19 +239,25 @@ escalation and passed.
      entry.
    - The host opens the upstream connection only after policy allows it.
    - The guest receives the upstream HTTP response.
-   - A blocked destination, for example `169.254.169.254`, fails closed.
+   - A blocked destination, for example `169.254.169.254`, fails closed with
+     guest-visible connection refusal and a `tcp_denied_preaccept` vmnet event.
 
-## Remaining Gap
+## Remaining Gaps
 
 `sandbox-wrap` still constructs the current QEMU command with `-netdev user`
 and `hostfwd`, so running it as-is would validate the old path rather than this
 Rust vmnet gateway. Use `agentvm-frontend launch` for the stream path.
 
-The remaining launcher hardening gap is process lifecycle: the new Rust
-launcher starts the embedded tasks and waits for QEMU, but it does not yet
-implement clean signal propagation/shutdown for long unattended runs. Run the
-first VM smoke interactively, inspect `.sandbox/docker-vm/run/console.log` and
-`.sandbox/docker-vm/run/qemu.log`, then append the outcome here.
+Bounded validation timeouts now have explicit lifecycle reporting. A
+`--qemu-timeout-seconds 10` run exits with
+`qemu timed out after 10 seconds and was terminated with status: signal: 9 (SIGKILL)`;
+`state.json` records `status=timed_out`, and expected embedded backend
+disconnects after QEMU termination are suppressed instead of being printed as
+misleading composed-fs/config-fs/vmnet failures.
 
-`wra-p7m4` should remain open until that real VM smoke is run and the observed
-outcome is appended here or to the ticket notes.
+Additional booted validation still needed before replacement:
+
+- HTTPS MITM with a CA installed in the guest image.
+- DNS proxy logging/policy from inside the guest.
+- UDP/443 and unsupported protocol denial from inside the guest.
+- Optional pcap capture from the QEMU stream boundary.

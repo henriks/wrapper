@@ -1,8 +1,12 @@
 use smoltcp::time::Instant;
+use smoltcp::wire::{
+    EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
+    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+};
 
 use crate::guest_tcp::{
-    evaluate_tcp_syn_frame, GuestTcpCore, GuestTcpCoreError, GuestTcpSessionRef,
-    QueuedEthernetDevice, DEFAULT_GATEWAY_MAC,
+    evaluate_tcp_syn_frame, GuestTcpConnectError, GuestTcpCore, GuestTcpCoreError,
+    GuestTcpSessionRef, QueuedEthernetDevice, DEFAULT_GATEWAY_MAC,
 };
 use crate::l2_gateway::{L2Gateway, ParseAddressError};
 use crate::network_policy::VmnetPolicy;
@@ -45,12 +49,13 @@ impl<'a> VmnetGateway<'a> {
 
         if let Some((destination, decision)) = evaluate_tcp_syn_frame(self.policy, &frame) {
             if decision.action == TcpAction::Deny {
+                let guest_frames = tcp_reset_for_denied_syn(&frame).into_iter().collect();
                 return GuestFrameResult {
                     outcome: GuestFrameOutcome::TcpDenied {
                         destination,
                         decision,
                     },
-                    guest_frames: Vec::new(),
+                    guest_frames,
                 };
             }
             if let Err(error) = self.tcp_core.ensure_listener(destination.port) {
@@ -91,6 +96,30 @@ impl<'a> VmnetGateway<'a> {
         self.tcp_core.active_sessions()
     }
 
+    pub fn connect_host_to_guest(
+        &mut self,
+        guest_port: u16,
+        local_port: u16,
+        now: Instant,
+    ) -> Result<HostIngressConnect, GuestTcpConnectError> {
+        let handle = self.tcp_core.connect_to_guest(
+            &self.policy.assignment,
+            guest_port,
+            local_port,
+            now,
+            &mut self.tcp_device,
+        )?;
+        self.tcp_core.poll(now, &mut self.tcp_device);
+        Ok(HostIngressConnect {
+            handle,
+            guest_frames: self.drain_tcp_frames(),
+        })
+    }
+
+    pub fn host_ingress_sessions(&self) -> Vec<GuestTcpSessionRef> {
+        self.tcp_core.host_ingress_sessions()
+    }
+
     pub fn recv_tcp_session(
         &mut self,
         handle: smoltcp::iface::SocketHandle,
@@ -109,6 +138,16 @@ impl<'a> VmnetGateway<'a> {
         Ok(self.drain_tcp_frames())
     }
 
+    pub fn close_tcp_session(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        now: Instant,
+    ) -> Vec<Vec<u8>> {
+        self.tcp_core.close_session(handle);
+        self.tcp_core.poll(now, &mut self.tcp_device);
+        self.drain_tcp_frames()
+    }
+
     pub fn policy(&self) -> &VmnetPolicy {
         self.policy
     }
@@ -120,6 +159,12 @@ impl<'a> VmnetGateway<'a> {
         }
         frames
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIngressConnect {
+    pub handle: smoltcp::iface::SocketHandle,
+    pub guest_frames: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +202,75 @@ fn ethernet_mtu(policy: &VmnetPolicy) -> usize {
     usize::from(policy.mtu) + 14
 }
 
+fn tcp_reset_for_denied_syn(frame: &[u8]) -> Option<Vec<u8>> {
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    let ethernet = EthernetRepr::parse(&ethernet).ok()?;
+    if ethernet.ethertype != EthernetProtocol::Ipv4 {
+        return None;
+    }
+
+    let ip_offset = ethernet.buffer_len();
+    let ipv4_packet = Ipv4Packet::new_checked(&frame[ip_offset..]).ok()?;
+    let ipv4 = Ipv4Repr::parse(&ipv4_packet, &Default::default()).ok()?;
+    if ipv4.next_header != IpProtocol::Tcp {
+        return None;
+    }
+
+    let tcp_offset = ip_offset + ipv4.buffer_len();
+    let tcp_packet = TcpPacket::new_checked(&frame[tcp_offset..]).ok()?;
+    let tcp = TcpRepr::parse(
+        &tcp_packet,
+        &IpAddress::Ipv4(ipv4.src_addr),
+        &IpAddress::Ipv4(ipv4.dst_addr),
+        &Default::default(),
+    )
+    .ok()?;
+
+    let reply_tcp = TcpRepr {
+        src_port: tcp.dst_port,
+        dst_port: tcp.src_port,
+        control: TcpControl::Rst,
+        seq_number: TcpSeqNumber(0),
+        ack_number: Some(tcp.seq_number + 1),
+        window_len: 0,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let reply_ipv4 = Ipv4Repr {
+        src_addr: ipv4.dst_addr,
+        dst_addr: ipv4.src_addr,
+        next_header: IpProtocol::Tcp,
+        payload_len: reply_tcp.buffer_len(),
+        hop_limit: 64,
+    };
+    let reply_ethernet = EthernetRepr {
+        src_addr: ethernet.dst_addr,
+        dst_addr: ethernet.src_addr,
+        ethertype: EthernetProtocol::Ipv4,
+    };
+
+    let mut reply =
+        vec![0; reply_ethernet.buffer_len() + reply_ipv4.buffer_len() + reply_tcp.buffer_len()];
+    reply_ethernet.emit(&mut EthernetFrame::new_unchecked(&mut reply));
+    reply_ipv4.emit(
+        &mut Ipv4Packet::new_unchecked(&mut reply[reply_ethernet.buffer_len()..]),
+        &Default::default(),
+    );
+    reply_tcp.emit(
+        &mut TcpPacket::new_unchecked(
+            &mut reply[reply_ethernet.buffer_len() + reply_ipv4.buffer_len()..],
+        ),
+        &IpAddress::Ipv4(reply_ipv4.src_addr),
+        &IpAddress::Ipv4(reply_ipv4.dst_addr),
+        &Default::default(),
+    );
+    Some(reply)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,7 +299,12 @@ mod tests {
             result.outcome,
             GuestFrameOutcome::TcpDenied { .. }
         ));
-        assert!(result.guest_frames.is_empty());
+        assert_eq!(result.guest_frames.len(), 1);
+        let reset = parse_tcp_reply(&result.guest_frames[0]);
+        assert_eq!(reset.control, TcpControl::Rst);
+        assert_eq!(reset.src_port, 80);
+        assert_eq!(reset.dst_port, 49152);
+        assert_eq!(reset.ack_number, Some(TcpSeqNumber(101)));
     }
 
     #[test]
@@ -207,6 +326,26 @@ mod tests {
             &result.guest_frames[0][0..6],
             EthernetAddress::BROADCAST.as_bytes()
         );
+    }
+
+    #[test]
+    fn host_ingress_connect_emits_guest_frames_without_guest_egress_session() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+
+        let connect = gateway
+            .connect_host_to_guest(1075, 40000, Instant::from_millis(1))
+            .expect("connect");
+
+        assert_eq!(connect.guest_frames.len(), 1);
+        assert_eq!(
+            &connect.guest_frames[0][0..6],
+            EthernetAddress::BROADCAST.as_bytes()
+        );
+        assert!(gateway.active_tcp_sessions().is_empty());
+        assert_eq!(gateway.host_ingress_sessions().len(), 1);
     }
 
     fn tcp_syn_frame(dst_port: u16) -> Vec<u8> {
@@ -250,5 +389,21 @@ mod tests {
             &ChecksumCapabilities::default(),
         );
         frame
+    }
+
+    fn parse_tcp_reply(frame: &[u8]) -> TcpRepr<'_> {
+        let ethernet = EthernetFrame::new_unchecked(frame);
+        let ethernet = EthernetRepr::parse(&ethernet).expect("ethernet");
+        let ip_offset = ethernet.buffer_len();
+        let ipv4 = Ipv4Packet::new_unchecked(&frame[ip_offset..]);
+        let ipv4 = Ipv4Repr::parse(&ipv4, &ChecksumCapabilities::default()).expect("ipv4");
+        let tcp_offset = ip_offset + ipv4.buffer_len();
+        TcpRepr::parse(
+            &TcpPacket::new_unchecked(&frame[tcp_offset..]),
+            &IpAddress::Ipv4(ipv4.src_addr),
+            &IpAddress::Ipv4(ipv4.dst_addr),
+            &ChecksumCapabilities::default(),
+        )
+        .expect("tcp")
     }
 }

@@ -12,6 +12,7 @@ Current scope:
 - DNS proxy policy hooks backed by `hickory-proto`
 - TCP destination policy and HTTP/1 request parsing backed by `ipnet` and
   `httparse`
+- configured-CA HTTPS MITM primitives backed by `rcgen` and `rustls`
 - smoltcp-backed userspace TCP handling and a QEMU stream runtime pump for the
   rootless vmnet gateway
 - Rust runtime preparation and launch entrypoints that write composed-fs/config
@@ -20,8 +21,8 @@ Current scope:
 - state snapshot fields for the future `state.json` writer
 
 It deliberately does not keep the Python/QEMU user-networking path alive.
-Host-to-guest Docker, payload, and published-port access must be implemented as
-frontend-owned listeners over the userspace vmnet gateway.
+Host-to-guest Docker, payload, and published-port access are frontend-owned
+listeners over the userspace vmnet gateway, not QEMU `hostfwd` rules.
 
 The vmnet stream layer is in `src/vmnet_stream.rs`. It decodes and encodes the
 QEMU wire format as a 4-byte big-endian Ethernet frame length followed by raw
@@ -49,6 +50,8 @@ The guest TCP stack and stream runtime are in `src/guest_tcp.rs`,
 destinations for policy, bridge allowed sessions to ordinary host sockets, and
 write upstream bytes back as guest Ethernet frames. The launched gateway writes
 concise TCP/HTTP event summaries to `.sandbox/docker-vm/run/vmnet-events.log`.
+Denied pre-accept TCP SYNs emit guest-visible resets and `tcp_denied_preaccept`
+events so blocked destinations fail closed without hanging guest connects.
 
 Real VM validation status and the KVM-host smoke procedure are documented in
 `vmnet-runtime-validation.md`.
@@ -76,6 +79,10 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
   --allow-public-internet
 ```
 
+Use `--no-net` for an explicit deny-egress launch. Docker and payload control
+listeners may still be exposed through frontend-owned listeners, but published
+guest ports are rejected with `--no-net`.
+
 For a VM egress smoke after rebuilding the appliance with the current
 `docker/guest-init.sh`, add:
 
@@ -88,8 +95,7 @@ result to `.sandbox/docker-vm/run/guest-http-smoke.log`, and the vmnet gateway
 should log the intercepted request in `.sandbox/docker-vm/run/vmnet-events.log`.
 
 The launcher is intentionally Rust-only for the stream path: it does not add a
-QEMU `user` netdev or `hostfwd` fallback. Host-to-guest Docker/payload/published
-ports remain a later frontend-owned listener task.
+QEMU `user` netdev or `hostfwd` fallback.
 
 Validate:
 

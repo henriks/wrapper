@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -12,6 +13,10 @@ use crate::tcp_gateway::{
     evaluate_tcp_destination, parse_http_request, HttpParseError, HttpRequestSummary, TcpAction,
     TcpConnectError, TcpDecision, TcpDestination, TcpUpstreamConnector,
 };
+use crate::tls_mitm::{
+    rustls_client_config_with_native_roots, GuestTlsSession, TlsMitmAuthority, TlsMitmError,
+    TlsUpstreamSession,
+};
 use crate::vmnet_gateway::VmnetGateway;
 
 pub struct TcpProxyBridge<C>
@@ -20,6 +25,8 @@ where
 {
     connector: C,
     sessions: HashMap<SocketHandle, UpstreamSession<C::Connection>>,
+    tls_server_config: Option<Arc<rustls::ServerConfig>>,
+    tls_client_config: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl<C> TcpProxyBridge<C>
@@ -30,7 +37,21 @@ where
         Self {
             connector,
             sessions: HashMap::new(),
+            tls_server_config: None,
+            tls_client_config: None,
         }
+    }
+
+    pub fn with_tls_mitm(
+        connector: C,
+        authority: Arc<TlsMitmAuthority>,
+    ) -> Result<Self, TlsMitmError> {
+        Ok(Self {
+            connector,
+            sessions: HashMap::new(),
+            tls_server_config: Some(Arc::new(authority.rustls_server_config()?)),
+            tls_client_config: Some(Arc::new(rustls_client_config_with_native_roots()?)),
+        })
     }
 
     pub fn process_gateway(
@@ -60,6 +81,27 @@ where
                     });
                     continue;
                 }
+                let guest_tls = if decision.action == TcpAction::InterceptHttps {
+                    let Some(config) = &self.tls_server_config else {
+                        events.push(TcpProxyEvent::TlsMitmUnavailable {
+                            handle: active.handle,
+                            destination,
+                        });
+                        continue;
+                    };
+                    match GuestTlsSession::new(config.clone()) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            events.push(TcpProxyEvent::TlsMitmFailed {
+                                handle: active.handle,
+                                error,
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
                 match self.connector.connect(&destination) {
                     Ok(connection) => {
                         events.push(TcpProxyEvent::Connected {
@@ -74,6 +116,9 @@ where
                                 decision,
                                 connection,
                                 http_buffer: Vec::new(),
+                                guest_tls,
+                                upstream_tls: None,
+                                pending_upstream_plaintext: Vec::new(),
                             },
                         );
                     }
@@ -99,7 +144,7 @@ where
                 }
             };
             if !guest_bytes.is_empty() {
-                self.process_guest_payload(active.handle, guest_bytes, &mut events);
+                self.process_guest_payload(active.handle, guest_bytes, gateway, now, &mut events);
             }
 
             let Some(session) = self.sessions.get_mut(&active.handle) else {
@@ -108,10 +153,70 @@ where
             if let Some(upstream_bytes) =
                 read_available(&mut session.connection, &mut events, active.handle)
             {
-                match gateway.send_tcp_session(active.handle, &upstream_bytes, now) {
+                let guest_bytes = if session.decision.action == TcpAction::InterceptHttps {
+                    let upstream_read = match session
+                        .upstream_tls
+                        .as_mut()
+                        .ok_or_else(|| {
+                            TlsMitmError::Tls("upstream TLS is not initialized".to_string())
+                        })
+                        .and_then(|upstream_tls| upstream_tls.read_upstream_tls(&upstream_bytes))
+                    {
+                        Ok(read) => read,
+                        Err(error) => {
+                            events.push(TcpProxyEvent::TlsMitmFailed {
+                                handle: active.handle,
+                                error,
+                            });
+                            continue;
+                        }
+                    };
+                    if !upstream_read.tls_to_upstream.is_empty() {
+                        match write_all_best_effort(
+                            &mut session.connection,
+                            &upstream_read.tls_to_upstream,
+                        ) {
+                            Ok(bytes) => events.push(TcpProxyEvent::TlsUpstreamPayload {
+                                handle: active.handle,
+                                bytes,
+                            }),
+                            Err(error) => {
+                                events.push(TcpProxyEvent::UpstreamWriteFailed {
+                                    handle: active.handle,
+                                    error,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    flush_pending_https_plaintext(session, active.handle, &mut events);
+                    if upstream_read.plaintext.is_empty() {
+                        continue;
+                    }
+                    let Some(guest_tls) = session.guest_tls.as_mut() else {
+                        events.push(TcpProxyEvent::TlsMitmUnavailable {
+                            handle: active.handle,
+                            destination: session.destination.clone(),
+                        });
+                        continue;
+                    };
+                    match guest_tls.write_guest_plaintext(&upstream_read.plaintext) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            events.push(TcpProxyEvent::TlsMitmFailed {
+                                handle: active.handle,
+                                error,
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    upstream_bytes.clone()
+                };
+                match gateway.send_tcp_session(active.handle, &guest_bytes, now) {
                     Ok(guest_frames) => events.push(TcpProxyEvent::UpstreamPayload {
                         handle: active.handle,
-                        bytes: upstream_bytes.len(),
+                        bytes: guest_bytes.len(),
                         guest_frames,
                     }),
                     Err(error) => events.push(TcpProxyEvent::GuestWriteFailed {
@@ -128,6 +233,8 @@ where
         &mut self,
         handle: SocketHandle,
         guest_bytes: Vec<u8>,
+        gateway: &mut VmnetGateway<'_>,
+        now: Instant,
         events: &mut Vec<TcpProxyEvent>,
     ) where
         C::Connection: Write,
@@ -136,24 +243,70 @@ where
             return;
         };
 
-        if session.decision.action == TcpAction::InterceptHttp {
-            session.http_buffer.extend_from_slice(&guest_bytes);
-            match parse_http_request(&session.http_buffer) {
-                Ok(Some(summary)) => events.push(TcpProxyEvent::HttpRequest {
+        let payload = if session.decision.action == TcpAction::InterceptHttps {
+            let Some(guest_tls) = session.guest_tls.as_mut() else {
+                events.push(TcpProxyEvent::TlsMitmUnavailable {
                     handle,
                     destination: session.destination.clone(),
-                    summary,
-                }),
-                Ok(None) => events.push(TcpProxyEvent::HttpRequestIncomplete { handle }),
-                Err(HttpParseError::Malformed) => {
-                    events.push(TcpProxyEvent::HttpRequestMalformed { handle })
+                });
+                return;
+            };
+            let read = match guest_tls.read_guest_tls(&guest_bytes) {
+                Ok(read) => read,
+                Err(error) => {
+                    events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+                    return;
+                }
+            };
+            if !read.tls_to_guest.is_empty() {
+                match gateway.send_tcp_session(handle, &read.tls_to_guest, now) {
+                    Ok(guest_frames) => events.push(TcpProxyEvent::TlsHandshakePayload {
+                        handle,
+                        bytes: read.tls_to_guest.len(),
+                        guest_frames,
+                    }),
+                    Err(error) => events.push(TcpProxyEvent::GuestWriteFailed { handle, error }),
                 }
             }
+            if !ensure_https_upstream_tls(session, handle, self.tls_client_config.clone(), events) {
+                return;
+            }
+            read.plaintext
+        } else {
+            guest_bytes
+        };
+
+        if session.decision.action == TcpAction::InterceptHttp
+            || session.decision.action == TcpAction::InterceptHttps
+        {
+            record_http_request(
+                handle,
+                &session.destination,
+                &mut session.http_buffer,
+                &payload,
+                events,
+            );
         }
 
-        match write_all_best_effort(&mut session.connection, &guest_bytes) {
-            Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
-            Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+        if payload.is_empty() {
+            return;
+        }
+
+        if session.decision.action == TcpAction::InterceptHttps {
+            if let Some(upstream_tls) = session.upstream_tls.as_ref() {
+                if upstream_tls.is_handshaking() {
+                    session
+                        .pending_upstream_plaintext
+                        .extend_from_slice(&payload);
+                    return;
+                }
+            }
+            write_https_plaintext_upstream(session, handle, &payload, events);
+        } else {
+            match write_all_best_effort(&mut session.connection, &payload) {
+                Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
+                Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+            }
         }
     }
 }
@@ -163,6 +316,127 @@ struct UpstreamSession<T> {
     decision: TcpDecision,
     connection: T,
     http_buffer: Vec<u8>,
+    guest_tls: Option<GuestTlsSession>,
+    upstream_tls: Option<TlsUpstreamSession>,
+    pending_upstream_plaintext: Vec<u8>,
+}
+
+fn ensure_https_upstream_tls<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    tls_client_config: Option<Arc<rustls::ClientConfig>>,
+    events: &mut Vec<TcpProxyEvent>,
+) -> bool {
+    if session.upstream_tls.is_some() {
+        return true;
+    }
+
+    let Some(guest_tls) = session.guest_tls.as_ref() else {
+        events.push(TcpProxyEvent::TlsMitmUnavailable {
+            handle,
+            destination: session.destination.clone(),
+        });
+        return false;
+    };
+    let Some(server_name) = guest_tls.server_name().map(ToOwned::to_owned) else {
+        if !guest_tls.is_handshaking() {
+            events.push(TcpProxyEvent::TlsMitmFailed {
+                handle,
+                error: TlsMitmError::InvalidHost(
+                    "guest TLS connection did not provide SNI".to_string(),
+                ),
+            });
+        }
+        return false;
+    };
+    let Some(config) = tls_client_config else {
+        events.push(TcpProxyEvent::TlsMitmUnavailable {
+            handle,
+            destination: session.destination.clone(),
+        });
+        return false;
+    };
+    let mut upstream_tls = match TlsUpstreamSession::new(config, &server_name) {
+        Ok(upstream_tls) => upstream_tls,
+        Err(error) => {
+            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            return false;
+        }
+    };
+    let client_hello = match upstream_tls.drain_tls_to_upstream() {
+        Ok(client_hello) => client_hello,
+        Err(error) => {
+            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            return false;
+        }
+    };
+    if !client_hello.is_empty() {
+        match write_all_best_effort(&mut session.connection, &client_hello) {
+            Ok(bytes) => events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes }),
+            Err(error) => {
+                events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
+                return false;
+            }
+        }
+    }
+    session.upstream_tls = Some(upstream_tls);
+    true
+}
+
+fn flush_pending_https_plaintext<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    if session.pending_upstream_plaintext.is_empty() {
+        return;
+    }
+    if session
+        .upstream_tls
+        .as_ref()
+        .is_none_or(TlsUpstreamSession::is_handshaking)
+    {
+        return;
+    }
+    let pending = std::mem::take(&mut session.pending_upstream_plaintext);
+    write_https_plaintext_upstream(session, handle, &pending, events);
+}
+
+fn write_https_plaintext_upstream<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    plaintext: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    let Some(upstream_tls) = session.upstream_tls.as_mut() else {
+        session
+            .pending_upstream_plaintext
+            .extend_from_slice(plaintext);
+        return;
+    };
+    if upstream_tls.is_handshaking() {
+        session
+            .pending_upstream_plaintext
+            .extend_from_slice(plaintext);
+        return;
+    }
+    let tls_bytes = match upstream_tls.write_upstream_plaintext(plaintext) {
+        Ok(tls_bytes) => tls_bytes,
+        Err(error) => {
+            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            return;
+        }
+    };
+    match write_all_best_effort(&mut session.connection, &tls_bytes) {
+        Ok(bytes) => {
+            events.push(TcpProxyEvent::GuestPayload {
+                handle,
+                bytes: plaintext.len(),
+            });
+            events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+        }
+        Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -202,6 +476,23 @@ pub enum TcpProxyEvent {
         bytes: usize,
         guest_frames: Vec<Vec<u8>>,
     },
+    TlsHandshakePayload {
+        handle: SocketHandle,
+        bytes: usize,
+        guest_frames: Vec<Vec<u8>>,
+    },
+    TlsUpstreamPayload {
+        handle: SocketHandle,
+        bytes: usize,
+    },
+    TlsMitmUnavailable {
+        handle: SocketHandle,
+        destination: TcpDestination,
+    },
+    TlsMitmFailed {
+        handle: SocketHandle,
+        error: TlsMitmError,
+    },
     GuestReadFailed {
         handle: SocketHandle,
         error: tcp::RecvError,
@@ -218,6 +509,30 @@ pub enum TcpProxyEvent {
         handle: SocketHandle,
         error: String,
     },
+}
+
+fn record_http_request(
+    handle: SocketHandle,
+    destination: &TcpDestination,
+    http_buffer: &mut Vec<u8>,
+    payload: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    if payload.is_empty() {
+        return;
+    }
+    http_buffer.extend_from_slice(payload);
+    match parse_http_request(http_buffer) {
+        Ok(Some(summary)) => events.push(TcpProxyEvent::HttpRequest {
+            handle,
+            destination: destination.clone(),
+            summary,
+        }),
+        Ok(None) => events.push(TcpProxyEvent::HttpRequestIncomplete { handle }),
+        Err(HttpParseError::Malformed) => {
+            events.push(TcpProxyEvent::HttpRequestMalformed { handle })
+        }
+    }
 }
 
 fn destination_from_session(session: &GuestTcpSession) -> Option<TcpDestination> {

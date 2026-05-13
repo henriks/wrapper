@@ -137,6 +137,14 @@ pub fn evaluate_tcp_destination(policy: &VmnetPolicy, destination: &TcpDestinati
     }
 
     if destination.port == 443 && policy.protocols.tcp.intercept_https_port_443 {
+        if !https_mitm_configured(policy) {
+            return TcpDecision {
+                action: TcpAction::Deny,
+                reason:
+                    "HTTPS MITM requires configured CA cert/key and per-host certificate generation"
+                        .to_string(),
+            };
+        }
         return TcpDecision {
             action: TcpAction::InterceptHttps,
             reason: "HTTPS interception enabled".to_string(),
@@ -147,6 +155,12 @@ pub fn evaluate_tcp_destination(policy: &VmnetPolicy, destination: &TcpDestinati
         action: TcpAction::Connect,
         reason: "generic TCP connect allowed".to_string(),
     }
+}
+
+fn https_mitm_configured(policy: &VmnetPolicy) -> bool {
+    policy.tls_mitm.ca_cert_path.is_some()
+        && policy.tls_mitm.ca_key_path.is_some()
+        && policy.tls_mitm.generate_per_host_certs
 }
 
 pub fn parse_http_request(buffer: &[u8]) -> Result<Option<HttpRequestSummary>, HttpParseError> {
@@ -267,6 +281,25 @@ mod tests {
 
     #[test]
     fn intercepts_allowed_https_destination() {
+        let mut policy = policy();
+        policy.tls_mitm.ca_cert_path = Some("/tmp/ca.pem".into());
+        policy.tls_mitm.ca_key_path = Some("/tmp/ca-key.pem".into());
+        policy.tls_mitm.generate_per_host_certs = true;
+
+        let decision = evaluate_tcp_destination(
+            &policy,
+            &TcpDestination {
+                ip: Ipv4Addr::new(93, 184, 216, 34),
+                port: 443,
+                domain: Some("example.com".to_string()),
+            },
+        );
+
+        assert_eq!(decision.action, TcpAction::InterceptHttps);
+    }
+
+    #[test]
+    fn https_interception_fails_closed_without_ca_material() {
         let decision = evaluate_tcp_destination(
             &policy(),
             &TcpDestination {
@@ -276,7 +309,10 @@ mod tests {
             },
         );
 
-        assert_eq!(decision.action, TcpAction::InterceptHttps);
+        assert_eq!(decision.action, TcpAction::Deny);
+        assert!(decision
+            .reason
+            .contains("HTTPS MITM requires configured CA"));
     }
 
     #[test]
