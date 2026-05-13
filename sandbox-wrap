@@ -327,6 +327,7 @@ def build_bwrap_args(
     extra_rw: list[str] | None = None,
     pass_env: list[str] | None = None,
     cli_args: list[str] | None = None,
+    mask_git: bool = True,
     interactive_tty: bool = False,
 ) -> list[str]:
     """Build the full bwrap command line."""
@@ -402,7 +403,7 @@ def build_bwrap_args(
 
     # .git read-only overlay
     git_dir = os.path.join(project, ".git")
-    if os.path.isdir(git_dir):
+    if mask_git and os.path.isdir(git_dir):
         args += ["--ro-bind", git_dir, git_dir]
 
     # Hide .sandbox inside the sandbox
@@ -684,6 +685,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Pass host environment variable into sandbox (repeatable)",
     )
     parser.add_argument(
+        "--git", action="store_true",
+        help="Allow sandbox writes to the project's .git directory",
+    )
+    parser.add_argument(
         "--reset", action="store_true",
         help="Remove .sandbox/ and start fresh",
     )
@@ -788,6 +793,7 @@ def main() -> None:
         extra_rw=args.rw,
         pass_env=args.pass_env,
         cli_args=args.extra,
+        mask_git=not args.git,
         interactive_tty=interactive_tty,
     )
 

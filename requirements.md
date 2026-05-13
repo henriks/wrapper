@@ -84,7 +84,10 @@ project. Toolchains are managed by mise and installed within the sandbox state.
 1. The project directory shall be mounted read-write at its real host path.
 2. `.git` within the project shall be mounted read-only (overriding the
    read-write mount), preventing the agent from modifying git state.
-3. `.sandbox` within the project shall be hidden by a tmpfs overlay.
+3. `--git` shall disable the `.git` read-only overlay, leaving `.git`
+   writable through the project directory mount when the caller intentionally
+   allows git metadata changes inside the sandbox.
+4. `.sandbox` within the project shall be hidden by a tmpfs overlay.
 
 ### 4.3 Persistent Sandbox State (from `.sandbox/`)
 
@@ -194,7 +197,9 @@ project. Toolchains are managed by mise and installed within the sandbox state.
    state (log, diff, status, blame, etc.).
 2. Git write operations (commit, push, checkout, etc.) shall fail due to the
    read-only mount.
-3. `GIT_CONFIG_GLOBAL` shall be set to `/dev/null` to prevent host git config
+3. `--git` shall opt out of the read-only `.git` mount for workflows
+   that need git write operations inside the sandbox.
+4. `GIT_CONFIG_GLOBAL` shall be set to `/dev/null` to prevent host git config
    leakage.
 
 ---
@@ -215,6 +220,7 @@ Options:
   --ro PATH             Extra read-only bind mount (repeatable)
   --rw PATH             Extra read-write bind mount (repeatable)
   --pass-env VAR        Pass host env var into sandbox (repeatable)
+  --git                 Allow sandbox writes to the project's .git directory
   --reset               Remove .sandbox/ and start fresh
   --help                Show usage
 ```
