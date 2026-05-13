@@ -18,12 +18,6 @@ The explicit form is also accepted:
 sandbox-wrap --docker --docker-machine microvm ...
 ```
 
-The old q35 per-share fallback remains available during the fallback window:
-
-```sh
-sandbox-wrap --docker --docker-legacy-per-share-fs ...
-```
-
 The microvm branch requires composed fs. This is deliberate: the migration goal
 is one composed filesystem export plus the tiny boot config share, not a
 duplicate microvm implementation of the old per-share export model.
@@ -49,14 +43,15 @@ The q35 branch still uses the existing PCI devices and `-nic` shorthand.
 booting QEMU. It is intended as the lightweight regression check for this
 branch until full VM validation is automated.
 
-## Current Scope
+## Validation Scope
 
-This ticket only adds the gated command-construction branch and documents the
-decision. Full boot validation belongs to `wra-11dm`.
+This ticket added the command-construction branch and documented the decision.
+Full boot validation is recorded in `wra-11dm` and summarized in
+`docker/microvm-composed-validation.md`.
 
-Expected next validation:
+Validated coverage:
 
-- boot `--docker --docker-composed-fs --docker-machine microvm`
+- boot `--docker --docker-machine microvm`
 - verify Docker and payload readiness
 - verify project path identity and host writeback
 - verify Docker bind mounts from `$PWD`

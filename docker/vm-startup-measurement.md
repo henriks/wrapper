@@ -34,8 +34,8 @@ differences are small and the device/process count reduction is structural.
 
 ## Decision
 
-Proceed with microvm composed as the Docker VM default, but retain the old q35
-per-share fallback until a fallback-window ticket removes it.
+Proceed with microvm composed as the Docker VM default and remove the old q35
+per-share fallback instead of preserving redundant legacy code.
 
 Rationale:
 
@@ -51,11 +51,10 @@ Rationale:
 
 ## Default Switch Criteria
 
-The default may move to microvm composed when the default-switch patch keeps an
-explicit fallback and preserves:
+The default may remain on microvm composed when validation preserves:
 
-- payload readiness within 20% or 1 second of the current q35 fallback on local
-  smoke runs
+- payload readiness within 20% or 1 second of the measured q35 fallback
+  baseline on local smoke runs
 - Docker readiness through the project-local socket
 - project path identity and host writeback
 - Docker bind mounts from `$PWD`
@@ -63,5 +62,5 @@ explicit fallback and preserves:
 - no increase above 4 wrapper-owned host processes for composed mode
 - no increase above 6 QEMU devices for composed mode with the tiny config share
 
-The old per-share export path should be removed only after the fallback window
-confirms no real workloads still need it.
+The old per-share export path has been removed after composed q35, microvm
+composed, and startup/readiness validation passed.

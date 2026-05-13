@@ -6,23 +6,15 @@ Date: 2026-05-13
 
 ## Switch
 
-The q35 composed filesystem path remains available explicitly:
+The q35 composed filesystem path remains available explicitly for comparison
+and troubleshooting:
 
 ```sh
 sandbox-wrap --docker --docker-machine q35 ...
 ```
 
-The old q35 per-share fallback remains available during the fallback window:
-
-```sh
-sandbox-wrap --docker --docker-legacy-per-share-fs ...
-```
-
-The fallback uses:
-
-- primary project `virtiofsd`
-- tiny readonly guest config `virtiofsd`
-- one supplemental per-share `virtiofsd` per extra guest share
+There is no longer a q35 per-share fallback path. All Docker VM modes use the
+composed filesystem export plus the tiny readonly config share.
 
 ## Runtime Files
 
@@ -73,8 +65,8 @@ Guest init mounts the tiny config share first. If
 - fail boot for required bind failures
 - log and skip optional bind failures
 
-If `composed-binds.json` is absent, guest init uses the old project mount plus
-`shares.txt` per-share reconstruction path.
+If `composed-binds.json` is absent, guest init fails boot because the old
+`shares.txt` per-share reconstruction path has been removed.
 
 ## Validation Status
 
@@ -91,7 +83,7 @@ Preflight checks:
 
 Integration checks:
 
-- `--docker --docker-composed-fs --no-net` boots, reaches payload readiness,
+- `--docker --docker-machine q35 --no-net` boots, reaches payload readiness,
   preserves the project working directory, exposes Docker through the socket
   proxy, and writes project files back to the host.
 - Composed mode mounts one primary `virtiofs` export at `/run/agentvm-host`;
@@ -102,9 +94,6 @@ Integration checks:
 - Docker bind mounts from `$PWD` work from inside the guest.
 - `--docker-publish 28081:18081` forwards host localhost traffic to a server
   inside the guest and returned `publish-ok`.
-- The non-composed q35 fallback path still boots, reaches payload readiness,
-  and exposes Docker.
-
 Validation found one implementation bug: `agentvm-composed-fs` returned from
 `main` immediately after starting the vhost-user daemon. The backend now calls
 `daemon.wait()` after `daemon.start(listener)` so the process remains alive for
@@ -113,5 +102,5 @@ the guest session.
 Remaining validation belongs to later rollout tickets:
 
 - broader Codex/Copilot auth-state smoke coverage
-- startup/readiness timing against the old q35 path
+- startup/readiness timing against the old q35 path before removal
 - microvm launch and microvm plus composed-fs integration

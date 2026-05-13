@@ -49,34 +49,6 @@ load_kernel_module() {
   fi
 }
 
-mount_extra_share() {
-  tag="$1"
-  kind="$2"
-  target="$3"
-  basename_part="$4"
-
-  case "${target}" in
-    /*) ;;
-    *)
-      log "warning: ignoring invalid share target ${target}"
-      return 0
-      ;;
-  esac
-
-  if [ "${kind}" = "dir" ]; then
-    mkdir -p "${target}"
-    mount -t virtiofs "${tag}" "${target}"
-    return 0
-  fi
-
-  temp_mount="/run/agentvm-share-mnts/${tag}"
-  mkdir -p "${temp_mount}"
-  mount -t virtiofs "${tag}" "${temp_mount}"
-  mkdir -p "$(dirname "${target}")"
-  : > "${target}"
-  mount --bind "${temp_mount}/${basename_part}" "${target}"
-}
-
 bind_composed_entry() {
   kind="$1"
   source="$2"
@@ -260,20 +232,13 @@ readonly \
   HOST_SOCKET_BRIDGE_LOG \
   HOST_PAYLOAD_SERVER_LOG
 
-if [ -f /run/agentvm-config/composed-binds.json ]; then
-  mount_composed_export
-else
-  mkdir -p "${PROJECT_PATH}"
-  mount -t virtiofs "${VIRTIOFS_TAG}" "${PROJECT_PATH}"
-fi
+[ -f /run/agentvm-config/composed-binds.json ] || {
+  log "error: missing composed bind manifest"
+  exit 1
+}
+mount_composed_export
 if [ "${PROJECT_PATH}" != "/workspace" ]; then
   mount --bind "${PROJECT_PATH}" /workspace
-fi
-if [ ! -f /run/agentvm-config/composed-binds.json ] && [ -f /run/agentvm-config/shares.txt ]; then
-  while IFS="$(printf '\t')" read -r tag kind target basename_part; do
-    [ -n "${tag}" ] || continue
-    mount_extra_share "${tag}" "${kind}" "${target}" "${basename_part}"
-  done </run/agentvm-config/shares.txt
 fi
 mkdir -p "${HOST_RUN_DIR}"
 touch "${HOST_DOCKERD_LOG}" "${HOST_SOCKET_BRIDGE_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"

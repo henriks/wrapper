@@ -38,8 +38,8 @@ The host remains responsible for:
   path.
 - Document spike outcomes as first-class deliverables so later tickets do not
   repeat investigation work.
-- Keep the old per-share path available behind a fallback until the composed
-  backend and `microvm` path pass integration tests.
+- Remove the old per-share path after the composed backend and `microvm` path
+  pass integration tests; do not preserve redundant legacy code paths.
 
 ## Non-Goals
 
@@ -50,16 +50,16 @@ The host remains responsible for:
 - Do not build duplicate staged-tree or symlink-projection implementations in
   parallel with `ComposedFs`.
 
-## Current Constraints
+## Replaced Constraints
 
-The current wrapper launches:
+The old wrapper launched:
 - QEMU with `-machine q35`
 - PCI virtio devices
 - one workspace `virtiofsd`
 - one config `virtiofsd`
 - one `virtiofsd` and one `vhost-user-fs-pci` device per extra share
 
-The current guest init:
+The old guest init:
 - mounts the project share directly at `PROJECT_PATH`
 - mounts a separate config share
 - reads `shares.txt`
@@ -67,6 +67,13 @@ The current guest init:
 
 This works, but it scales poorly with many host paths and conflicts with
 `microvm`'s smaller device model.
+
+Current implementation:
+- defaults `--docker` to `microvm`
+- uses one composed filesystem export for workspace, tool state, auth state,
+  and user `--ro` / `--rw` paths
+- keeps a tiny readonly config `virtio-fs` share for boot metadata
+- no longer includes the old per-share `virtiofsd`/`shares.txt` path
 
 ## Target Architecture
 
@@ -416,12 +423,11 @@ Implementation order:
 11. Measure startup and readiness times against the current implementation.
     Current measurement and rollout decision are in
     `docker/vm-startup-measurement.md`.
-12. Make the composed backend and `microvm` path default only after acceptance
+12. Make the composed backend and `microvm` path default after acceptance
     criteria are met.
-    Current outcome: `--docker` defaults to microvm composed mode, while
-    `--docker-legacy-per-share-fs` keeps the old q35 per-share fallback
-    available during the fallback window.
-13. Remove the old per-share export path after a fallback window.
+    Current outcome: `--docker` defaults to microvm composed mode.
+13. Remove the old per-share export path instead of preserving a redundant
+    legacy branch.
 
 This order avoids duplicate implementations while still using spikes to answer
 unknowns. The filesystem remains critical: if a spike finds a blocker, the
@@ -459,7 +465,7 @@ Current unit-level coverage and residual integration gaps are documented in
 - Docker bind mounts using host-like paths work
 - Codex/Copilot state and auth paths work
 - `--ro`, `--rw`, `--no-net`, and `--docker-publish` behavior is preserved
-- fallback to the old per-share path remains possible until removal
+- no per-share fallback path remains in host or guest code
 
 ### Performance Tests
 

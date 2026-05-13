@@ -26,14 +26,13 @@ def load_sandbox_wrap():
     return module
 
 
-def make_manager(sw, machine_type: str, composed_fs: bool):
+def make_manager(sw, machine_type: str):
     manager = sw.DockerVmManager(
         "/project",
         "/project/.sandbox",
         str(ROOT),
         "codex",
         network_enabled=True,
-        composed_fs_enabled=composed_fs,
         machine_type=machine_type,
     )
     manager.host_tools = {"qemu-system-x86_64": "qemu-system-x86_64"}
@@ -75,7 +74,6 @@ def check_q35(sw) -> None:
     command = make_manager(
         sw,
         sw.DOCKER_VM_MACHINE_Q35,
-        composed_fs=False,
     ).build_qemu_command()
     assert_contains(command, "-machine q35,accel=kvm,memory-backend=mem")
     assert_contains(command, "virtio-blk-pci,drive=rootfs")
@@ -89,7 +87,6 @@ def check_microvm(sw) -> None:
     command = make_manager(
         sw,
         sw.DOCKER_VM_MACHINE_MICROVM,
-        composed_fs=True,
     ).build_qemu_command()
     assert_contains(
         command,

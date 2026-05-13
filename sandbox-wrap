@@ -325,7 +325,6 @@ class DockerVmPaths:
     state: str
     docker_sock: str
     guest_config_dir: str
-    guest_share_manifest: str
     composed_fs_manifest: str
     composed_bind_manifest: str
     guest_config_sock: str
@@ -343,23 +342,16 @@ class DockerVmPaths:
     launcher_snapshot: str
 
 
-@dataclass
-class DockerVmGuestShare:
-    """One supplemental host path shared into the guest."""
+@dataclass(frozen=True)
+class DockerVmGuestMount:
+    """One host path exposed through the composed filesystem."""
 
-    tag: str
     source_path: str
-    shared_dir: str
     guest_path: str
     readonly: bool
     kind: str
     source_class: str
     required: bool
-    basename: str
-    socket_path: str
-    pid_path: str
-    log_path: str
-    proc: subprocess.Popen | None = field(default=None, init=False)
 
 
 @dataclass
@@ -375,8 +367,7 @@ class DockerVmManager:
     extra_ro: list[str] = field(default_factory=list)
     extra_rw: list[str] = field(default_factory=list)
     gh_enabled: bool = False
-    composed_fs_enabled: bool = False
-    machine_type: str = DOCKER_VM_MACHINE_Q35
+    machine_type: str = DOCKER_VM_MACHINE_MICROVM
     paths: DockerVmPaths = field(init=False)
     manifest: dict | None = field(default=None, init=False)
     lock_fd: int | None = field(default=None, init=False)
@@ -384,12 +375,11 @@ class DockerVmManager:
     virtiofsd_proc: subprocess.Popen | None = field(default=None, init=False)
     qemu_proc: subprocess.Popen | None = field(default=None, init=False)
     proxy_proc: subprocess.Popen | None = field(default=None, init=False)
-    share_procs: list[subprocess.Popen] = field(default_factory=list, init=False)
     host_tools: dict[str, str] = field(default_factory=dict, init=False)
     network: DockerVmNetwork | None = field(default=None, init=False)
     host_docker_port: int | None = field(default=None, init=False)
     host_payload_port: int | None = field(default=None, init=False)
-    guest_shares: list["DockerVmGuestShare"] = field(default_factory=list, init=False)
+    guest_mounts: list[DockerVmGuestMount] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         root = os.path.join(self.sandbox, DOCKER_VM_DIRNAME)
@@ -403,7 +393,6 @@ class DockerVmManager:
             state=os.path.join(run, "state.json"),
             docker_sock=os.path.join(run, "docker.sock"),
             guest_config_dir=os.path.join(run, "guest-config"),
-            guest_share_manifest=os.path.join(run, "guest-config", "shares.txt"),
             composed_fs_manifest=os.path.join(run, "composed-fs-manifest.json"),
             composed_bind_manifest=os.path.join(
                 run, "guest-config", "composed-binds.json"),
@@ -464,12 +453,11 @@ class DockerVmManager:
                 self.host_tools[name] = resolved
             else:
                 missing.append(name)
-        if self.composed_fs_enabled:
-            composed = self.resolve_composed_fs_binary()
-            if composed:
-                self.host_tools["agentvm-composed-fs"] = composed
-            else:
-                missing.append("agentvm-composed-fs")
+        composed = self.resolve_composed_fs_binary()
+        if composed:
+            self.host_tools["agentvm-composed-fs"] = composed
+        else:
+            missing.append("agentvm-composed-fs")
         if missing:
             raise DockerVmError(
                 "Missing required Docker VM host tools: "
@@ -623,27 +611,6 @@ class DockerVmManager:
         with open(path, "w") as f:
             f.write(f"{pid}\n")
 
-    def start_virtiofsd(self) -> None:
-        log = self._open_log(self.paths.virtiofsd_log)
-        cmd = [
-            self.host_tools["virtiofsd"],
-            f"--socket-path={self.paths.virtiofs_sock}",
-            f"--shared-dir={self.project}",
-            "--sandbox=none",
-            "--inode-file-handles=never",
-            "--cache=never",
-            f"--thread-pool-size={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
-            "--log-level=debug",
-        ]
-        self.virtiofsd_proc = subprocess.Popen(
-            cmd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-        )
-        self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
-        self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
-
     def start_composed_fs(self) -> None:
         manifest = self.load_manifest()
         tag = manifest["vm"]["virtiofs_tag"]
@@ -686,8 +653,8 @@ class DockerVmManager:
         self._write_pid(self.paths.guest_config_pid, self.config_share_proc.pid)
         self.wait_for_path(self.paths.guest_config_sock, timeout=10.0)
 
-    def build_guest_shares(self) -> list[DockerVmGuestShare]:
-        shares: list[DockerVmGuestShare] = []
+    def build_guest_mounts(self) -> list[DockerVmGuestMount]:
+        mounts: list[DockerVmGuestMount] = []
         seen_guest_paths: set[str] = set()
 
         def add_share(source_path: str, guest_path: str, readonly: bool,
@@ -697,7 +664,7 @@ class DockerVmManager:
             if abs_guest in seen_guest_paths:
                 return
             if not os.path.exists(abs_source):
-                if required and self.composed_fs_enabled:
+                if required:
                     raise DockerVmError(
                         f"Required guest share source is missing: {source_path}"
                     )
@@ -707,22 +674,13 @@ class DockerVmManager:
                 )
                 return
             kind = "dir" if os.path.isdir(abs_source) else "file"
-            shared_dir = abs_source if kind == "dir" else os.path.dirname(abs_source)
-            basename = "" if kind == "dir" else os.path.basename(abs_source)
-            tag = f"share{len(shares)}"
-            shares.append(DockerVmGuestShare(
-                tag=tag,
+            mounts.append(DockerVmGuestMount(
                 source_path=abs_source,
-                shared_dir=shared_dir,
                 guest_path=abs_guest,
                 readonly=readonly,
                 kind=kind,
                 source_class=source_class,
                 required=required,
-                basename=basename,
-                socket_path=os.path.join(self.paths.run, f"{tag}.sock"),
-                pid_path=os.path.join(self.paths.run, f"{tag}.pid"),
-                log_path=os.path.join(self.paths.run, f"{tag}.log"),
             ))
             seen_guest_paths.add(abs_guest)
 
@@ -758,22 +716,10 @@ class DockerVmManager:
             add_share(path, os.path.abspath(path), readonly=False,
                       source_class="user-rw", required=True)
 
-        return shares
-
-    def write_guest_share_manifest(self) -> None:
-        with open(self.paths.guest_share_manifest, "w") as f:
-            for share in self.guest_shares:
-                f.write(
-                    "\t".join([
-                        share.tag,
-                        share.kind,
-                        share.guest_path,
-                        share.basename,
-                    ]) + "\n"
-                )
+        return mounts
 
     def build_composed_mounts(self) -> list[dict]:
-        self.guest_shares = self.build_guest_shares()
+        self.guest_mounts = self.build_guest_mounts()
         mounts: list[dict] = []
 
         def add_mount(mount_id: str, host_path: str, guest_path: str,
@@ -828,7 +774,7 @@ class DockerVmManager:
             source_class="workspace",
             required=True,
         )
-        for index, share in enumerate(self.guest_shares, start=2):
+        for index, share in enumerate(self.guest_mounts, start=2):
             add_mount(
                 f"m{index:04d}_{share.source_class.replace('-', '_')}",
                 share.source_path,
@@ -919,34 +865,6 @@ class DockerVmManager:
         with open(self.paths.composed_bind_manifest, "w") as f:
             json.dump(bind_manifest, f, indent=2, sort_keys=True)
             f.write("\n")
-
-    def start_guest_shares(self) -> None:
-        self.guest_shares = self.build_guest_shares()
-        self.write_guest_share_manifest()
-        for share in self.guest_shares:
-            log = self._open_log(share.log_path)
-            cmd = [
-                self.host_tools["virtiofsd"],
-                f"--socket-path={share.socket_path}",
-                f"--shared-dir={share.shared_dir}",
-                "--sandbox=none",
-                "--inode-file-handles=never",
-                "--cache=never",
-                f"--thread-pool-size={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
-                "--log-level=debug",
-            ]
-            if share.readonly:
-                cmd.append("--readonly")
-            proc = subprocess.Popen(
-                cmd,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                close_fds=True,
-            )
-            share.proc = proc
-            self.share_procs.append(proc)
-            self._write_pid(share.pid_path, share.proc.pid)
-            self.wait_for_path(share.socket_path, timeout=10.0)
 
     def _build_hostfwd_specs(self, guest_docker_port: int,
                              guest_payload_port: int) -> list[str]:
@@ -1104,18 +1022,6 @@ class DockerVmManager:
             f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
             f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
         ]
-        if not self.composed_fs_enabled:
-            for index, share in enumerate(self.guest_shares):
-                args += [
-                    "-chardev",
-                    f"socket,id=charshare{index},path={share.socket_path}",
-                    "-device",
-                    f"{fs_device},"
-                    f"chardev=charshare{index},"
-                    f"tag={share.tag},"
-                    f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
-                    f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
-                ]
         if self.machine_type == DOCKER_VM_MACHINE_MICROVM:
             args += [
                 "-netdev", ",".join(netdev_parts),
@@ -1148,7 +1054,6 @@ class DockerVmManager:
             self.virtiofsd_proc,
             self.qemu_proc,
             self.proxy_proc,
-            *self.share_procs,
         ]
         return sum(1 for proc in processes if proc is not None)
 
@@ -1168,8 +1073,6 @@ class DockerVmManager:
             ("qemu", self.qemu_proc, self.paths.qemu_log),
             ("docker-vm-proxy", self.proxy_proc, self.paths.proxy_log),
         ]
-        for share in self.guest_shares:
-            processes.append((share.tag, share.proc, share.log_path))
         for name, proc, log_path in processes:
             if proc is not None and proc.poll() is not None:
                 log_tail = read_tail(log_path)
@@ -1283,14 +1186,9 @@ class DockerVmManager:
         self.host_docker_port = self._allocate_host_docker_port()
         self.host_payload_port = self._allocate_host_payload_port()
         try:
-            if self.composed_fs_enabled:
-                self.write_composed_manifests()
-                self.start_composed_fs()
-                self.start_guest_config_share()
-            else:
-                self.start_virtiofsd()
-                self.start_guest_config_share()
-                self.start_guest_shares()
+            self.write_composed_manifests()
+            self.start_composed_fs()
+            self.start_guest_config_share()
             self.start_qemu()
             timings_ms["qemu_started"] = elapsed_ms()
             self.start_proxy()
@@ -1319,19 +1217,17 @@ class DockerVmManager:
                     self.build_qemu_command().count("-device")
                     + self.build_qemu_command().count("-nic")
                 ),
-                guest_shares=([
+                guest_mounts=([
                     {
-                        "tag": share.tag,
                         "source_path": share.source_path,
                         "guest_path": share.guest_path,
                         "readonly": share.readonly,
                         "kind": share.kind,
                         "source_class": share.source_class,
                     }
-                    for share in self.guest_shares
+                    for share in self.guest_mounts
                 ]),
-                composed_fs=("enabled" if self.composed_fs_enabled
-                             else "disabled"),
+                composed_fs="enabled",
             )
         except Exception:
             self.write_state("failed")
@@ -1358,7 +1254,6 @@ class DockerVmManager:
                 self.virtiofsd_proc,
                 self.config_share_proc,
                 self.proxy_proc,
-                *[share.proc for share in self.guest_shares],
             ):
                 if proc is not None and proc.poll() is None:
                     proc.terminate()
@@ -1369,7 +1264,6 @@ class DockerVmManager:
             self.virtiofsd_proc,
             self.config_share_proc,
             self.proxy_proc,
-            *[share.proc for share in self.guest_shares],
         ):
             if proc is None:
                 continue
@@ -1383,7 +1277,6 @@ class DockerVmManager:
             self.virtiofsd_proc,
             self.config_share_proc,
             self.proxy_proc,
-            *[share.proc for share in self.guest_shares],
         ):
             if proc is None:
                 continue
@@ -2248,19 +2141,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "into the sandbox",
     )
     parser.add_argument(
-        "--docker-composed-fs", action="store_true",
-        help="Use the composed virtio-fs backend for the Docker VM "
-             "(default when --docker is used; kept for compatibility)",
-    )
-    parser.add_argument(
-        "--docker-legacy-per-share-fs", action="store_true",
-        help="Use the old q35 per-share virtiofsd export path as a fallback "
-             "(requires --docker)",
-    )
-    parser.add_argument(
         "--docker-machine", choices=DOCKER_VM_MACHINE_CHOICES,
         help="QEMU machine type for the Docker VM "
-             "(default: microvm, or q35 with --docker-legacy-per-share-fs)",
+             "(default: microvm)",
     )
     parser.add_argument(
         "--docker-publish", action="append", default=[], metavar="HOST:GUEST",
@@ -2394,29 +2277,13 @@ def main() -> None:
                   "(run 'gh auth login' on the host)", file=sys.stderr)
 
     docker_vm: DockerVmManager | None = None
-    if args.docker_composed_fs and not args.docker:
-        die("--docker-composed-fs requires --docker")
-    if args.docker_legacy_per_share_fs and not args.docker:
-        die("--docker-legacy-per-share-fs requires --docker")
-    if args.docker_composed_fs and args.docker_legacy_per_share_fs:
-        die("--docker-composed-fs and --docker-legacy-per-share-fs conflict")
     if args.docker_machine is not None and not args.docker:
         die("--docker-machine requires --docker")
     if args.docker:
         if args.docker_publish and args.no_net:
             die("--docker-publish requires Docker VM networking; "
                 "do not combine it with --no-net")
-        docker_composed_fs = not args.docker_legacy_per_share_fs
-        if args.docker_machine is not None:
-            docker_machine = args.docker_machine
-        elif args.docker_legacy_per_share_fs:
-            docker_machine = DOCKER_VM_MACHINE_Q35
-        else:
-            docker_machine = DOCKER_VM_MACHINE_MICROVM
-        if (docker_machine == DOCKER_VM_MACHINE_MICROVM
-                and not docker_composed_fs):
-            die("--docker-machine microvm requires composed fs; remove "
-                "--docker-legacy-per-share-fs or choose --docker-machine q35")
+        docker_machine = args.docker_machine or DOCKER_VM_MACHINE_MICROVM
         published_ports = [
             DockerVmForward(*parse_forward_spec(spec))
             for spec in args.docker_publish
@@ -2431,7 +2298,6 @@ def main() -> None:
             extra_ro=args.ro,
             extra_rw=args.rw,
             gh_enabled=args.gh,
-            composed_fs_enabled=docker_composed_fs,
             machine_type=docker_machine,
         )
         try:
