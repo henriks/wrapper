@@ -1,7 +1,7 @@
 ---
 id: wra-oz9h
-status: open
-deps: [wra-0bcu, wra-d8nv, wra-udix]
+status: in_progress
+deps: [wra-0bcu, wra-udix]
 links: []
 created: 2026-05-11T20:43:59Z
 type: task
@@ -28,3 +28,11 @@ Validation results are documented in plan.md, an adjacent docker design note, or
 **2026-05-12T20:54:34Z**
 
 Dependency insight from wra-30di: q35 + composed fs validation should run the smoke commands from docker/filesystem-semantics-baseline.md, including shell/path basics, open-after-rename/unlink, readonly path write failure, git status/rev-parse/diff, package/tool state writes under HOME, Docker bind mount from PWD, Codex/Copilot state visibility, GitHub config readonly behavior when --gh is used, and xattr smoke where host supports xattrs.
+
+**2026-05-13T05:00:59Z**
+
+Dependency correction: wra-d8nv is superseded by wra-0bcu, which now owns both q35 host wiring and guest init bind-manifest consumption. Validation should depend on wra-0bcu as the single end-to-end composed q35 implementation, plus backend test coverage already closed in wra-udix.
+
+**2026-05-13T05:13:39Z**
+
+Started validation. Current environment is uid 1000, while docker/build-appliance.sh explicitly requires root and rebuilds docker/build plus docker/out. Because docker/guest-init.sh changed for composed mode, q35 composed-fs boot validation requires rebuilding docker/out/initrd.img first; existing docker/out artifacts still contain the old guest init. Preflight checks completed: sandbox-wrap help exposes --docker-composed-fs; python3 -m py_compile sandbox-wrap, sh -n docker/guest-init.sh, cargo build/test --manifest-path composed-fs/Cargo.toml --offline all pass; manifest-generation probe writes host and bind manifests. Full q35 boot validation is blocked until appliance rebuild can be run with root/network permissions.

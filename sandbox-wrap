@@ -5,6 +5,8 @@ Uses Bubblewrap (bwrap) to run agents in an isolated namespace with
 persistent, project-local state stored in .sandbox/.
 """
 
+from __future__ import annotations
+
 import argparse
 import fcntl
 import glob
@@ -97,6 +99,8 @@ DOCKER_VM_USERNET_HOST_IP = "10.0.2.2"
 DOCKER_VM_USERNET_GUEST_IP = "10.0.2.15"
 DOCKER_VM_USERNET_DNS_IP = "10.0.2.3"
 DOCKER_VM_CONFIG_SHARE_TAG = "agentvm-config"
+DOCKER_VM_COMPOSED_FS_TAG = "agentvm"
+DOCKER_VM_COMPOSED_FS_MOUNTPOINT = "/run/agentvm-host"
 
 HOST_TOOL_FALLBACKS = {
     "virtiofsd": [
@@ -121,6 +125,7 @@ HOST_TOOL_ENV_OVERRIDES = {
     "virtiofsd": "SANDBOX_WRAP_VIRTIOFSD_BIN",
     "qemu-system-x86_64": "SANDBOX_WRAP_QEMU_BIN",
     "mkfs.ext4": "SANDBOX_WRAP_MKFS_EXT4_BIN",
+    "agentvm-composed-fs": "SANDBOX_WRAP_COMPOSED_FS_BIN",
 }
 
 FRAME_HEADER = struct.Struct("!cI")
@@ -318,6 +323,8 @@ class DockerVmPaths:
     docker_sock: str
     guest_config_dir: str
     guest_share_manifest: str
+    composed_fs_manifest: str
+    composed_bind_manifest: str
     guest_config_sock: str
     guest_config_pid: str
     guest_config_log: str
@@ -343,6 +350,8 @@ class DockerVmGuestShare:
     guest_path: str
     readonly: bool
     kind: str
+    source_class: str
+    required: bool
     basename: str
     socket_path: str
     pid_path: str
@@ -363,6 +372,7 @@ class DockerVmManager:
     extra_ro: list[str] = field(default_factory=list)
     extra_rw: list[str] = field(default_factory=list)
     gh_enabled: bool = False
+    composed_fs_enabled: bool = False
     paths: DockerVmPaths = field(init=False)
     manifest: dict | None = field(default=None, init=False)
     lock_fd: int | None = field(default=None, init=False)
@@ -390,6 +400,9 @@ class DockerVmManager:
             docker_sock=os.path.join(run, "docker.sock"),
             guest_config_dir=os.path.join(run, "guest-config"),
             guest_share_manifest=os.path.join(run, "guest-config", "shares.txt"),
+            composed_fs_manifest=os.path.join(run, "composed-fs-manifest.json"),
+            composed_bind_manifest=os.path.join(
+                run, "guest-config", "composed-binds.json"),
             guest_config_sock=os.path.join(run, "guest-config.sock"),
             guest_config_pid=os.path.join(run, "guest-config.pid"),
             guest_config_log=os.path.join(run, "guest-config.log"),
@@ -447,6 +460,12 @@ class DockerVmManager:
                 self.host_tools[name] = resolved
             else:
                 missing.append(name)
+        if self.composed_fs_enabled:
+            composed = self.resolve_composed_fs_binary()
+            if composed:
+                self.host_tools["agentvm-composed-fs"] = composed
+            else:
+                missing.append("agentvm-composed-fs")
         if missing:
             raise DockerVmError(
                 "Missing required Docker VM host tools: "
@@ -458,6 +477,25 @@ class DockerVmManager:
             raise DockerVmError(
                 "/dev/kvm exists but is not readable/writable by the current "
                 "user")
+
+    def resolve_composed_fs_binary(self) -> str | None:
+        override = os.environ.get("SANDBOX_WRAP_COMPOSED_FS_BIN")
+        if override:
+            if os.path.isfile(override) and os.access(override, os.X_OK):
+                return override
+            raise DockerVmError(
+                "SANDBOX_WRAP_COMPOSED_FS_BIN is set to a non-executable "
+                f"path: {override}"
+            )
+        path = shutil.which("agentvm-composed-fs")
+        if path:
+            return path
+        candidate = os.path.join(
+            self.repo_root, "composed-fs", "target", "debug",
+            "agentvm-composed-fs")
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        return None
 
     def ensure_runtime_root(self) -> None:
         os.makedirs(self.paths.root, exist_ok=True)
@@ -602,6 +640,26 @@ class DockerVmManager:
         self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
         self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
 
+    def start_composed_fs(self) -> None:
+        manifest = self.load_manifest()
+        tag = manifest["vm"]["virtiofs_tag"]
+        log = self._open_log(self.paths.virtiofsd_log)
+        cmd = [
+            self.host_tools["agentvm-composed-fs"],
+            "--manifest", self.paths.composed_fs_manifest,
+            "--socket-path", self.paths.virtiofs_sock,
+            "--tag", tag,
+            "--thread-pool-size", str(DOCKER_VM_VIRTIOFS_NUM_QUEUES),
+        ]
+        self.virtiofsd_proc = subprocess.Popen(
+            cmd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+        self._write_pid(self.paths.virtiofsd_pid, self.virtiofsd_proc.pid)
+        self.wait_for_path(self.paths.virtiofs_sock, timeout=10.0)
+
     def start_guest_config_share(self) -> None:
         log = self._open_log(self.paths.guest_config_log)
         cmd = [
@@ -628,12 +686,17 @@ class DockerVmManager:
         shares: list[DockerVmGuestShare] = []
         seen_guest_paths: set[str] = set()
 
-        def add_share(source_path: str, guest_path: str, readonly: bool) -> None:
+        def add_share(source_path: str, guest_path: str, readonly: bool,
+                      source_class: str, required: bool = False) -> None:
             abs_source = os.path.abspath(source_path)
             abs_guest = os.path.abspath(guest_path)
             if abs_guest in seen_guest_paths:
                 return
             if not os.path.exists(abs_source):
+                if required and self.composed_fs_enabled:
+                    raise DockerVmError(
+                        f"Required guest share source is missing: {source_path}"
+                    )
                 print(
                     f"warning: skipping missing guest share source: {source_path}",
                     file=sys.stderr,
@@ -650,6 +713,8 @@ class DockerVmManager:
                 guest_path=abs_guest,
                 readonly=readonly,
                 kind=kind,
+                source_class=source_class,
+                required=required,
                 basename=basename,
                 socket_path=os.path.join(self.paths.run, f"{tag}.sock"),
                 pid_path=os.path.join(self.paths.run, f"{tag}.pid"),
@@ -663,11 +728,14 @@ class DockerVmManager:
         for rel_dir in TOOLS[self.tool].get("host_home_mounts", []):
             host_dir = os.path.join(host_home, rel_dir)
             guest_dir = os.path.join(guest_home, rel_dir)
-            add_share(host_dir, guest_dir, readonly=False)
+            add_share(host_dir, guest_dir, readonly=False,
+                      source_class="tool-state")
 
         docker_config = os.path.join(host_home, ".docker")
         if os.path.isdir(docker_config):
-            add_share(docker_config, os.path.join(guest_home, ".docker"), readonly=False)
+            add_share(
+                docker_config, os.path.join(guest_home, ".docker"),
+                readonly=False, source_class="tool-state")
 
         if self.gh_enabled:
             gh_config = os.path.join(host_home, ".config", "gh")
@@ -676,12 +744,15 @@ class DockerVmManager:
                     gh_config,
                     os.path.join(guest_home, ".config", "gh"),
                     readonly=True,
+                    source_class="auth-config",
                 )
 
         for path in self.extra_ro:
-            add_share(path, os.path.abspath(path), readonly=True)
+            add_share(path, os.path.abspath(path), readonly=True,
+                      source_class="user-ro", required=True)
         for path in self.extra_rw:
-            add_share(path, os.path.abspath(path), readonly=False)
+            add_share(path, os.path.abspath(path), readonly=False,
+                      source_class="user-rw", required=True)
 
         return shares
 
@@ -696,6 +767,154 @@ class DockerVmManager:
                         share.basename,
                     ]) + "\n"
                 )
+
+    def build_composed_mounts(self) -> list[dict]:
+        self.guest_shares = self.build_guest_shares()
+        mounts: list[dict] = []
+
+        def add_mount(mount_id: str, host_path: str, guest_path: str,
+                      readonly: bool, source_class: str,
+                      required: bool, bind: bool = True) -> None:
+            abs_host = os.path.abspath(host_path)
+            abs_guest = os.path.abspath(guest_path)
+            if not os.path.exists(abs_host):
+                if required:
+                    raise DockerVmError(
+                        f"Required composed filesystem source is missing: {host_path}"
+                    )
+                return
+            kind = "dir" if os.path.isdir(abs_host) else "file"
+            if readonly:
+                if not os.access(abs_host, os.R_OK):
+                    raise DockerVmError(
+                        f"Readonly composed filesystem source is not readable: {abs_host}"
+                    )
+            elif not is_rw_accessible(abs_host):
+                if required:
+                    raise DockerVmError(
+                        "Writable composed filesystem source is not "
+                        f"read/write accessible: {abs_host}"
+                    )
+                print(
+                    "warning: skipping inaccessible optional composed "
+                    f"filesystem source: {abs_host}",
+                    file=sys.stderr,
+                )
+                return
+            mounts.append({
+                "id": mount_id,
+                "guest_path": abs_guest,
+                "host_path": abs_host,
+                "kind": kind,
+                "access": "ro" if readonly else "rw",
+                "source_class": source_class,
+                "required": required,
+                "bind": bind,
+                "metadata": {
+                    "uid_gid": "host",
+                    "permissions": "host",
+                },
+            })
+
+        add_mount(
+            "m0001_workspace",
+            self.project,
+            self.project,
+            readonly=False,
+            source_class="workspace",
+            required=True,
+        )
+        for index, share in enumerate(self.guest_shares, start=2):
+            add_mount(
+                f"m{index:04d}_{share.source_class.replace('-', '_')}",
+                share.source_path,
+                share.guest_path,
+                readonly=share.readonly,
+                source_class=share.source_class,
+                required=share.required,
+            )
+
+        self.validate_composed_mounts(mounts)
+        return mounts
+
+    def validate_composed_mounts(self, mounts: list[dict]) -> None:
+        protected = self.composed_protected_guest_paths()
+        seen: dict[str, dict] = {}
+        for mount in mounts:
+            guest_path = mount["guest_path"]
+            if guest_path in protected:
+                raise DockerVmError(
+                    f"Composed filesystem mount targets protected path: {guest_path}"
+                )
+            existing = seen.get(guest_path)
+            if existing is not None:
+                raise DockerVmError(
+                    "Duplicate composed filesystem guest path: "
+                    f"{guest_path} ({existing['host_path']} and {mount['host_path']})"
+                )
+            seen[guest_path] = mount
+        paths = sorted(seen)
+        for path in paths:
+            for other in paths:
+                if path == other:
+                    continue
+                if other.startswith(path.rstrip("/") + "/"):
+                    ancestor = seen[path]
+                    if ancestor["kind"] == "file":
+                        raise DockerVmError(
+                            "Composed filesystem file mount has descendant: "
+                            f"{path} -> {other}"
+                        )
+
+    def composed_protected_guest_paths(self) -> list[str]:
+        return [
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/tmp",
+            "/var/lib/docker",
+            "/var/run/docker.sock",
+            "/var/run",
+        ]
+
+    def write_composed_manifests(self) -> None:
+        mounts = self.build_composed_mounts()
+        host_manifest = {
+            "schema_version": 1,
+            "export_tag": self.load_manifest()["vm"]["virtiofs_tag"],
+            "created_by": "sandbox-wrap",
+            "mounts": mounts,
+            "synthetic": {
+                "uid": 0,
+                "gid": 0,
+                "dir_mode": "0555",
+            },
+            "protected_guest_paths": self.composed_protected_guest_paths(),
+        }
+        bind_manifest = {
+            "schema_version": 1,
+            "composed_mountpoint": DOCKER_VM_COMPOSED_FS_MOUNTPOINT,
+            "entries": [
+                {
+                    "mount_id": mount["id"],
+                    "kind": mount["kind"],
+                    "source": DOCKER_VM_COMPOSED_FS_MOUNTPOINT
+                    + mount["guest_path"],
+                    "target": mount["guest_path"],
+                    "required": mount["required"],
+                    "create_parent": True,
+                }
+                for mount in mounts
+                if mount["bind"]
+            ],
+        }
+        with open(self.paths.composed_fs_manifest, "w") as f:
+            json.dump(host_manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
+        with open(self.paths.composed_bind_manifest, "w") as f:
+            json.dump(bind_manifest, f, indent=2, sort_keys=True)
+            f.write("\n")
 
     def start_guest_shares(self) -> None:
         self.guest_shares = self.build_guest_shares()
@@ -865,17 +1084,18 @@ class DockerVmManager:
             f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
             f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
         ]
-        for index, share in enumerate(self.guest_shares):
-            args += [
-                "-chardev",
-                f"socket,id=charshare{index},path={share.socket_path}",
-                "-device",
-                "vhost-user-fs-pci,"
-                f"chardev=charshare{index},"
-                f"tag={share.tag},"
-                f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
-                f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
-            ]
+        if not self.composed_fs_enabled:
+            for index, share in enumerate(self.guest_shares):
+                args += [
+                    "-chardev",
+                    f"socket,id=charshare{index},path={share.socket_path}",
+                    "-device",
+                    "vhost-user-fs-pci,"
+                    f"chardev=charshare{index},"
+                    f"tag={share.tag},"
+                    f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
+                    f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
+                ]
         args += ["-nic", ",".join(nic_parts)]
         return args
 
@@ -1014,9 +1234,14 @@ class DockerVmManager:
         self.host_docker_port = self._allocate_host_docker_port()
         self.host_payload_port = self._allocate_host_payload_port()
         try:
-            self.start_virtiofsd()
-            self.start_guest_config_share()
-            self.start_guest_shares()
+            if self.composed_fs_enabled:
+                self.write_composed_manifests()
+                self.start_composed_fs()
+                self.start_guest_config_share()
+            else:
+                self.start_virtiofsd()
+                self.start_guest_config_share()
+                self.start_guest_shares()
             self.start_qemu()
             self.start_proxy()
             self.wait_for_docker_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
@@ -1042,9 +1267,12 @@ class DockerVmManager:
                         "guest_path": share.guest_path,
                         "readonly": share.readonly,
                         "kind": share.kind,
+                        "source_class": share.source_class,
                     }
                     for share in self.guest_shares
                 ]),
+                composed_fs=("enabled" if self.composed_fs_enabled
+                             else "disabled"),
             )
         except Exception:
             self.write_state("failed")
@@ -1961,6 +2189,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
              "into the sandbox",
     )
     parser.add_argument(
+        "--docker-composed-fs", action="store_true",
+        help="Use the experimental composed virtio-fs backend for the Docker "
+             "VM (requires --docker; old per-share virtiofsd remains default)",
+    )
+    parser.add_argument(
         "--docker-publish", action="append", default=[], metavar="HOST:GUEST",
         help="Expose guest TCP port GUEST on host localhost:HOST "
              "(repeatable, Docker VM only)",
@@ -2092,6 +2325,8 @@ def main() -> None:
                   "(run 'gh auth login' on the host)", file=sys.stderr)
 
     docker_vm: DockerVmManager | None = None
+    if args.docker_composed_fs and not args.docker:
+        die("--docker-composed-fs requires --docker")
     if args.docker:
         if args.docker_publish and args.no_net:
             die("--docker-publish requires Docker VM networking; "
@@ -2110,6 +2345,7 @@ def main() -> None:
             extra_ro=args.ro,
             extra_rw=args.rw,
             gh_enabled=args.gh,
+            composed_fs_enabled=args.docker_composed_fs,
         )
         try:
             docker_vm.start()

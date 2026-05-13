@@ -401,16 +401,17 @@ Implementation order:
 3. Complete and document the filesystem semantics spike.
 4. Define the manifest schema, overlap rules, and bind manifest format.
 5. Implement the composed filesystem namespace and safe traversal core.
-6. Implement the composed backend behind a feature flag on the current `q35`
-   path.
-7. Add backend correctness and adversarial security tests.
-8. Switch guest init to mount the composed export and bind selected paths.
-9. Validate Docker, payload control, auth/state sharing, and real tool smoke
+6. Add backend correctness and adversarial security tests.
+7. Implement q35 composed-fs as one gated end-to-end path: generate both
+   manifests, start the composed backend, attach it to q35, and update guest
+   init to mount the composed export and bind selected paths.
+   Current implementation notes are in `docker/composed-fs-q35.md`.
+8. Validate Docker, payload control, auth/state sharing, and real tool smoke
    commands on `q35 + composed fs`.
-10. Add a `microvm` QEMU command branch using the documented spike result.
-11. Validate `microvm + composed fs`.
-12. Measure startup and readiness times against the current implementation.
-13. Make the composed backend and `microvm` path default only after acceptance
+9. Add a `microvm` QEMU command branch using the documented spike result.
+10. Validate `microvm + composed fs`.
+11. Measure startup and readiness times against the current implementation.
+12. Make the composed backend and `microvm` path default only after acceptance
     criteria are met.
 13. Remove the old per-share export path after a fallback window.
 

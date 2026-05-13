@@ -77,6 +77,88 @@ mount_extra_share() {
   mount --bind "${temp_mount}/${basename_part}" "${target}"
 }
 
+bind_composed_entry() {
+  kind="$1"
+  source="$2"
+  target="$3"
+  required="$4"
+  create_parent="$5"
+
+  case "${source}:${target}" in
+    /*:/*) ;;
+    *)
+      log "warning: ignoring invalid composed bind ${source} -> ${target}"
+      [ "${required}" = "true" ] && return 1
+      return 0
+      ;;
+  esac
+
+  if [ "${create_parent}" = "true" ]; then
+    mkdir -p "$(dirname "${target}")"
+  fi
+
+  if [ "${kind}" = "dir" ]; then
+    mkdir -p "${target}"
+  elif [ "${kind}" = "file" ]; then
+    if [ -d "${target}" ]; then
+      log "warning: composed file bind target is a directory: ${target}"
+      [ "${required}" = "true" ] && return 1
+      return 0
+    fi
+    [ -e "${target}" ] || : > "${target}"
+  else
+    log "warning: unknown composed bind kind ${kind} for ${target}"
+    [ "${required}" = "true" ] && return 1
+    return 0
+  fi
+
+  if mount --bind "${source}" "${target}"; then
+    return 0
+  fi
+
+  log "warning: failed composed bind ${source} -> ${target}"
+  [ "${required}" = "true" ] && return 1
+  return 0
+}
+
+mount_composed_export() {
+  manifest="/run/agentvm-config/composed-binds.json"
+  mountpoint=$(python3 - "${manifest}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+print(manifest.get("composed_mountpoint", "/run/agentvm-host"))
+PY
+)
+  mkdir -p "${mountpoint}"
+  mount -t virtiofs "${VIRTIOFS_TAG}" "${mountpoint}"
+
+  python3 - "${manifest}" <<'PY' | while IFS="$(printf '\t')" read -r kind source target required create_parent; do
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    manifest = json.load(f)
+
+for entry in manifest.get("entries", []):
+    print(
+        "\t".join([
+            entry.get("kind", ""),
+            entry.get("source", ""),
+            entry.get("target", ""),
+            "true" if entry.get("required", False) else "false",
+            "true" if entry.get("create_parent", False) else "false",
+        ])
+    )
+PY
+    [ -n "${source}" ] || continue
+    bind_composed_entry "${kind}" "${source}" "${target}" \
+      "${required}" "${create_parent}"
+  done
+}
+
 mirror_log_to_workspace() {
   src="$1"
   dst="$2"
@@ -178,12 +260,16 @@ readonly \
   HOST_SOCKET_BRIDGE_LOG \
   HOST_PAYLOAD_SERVER_LOG
 
-mkdir -p "${PROJECT_PATH}"
-mount -t virtiofs "${VIRTIOFS_TAG}" "${PROJECT_PATH}"
+if [ -f /run/agentvm-config/composed-binds.json ]; then
+  mount_composed_export
+else
+  mkdir -p "${PROJECT_PATH}"
+  mount -t virtiofs "${VIRTIOFS_TAG}" "${PROJECT_PATH}"
+fi
 if [ "${PROJECT_PATH}" != "/workspace" ]; then
   mount --bind "${PROJECT_PATH}" /workspace
 fi
-if [ -f /run/agentvm-config/shares.txt ]; then
+if [ ! -f /run/agentvm-config/composed-binds.json ] && [ -f /run/agentvm-config/shares.txt ]; then
   while IFS="$(printf '\t')" read -r tag kind target basename_part; do
     [ -n "${tag}" ] || continue
     mount_extra_share "${tag}" "${kind}" "${target}" "${basename_part}"
