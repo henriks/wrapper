@@ -14,8 +14,9 @@ use serde::Deserialize;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{
-    Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, FsOptions, OpenOptions,
-    SerializableFileSystem, SetattrValid, ZeroCopyReader, ZeroCopyWriter, ROOT_ID,
+    Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, FsOptions, GetxattrReply,
+    ListxattrReply, OpenOptions, SerializableFileSystem, SetattrValid, SetxattrFlags,
+    ZeroCopyReader, ZeroCopyWriter, ROOT_ID,
 };
 use virtiofsd::fuse;
 use virtiofsd::soft_idmap::{GuestGid, GuestUid, Id};
@@ -168,6 +169,7 @@ struct Node {
     uid: u32,
     gid: u32,
     lookup_count: u64,
+    cached_attr: Option<fuse::Attr>,
 }
 
 #[derive(Debug)]
@@ -299,6 +301,7 @@ impl Namespace {
                 uid: synthetic_uid,
                 gid: synthetic_gid,
                 lookup_count: 0,
+                cached_attr: None,
             });
             ns.link_child(parent, leaf, inode)?;
             ns.path_to_inode.insert(guest_path, inode);
@@ -317,6 +320,7 @@ impl Namespace {
                 uid: self.synthetic_uid,
                 gid: self.synthetic_gid,
                 lookup_count: 1,
+                cached_attr: None,
             },
         );
         self.children.entry(ROOT_ID).or_default();
@@ -373,6 +377,7 @@ impl Namespace {
             uid: self.synthetic_uid,
             gid: self.synthetic_gid,
             lookup_count: 0,
+            cached_attr: None,
         });
         self.link_child(parent, name, inode)?;
         self.path_to_inode.insert(guest_path.to_string(), inode);
@@ -409,8 +414,16 @@ impl Namespace {
     }
 
     fn attr_for(&self, node: &Node) -> io::Result<fuse::Attr> {
-        if let Some(metadata) = self.host_metadata_for(node)? {
-            return Ok(attr_from_metadata(node.inode, &metadata));
+        match self.host_metadata_for(node) {
+            Ok(Some(metadata)) => return Ok(attr_from_metadata(node.inode, &metadata)),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                if let Some(attr) = node.cached_attr {
+                    return Ok(attr);
+                }
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+            Ok(None) => {}
         }
 
         let now = now_secs();
@@ -535,6 +548,16 @@ impl Namespace {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
     }
 
+    fn xattr_location(&self, inode: u64) -> io::Result<(usize, PathBuf)> {
+        let node = self
+            .nodes
+            .get(&inode)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        self.host_file_location(node)
+            .or_else(|| self.host_location(node))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
     fn ensure_mount_writable(&self, mount: usize) -> io::Result<()> {
         match self.host_mount(mount)?.access {
             AccessMode::Rw => Ok(()),
@@ -587,6 +610,9 @@ impl Namespace {
             ino: metadata.ino(),
         };
         if let Some(inode) = self.host_inodes.get(&key).copied() {
+            if let Some(node) = self.nodes.get_mut(&inode) {
+                node.cached_attr = Some(attr_from_metadata(inode, metadata));
+            }
             return inode;
         }
 
@@ -601,6 +627,7 @@ impl Namespace {
             uid: metadata.uid(),
             gid: metadata.gid(),
             lookup_count: 0,
+            cached_attr: Some(attr_from_metadata(inode, metadata)),
         });
         self.host_inodes.insert(key, inode);
         inode
@@ -618,6 +645,7 @@ impl Namespace {
             .get_mut(&inode)
             .expect("host node must exist after insertion");
         node.lookup_count = node.lookup_count.saturating_add(1);
+        node.cached_attr = Some(attr_from_metadata(inode, metadata));
         Entry {
             inode,
             generation: 0,
@@ -731,6 +759,7 @@ impl FileSystem for ComposedFs {
             uid: 0,
             gid: 0,
             lookup_count: 0,
+            cached_attr: None,
         };
         if let Some(inode) = namespace
             .children
@@ -820,7 +849,7 @@ impl FileSystem for ComposedFs {
         } else {
             libc::O_RDONLY
         };
-        let file = open_beneath_for_io(mount.root.as_raw_fd(), &relative_path, open_flags, 0)?;
+        let file = open_host_file_for_io(mount, &relative_path, open_flags, 0)?;
         apply_setattr(&file, attr, valid)?;
         let metadata = fstat_file(&file)?;
         Ok((attr_from_metadata(inode, &metadata), ATTR_TTL))
@@ -928,7 +957,7 @@ impl FileSystem for ComposedFs {
             namespace.ensure_mount_writable(mount_index)?;
         }
         let mount = namespace.host_mount(mount_index)?;
-        let file = open_beneath_for_io(mount.root.as_raw_fd(), &relative_path, flags as i32, 0)?;
+        let file = open_host_file_for_io(mount, &relative_path, flags as i32, 0)?;
         drop(namespace);
 
         let handle = self.insert_file_handle(inode, file, open_flags_want_write(flags));
@@ -1231,7 +1260,7 @@ impl FileSystem for ComposedFs {
             return Ok(());
         };
         let mount = namespace.host_mount(mount_index)?;
-        access_beneath(mount.root.as_raw_fd(), &relative_path, mask as i32)
+        access_host_path(mount, &relative_path, mask as i32)
     }
 
     fn lseek(
@@ -1250,6 +1279,69 @@ impl FileSystem for ComposedFs {
             }
             Ok(result as u64)
         })
+    }
+
+    fn setxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        name: &CStr,
+        value: &[u8],
+        flags: u32,
+        _extra_flags: SetxattrFlags,
+    ) -> io::Result<()> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.xattr_location(inode)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
+        setxattr_file(&file, name, value, flags)
+    }
+
+    fn getxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        name: &CStr,
+        size: u32,
+    ) -> io::Result<GetxattrReply> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.xattr_location(inode)?;
+        let mount = namespace.host_mount(mount_index)?;
+        let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
+        getxattr_file(&file, name, size)
+    }
+
+    fn listxattr(
+        &self,
+        _ctx: Context,
+        inode: Self::Inode,
+        size: u32,
+    ) -> io::Result<ListxattrReply> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.xattr_location(inode)?;
+        let mount = namespace.host_mount(mount_index)?;
+        let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
+        listxattr_file(&file, size)
+    }
+
+    fn removexattr(&self, _ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
+        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let (mount_index, relative_path) = namespace.xattr_location(inode)?;
+        namespace.ensure_mount_writable(mount_index)?;
+        let mount = namespace.host_mount(mount_index)?;
+        let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
+        removexattr_file(&file, name)
+    }
+
+    fn fsyncdir(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _datasync: bool,
+        _handle: Self::Handle,
+    ) -> io::Result<()> {
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1522,6 +1614,37 @@ fn open_beneath_for_io(
     open_beneath_with_mode(root_fd, relative_path, flags, mode)
 }
 
+fn open_host_file_for_io(
+    mount: &MountRuntime,
+    relative_path: &Path,
+    flags: i32,
+    mode: u32,
+) -> io::Result<File> {
+    if relative_path.as_os_str().is_empty() && matches!(mount.kind, MountKind::File) {
+        return open_absolute_nofollow(&mount.root_path, flags, mode);
+    }
+    open_beneath_for_io(mount.root.as_raw_fd(), relative_path, flags, mode)
+}
+
+fn open_absolute_nofollow(path: &Path, flags: i32, mode: u32) -> io::Result<File> {
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(io::Error::from_raw_os_error(libc::ENOENT));
+    }
+    let path = CString::new(bytes)?;
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            mode,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
 fn open_beneath_with_mode(
     root_fd: RawFd,
     relative_path: &Path,
@@ -1734,6 +1857,23 @@ fn access_beneath(root_fd: RawFd, path: &Path, mask: i32) -> io::Result<()> {
     Ok(())
 }
 
+fn access_host_path(mount: &MountRuntime, path: &Path, mask: i32) -> io::Result<()> {
+    if path.as_os_str().is_empty() && matches!(mount.kind, MountKind::File) {
+        let bytes = mount.root_path.as_os_str().as_bytes();
+        if bytes.contains(&0) {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        let c_path = CString::new(bytes)?;
+        let result =
+            unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), mask, libc::AT_EACCESS) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    access_beneath(mount.root.as_raw_fd(), path, mask)
+}
+
 fn fstatvfs_file(file: &File) -> io::Result<libc::statvfs64> {
     let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
     let result = unsafe { libc::fstatvfs64(file.as_raw_fd(), &mut st) };
@@ -1741,6 +1881,163 @@ fn fstatvfs_file(file: &File) -> io::Result<libc::statvfs64> {
         return Err(io::Error::last_os_error());
     }
     Ok(st)
+}
+
+fn setattr_wants_mutation(valid: SetattrValid) -> bool {
+    valid.intersects(
+        SetattrValid::MODE
+            | SetattrValid::UID
+            | SetattrValid::GID
+            | SetattrValid::SIZE
+            | SetattrValid::ATIME
+            | SetattrValid::MTIME
+            | SetattrValid::ATIME_NOW
+            | SetattrValid::MTIME_NOW,
+    )
+}
+
+fn apply_setattr(file: &File, attr: fuse::SetattrIn, valid: SetattrValid) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+    if valid.contains(SetattrValid::MODE) {
+        let result = unsafe { libc::fchmod(fd, attr.mode & 0o7777) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if valid.intersects(SetattrValid::UID | SetattrValid::GID) {
+        let uid = if valid.contains(SetattrValid::UID) {
+            attr.uid.into_inner()
+        } else {
+            u32::MAX
+        };
+        let gid = if valid.contains(SetattrValid::GID) {
+            attr.gid.into_inner()
+        } else {
+            u32::MAX
+        };
+        let result = unsafe { libc::fchown(fd, uid, gid) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if valid.contains(SetattrValid::SIZE) {
+        let result = unsafe { libc::ftruncate64(fd, attr.size as i64) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if valid.intersects(
+        SetattrValid::ATIME
+            | SetattrValid::MTIME
+            | SetattrValid::ATIME_NOW
+            | SetattrValid::MTIME_NOW,
+    ) {
+        let times = [
+            setattr_time(
+                valid.contains(SetattrValid::ATIME),
+                valid.contains(SetattrValid::ATIME_NOW),
+                attr.atime,
+                attr.atimensec,
+            ),
+            setattr_time(
+                valid.contains(SetattrValid::MTIME),
+                valid.contains(SetattrValid::MTIME_NOW),
+                attr.mtime,
+                attr.mtimensec,
+            ),
+        ];
+        let result = unsafe { libc::futimens(fd, times.as_ptr()) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn setxattr_file(file: &File, name: &CStr, value: &[u8], flags: u32) -> io::Result<()> {
+    let result = unsafe {
+        libc::fsetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            flags as i32,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn getxattr_file(file: &File, name: &CStr, size: u32) -> io::Result<GetxattrReply> {
+    let needed =
+        unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(GetxattrReply::Count(needed as u32));
+    }
+    let mut value = vec![0; size as usize];
+    let actual = unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    value.truncate(actual as usize);
+    Ok(GetxattrReply::Value(value))
+}
+
+fn listxattr_file(file: &File, size: u32) -> io::Result<ListxattrReply> {
+    let needed = unsafe { libc::flistxattr(file.as_raw_fd(), std::ptr::null_mut(), 0) };
+    if needed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size == 0 {
+        return Ok(ListxattrReply::Count(needed as u32));
+    }
+    let mut names = vec![0; size as usize];
+    let actual =
+        unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len()) };
+    if actual < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    names.truncate(actual as usize);
+    Ok(ListxattrReply::Names(names))
+}
+
+fn removexattr_file(file: &File, name: &CStr) -> io::Result<()> {
+    let result = unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn setattr_time(set_explicit: bool, set_now: bool, sec: u64, nsec: u32) -> libc::timespec {
+    if set_now {
+        return libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_NOW,
+        };
+    }
+    if set_explicit {
+        return libc::timespec {
+            tv_sec: sec as libc::time_t,
+            tv_nsec: nsec as libc::c_long,
+        };
+    }
+    libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_OMIT,
+    }
 }
 
 struct HostDirEntry {
@@ -1886,9 +2183,33 @@ mod tests {
         }
     }
 
+    fn file_mount(id: &str, guest_path: &str, host_path: &Path, access: AccessMode) -> MountSpec {
+        MountSpec {
+            id: id.to_string(),
+            guest_path: guest_path.to_string(),
+            host_path: host_path.display().to_string(),
+            kind: MountKind::File,
+            access,
+            source_class: SourceClass::SystemRo,
+            required: true,
+            bind: true,
+            metadata: MetadataSpec {
+                uid_gid: MetadataPolicy::Host,
+                permissions: MetadataPolicy::Host,
+            },
+        }
+    }
+
     fn lookup(fs: &ComposedFs, parent: u64, name: &str) -> io::Result<Entry> {
         let name = CString::new(name).expect("test name");
         fs.lookup(ctx(), parent, name.as_c_str())
+    }
+
+    fn raw_error<T>(result: io::Result<T>, label: &str) -> Option<i32> {
+        match result {
+            Ok(_) => panic!("{label} succeeded unexpectedly"),
+            Err(error) => error.raw_os_error(),
+        }
     }
 
     struct VecReader {
@@ -2246,5 +2567,394 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
+
+    #[test]
+    fn setattr_truncates_and_changes_mode_on_writable_mount() {
+        let test_dir = TestDir::new("setattr");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"abcdef").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+
+        let mut attr = fuse::SetattrIn::default();
+        attr.size = 3;
+        attr.mode = 0o600;
+        fs.setattr(
+            ctx(),
+            file.inode,
+            attr,
+            None,
+            SetattrValid::SIZE | SetattrValid::MODE,
+        )
+        .expect("setattr");
+
+        assert_eq!(
+            fs::read_to_string(root.join("file")).expect("read file"),
+            "abc"
+        );
+        assert_eq!(
+            fs::metadata(root.join("file")).expect("metadata").mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn readonly_mount_rejects_mutating_setattr() {
+        let test_dir = TestDir::new("readonly-setattr");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"abcdef").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "readonly",
+            "/readonly",
+            &root,
+            AccessMode::Ro,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let readonly = lookup(&fs, ROOT_ID, "readonly").expect("lookup readonly");
+        let file = lookup(&fs, readonly.inode, "file").expect("lookup file");
+
+        let mut attr = fuse::SetattrIn::default();
+        attr.size = 3;
+        let error = match fs.setattr(ctx(), file.inode, attr, None, SetattrValid::SIZE) {
+            Ok(_) => panic!("readonly setattr succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EROFS));
+        assert_eq!(
+            fs::read_to_string(root.join("file")).expect("read file"),
+            "abcdef"
+        );
+    }
+
+    #[test]
+    fn xattrs_delegate_to_host_when_supported() {
+        let test_dir = TestDir::new("xattr");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let name = CString::new("user.agentvm_test").expect("xattr name");
+
+        if let Err(error) = fs.setxattr(
+            ctx(),
+            file.inode,
+            name.as_c_str(),
+            b"value",
+            0,
+            SetxattrFlags::empty(),
+        ) {
+            if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                return;
+            }
+            panic!("setxattr failed unexpectedly: {error}");
+        }
+
+        match fs
+            .getxattr(ctx(), file.inode, name.as_c_str(), 0)
+            .expect("getxattr count")
+        {
+            GetxattrReply::Count(count) => assert_eq!(count, 5),
+            GetxattrReply::Value(_) => panic!("expected count"),
+        }
+        match fs
+            .getxattr(ctx(), file.inode, name.as_c_str(), 64)
+            .expect("getxattr value")
+        {
+            GetxattrReply::Value(value) => assert_eq!(value, b"value"),
+            GetxattrReply::Count(_) => panic!("expected value"),
+        }
+        match fs.listxattr(ctx(), file.inode, 4096).expect("listxattr") {
+            ListxattrReply::Names(names) => {
+                assert!(names
+                    .split(|byte| *byte == 0)
+                    .any(|entry| entry == b"user.agentvm_test"));
+            }
+            ListxattrReply::Count(_) => panic!("expected names"),
+        }
+        fs.removexattr(ctx(), file.inode, name.as_c_str())
+            .expect("removexattr");
+    }
+
+    #[test]
+    fn getattr_uses_cached_metadata_after_unlink() {
+        let test_dir = TestDir::new("stale");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let name = CString::new("file").expect("name");
+
+        fs.unlink(ctx(), workspace.inode, name.as_c_str())
+            .expect("unlink");
+        assert!(!root.join("file").exists());
+        let (attr, _ttl) = fs
+            .getattr(ctx(), file.inode, None)
+            .expect("cached getattr after unlink");
+        assert_eq!(attr.ino, file.inode);
+        assert_eq!(attr.size, 4);
+    }
+
+    #[test]
+    fn file_mount_opens_as_regular_file() {
+        let test_dir = TestDir::new("file-mount");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let mounted_file = root.join("hosts");
+        fs::write(&mounted_file, b"127.0.0.1 localhost\n").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![file_mount(
+            "hosts",
+            "/etc/hosts",
+            &mounted_file,
+            AccessMode::Ro,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let etc = lookup(&fs, ROOT_ID, "etc").expect("lookup etc");
+        let hosts = lookup(&fs, etc.inode, "hosts").expect("lookup hosts");
+        let (handle, _options) = fs
+            .open(ctx(), hosts.inode, false, libc::O_RDONLY as u32)
+            .expect("open file mount");
+        let handle = handle.expect("handle");
+        let mut reader = VecWriter::default();
+        fs.read(ctx(), hosts.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("read file mount");
+        assert_eq!(reader.data, b"127.0.0.1 localhost\n");
+    }
+
+    #[test]
+    fn symlink_escape_does_not_open_outside_mount_root() {
+        let test_dir = TestDir::new("symlink-escape");
+        let root = test_dir.path.join("root");
+        let outside = test_dir.path.join("outside");
+        fs::create_dir(&root).expect("create root");
+        fs::create_dir(&outside).expect("create outside");
+        fs::write(outside.join("secret"), b"secret").expect("write secret");
+        std::os::unix::fs::symlink(outside.join("secret"), root.join("escape"))
+            .expect("create symlink");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let escape = lookup(&fs, workspace.inode, "escape").expect("lookup symlink");
+
+        let error = match fs.open(ctx(), escape.inode, false, libc::O_RDONLY as u32) {
+            Ok(_) => panic!("opened symlink escape"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ENOENT) | Some(libc::EXDEV) | Some(libc::ELOOP)
+        ));
+    }
+
+    #[test]
+    fn cross_mount_rename_and_link_return_exdev() {
+        let test_dir = TestDir::new("cross-mount");
+        let left = test_dir.path.join("left");
+        let right = test_dir.path.join("right");
+        fs::create_dir(&left).expect("create left");
+        fs::create_dir(&right).expect("create right");
+        fs::write(left.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![
+            dir_mount("left", "/left", &left, AccessMode::Rw),
+            dir_mount("right", "/right", &right, AccessMode::Rw),
+        ]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let left_node = lookup(&fs, ROOT_ID, "left").expect("lookup left");
+        let right_node = lookup(&fs, ROOT_ID, "right").expect("lookup right");
+        let file = lookup(&fs, left_node.inode, "file").expect("lookup file");
+        let file_name = CString::new("file").expect("file");
+        let moved_name = CString::new("moved").expect("moved");
+
+        let rename_error = match fs.rename(
+            ctx(),
+            left_node.inode,
+            file_name.as_c_str(),
+            right_node.inode,
+            moved_name.as_c_str(),
+            0,
+        ) {
+            Ok(_) => panic!("cross-mount rename succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(rename_error.raw_os_error(), Some(libc::EXDEV));
+
+        let link_error = match fs.link(ctx(), file.inode, right_node.inode, moved_name.as_c_str()) {
+            Ok(_) => panic!("cross-mount link succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(link_error.raw_os_error(), Some(libc::EXDEV));
+    }
+
+    #[test]
+    fn open_handle_survives_unlink_for_reads() {
+        let test_dir = TestDir::new("open-unlink");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"still here").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let (handle, _options) = fs
+            .open(ctx(), file.inode, false, libc::O_RDONLY as u32)
+            .expect("open file");
+        let handle = handle.expect("handle");
+        let name = CString::new("file").expect("name");
+        fs.unlink(ctx(), workspace.inode, name.as_c_str())
+            .expect("unlink file");
+
+        let mut reader = VecWriter::default();
+        fs.read(ctx(), file.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("read after unlink");
+        assert_eq!(reader.data, b"still here");
+    }
+
+    #[test]
+    fn readonly_mount_rejects_namespace_mutations() {
+        let test_dir = TestDir::new("readonly-mutations");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::create_dir(root.join("dir")).expect("create dir");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "readonly",
+            "/readonly",
+            &root,
+            AccessMode::Ro,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let readonly = lookup(&fs, ROOT_ID, "readonly").expect("lookup readonly");
+        let file = lookup(&fs, readonly.inode, "file").expect("lookup file");
+        let file_name = CString::new("file").expect("file");
+        let dir_name = CString::new("dir").expect("dir");
+        let new_name = CString::new("new").expect("new");
+
+        assert_eq!(
+            fs.open(ctx(), file.inode, false, libc::O_WRONLY as u32)
+                .expect_err("readonly write open")
+                .raw_os_error(),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.mkdir(
+                    ctx(),
+                    readonly.inode,
+                    new_name.as_c_str(),
+                    0o755,
+                    0,
+                    Extensions::default(),
+                ),
+                "readonly mkdir",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.unlink(ctx(), readonly.inode, file_name.as_c_str()),
+                "readonly unlink",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.rmdir(ctx(), readonly.inode, dir_name.as_c_str()),
+                "readonly rmdir",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.rename(
+                    ctx(),
+                    readonly.inode,
+                    file_name.as_c_str(),
+                    readonly.inode,
+                    new_name.as_c_str(),
+                    0,
+                ),
+                "readonly rename",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.link(ctx(), file.inode, readonly.inode, new_name.as_c_str()),
+                "readonly link",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.symlink(
+                    ctx(),
+                    file_name.as_c_str(),
+                    readonly.inode,
+                    new_name.as_c_str(),
+                    Extensions::default(),
+                ),
+                "readonly symlink",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            raw_error(
+                fs.mknod(
+                    ctx(),
+                    readonly.inode,
+                    new_name.as_c_str(),
+                    libc::S_IFREG | 0o644,
+                    0,
+                    0,
+                    Extensions::default(),
+                ),
+                "readonly mknod",
+            ),
+            Some(libc::EROFS)
+        );
     }
 }

@@ -1,6 +1,6 @@
 ---
 id: wra-0bcu
-status: open
+status: in_progress
 deps: [wra-a9je, wra-vy20, wra-udix]
 links: []
 created: 2026-05-11T20:43:59Z
@@ -32,3 +32,7 @@ Dependency insight from wra-a9je: host integration should generate .sandbox/dock
 **2026-05-12T21:08:42Z**
 
 Scaffold handoff from wra-saox: runtime integration should launch composed-fs/target/debug/agentvm-composed-fs in development, or the packaged agentvm-composed-fs binary once release packaging exists. The CLI already supports --manifest .sandbox/docker-vm/run/composed-fs-manifest.json --socket-path .sandbox/docker-vm/run/virtiofs.sock --tag agentvm; QEMU should connect vhost-user-fs-device to that socket/tag. Sandbox-local smoke testing showed Unix listener creation can require host privileges outside the coding sandbox.
+
+**2026-05-12T21:38:17Z**
+
+Started orientation. q35 Docker VM launch is implemented in sandbox-wrap (codex-wrap and copilot-wrap are symlinks to it). Primary project virtiofsd starts in DockerVmManager.start_virtiofsd() using paths.virtiofs_sock and QEMU attaches it as charfs/tag vm_cfg['virtiofs_tag'] in build_qemu_command(). Supplemental guest shares are built in build_guest_shares(), written to guest-config/shares.txt, started by start_guest_shares(), and attached as additional vhost-user-fs-pci devices. Guest config is still a separate readonly virtiofsd on agentvm-config. Integration should add an explicit non-default switch before changing these paths, and must account for the current guest init still expecting per-share tags until wra-d8nv updates it to consume composed-binds.json.

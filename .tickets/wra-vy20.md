@@ -1,6 +1,6 @@
 ---
 id: wra-vy20
-status: in_progress
+status: closed
 deps: [wra-46m5, wra-30di]
 links: []
 created: 2026-05-11T20:43:42Z
@@ -40,3 +40,11 @@ Started after wra-46m5 closure. Next implementation slice should add handle tabl
 **2026-05-12T21:27:38Z**
 
 Implemented a first operation-surface slice in composed-fs: file handle table, open/create/read/write/flush/fsync/release, mkdir, regular/FIFO mknod with EPERM for special nodes, unlink/rmdir, rename, link, symlink/readlink, statfs, access, and lseek. Readonly policy now rejects write-intent open/create/write access and mutating namespace operations with EROFS; cross-mount rename/link returns EXDEV. Added unit tests for file IO, readonly create/access rejection, mkdir/link/rename/symlink/readlink, and mknod behavior. Documented implemented slice and remaining work in docker/composed-fs-operations.md. Verified with cargo build --manifest-path composed-fs/Cargo.toml --offline and cargo test --manifest-path composed-fs/Cargo.toml --offline.
+
+**2026-05-12T21:31:25Z**
+
+Extended operation surface further: implemented setattr for chmod/chown/truncate/atime/mtime, xattrs (get/list/set/remove) via host fds, and fsyncdir as a safe success. Added tests for setattr mutation/readonly rejection and host xattr delegation when user.* xattrs are supported. Current verification: cargo build --manifest-path composed-fs/Cargo.toml --offline and cargo test --manifest-path composed-fs/Cargo.toml --offline pass with 11 tests. Remaining correctness gap before closing: stale host inode behavior after unlink/rename when lookup counts or open handles keep the inode alive; current host nodes still retain their old relative path for metadata lookup.
+
+**2026-05-12T21:33:06Z**
+
+Completed the v1 operation-surface implementation slice and documented compromises. Added cached host attributes so getattr can succeed for looked-up inodes after unlink; stale host-backed nodes are currently retained until backend shutdown rather than retired when lookup/open counts reach zero. Documented deferred operations and user impact in docker/composed-fs-operations.md. Latest verification: cargo build --manifest-path composed-fs/Cargo.toml --offline and cargo test --manifest-path composed-fs/Cargo.toml --offline pass with 12 tests.

@@ -365,14 +365,16 @@ Implemented:
 - `rename`
 - `link`
 - `lseek`
-
-Still required before closing the operation-surface ticket:
 - `setattr`
 - xattrs
 - `fsyncdir`
-- stale inode retirement after unlink/rename plus release/forget
-- expected-error documentation for deferred locks, polling, live-migration
-  state, `copyfilerange`, `syncfs`, `tmpfile`, and `fallocate`
+
+Documented compromises:
+- stale host-backed inodes retain cached attributes after unlink but are not
+  retired until backend shutdown
+- deferred locks, polling, live-migration state, `copyfilerange`, `syncfs`,
+  `tmpfile`, and `fallocate` remain unsupported unless integration testing
+  proves a real wrapper workload needs them
 
 ## Guest Init Changes
 
@@ -431,6 +433,9 @@ not dropping the composed namespace goal.
 - concurrent lookup/open/read/write/readdir behavior
 - lookup count and inode lifetime behavior
 - xattr behavior required by real tooling
+
+Current unit-level coverage and residual integration gaps are documented in
+`docker/composed-fs-tests.md`.
 
 ### VM Integration Tests
 

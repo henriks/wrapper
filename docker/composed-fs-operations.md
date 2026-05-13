@@ -28,6 +28,11 @@ top of the namespace core:
 - `statfs`
 - `access`
 - `lseek`
+- `setattr` for chmod/chown/truncate/timestamps
+- xattrs: `getxattr`, `listxattr`, `setxattr`, `removexattr`
+- `fsyncdir`
+- cached metadata for host-backed inodes whose original path disappears after
+  unlink
 
 Readonly policy is enforced for write-intent operations in this slice. A
 readonly manifest mount rejects creates, mutating opens, writes through readonly
@@ -41,18 +46,32 @@ safe traversal and then call the corresponding `*at` syscall on a single
 validated final path component. Cross-mount renames and hardlinks fail with
 `EXDEV`.
 
-## Remaining Work Before Closing `wra-vy20`
+## Documented Compromises
 
-The following operation-surface items remain:
+Stale host-backed inodes are retained in memory for the backend process
+lifetime. If a host-backed path is unlinked after lookup, `getattr` can still
+return the last cached attributes for that inode, but the node is not yet
+retired when lookup counts and open handles both reach zero. This is acceptable
+for the first v1 slice, but the full correctness test ticket should either add
+retirement or convert the retention behavior into an explicit bounded cache.
 
-- `setattr` for chmod/chown/truncate/timestamps
-- xattrs: `getxattr`, `listxattr`, `setxattr`, `removexattr`
-- `fsyncdir`
-- stale inode retirement after unlink/rename once lookup counts and open
-  handles both drop
-- broader readonly tests for every mutating operation
-- expected-error documentation for deferred operations such as locks, ioctl,
-  copyfilerange, syncfs, tmpfile, and fallocate
+The following FUSE operations intentionally remain deferred and currently use
+the upstream trait defaults:
+
+- POSIX locks: `getlk`, `setlk`, `setlkw`
+- `ioctl`
+- `bmap`
+- `poll`
+- `notify_reply`
+- `tmpfile`
+- `copyfilerange`
+- `syncfs`
+- `fallocate`
+
+User impact: ordinary shell, Git, package-manager, and Docker bind-mount
+workflows should not require these deferred operations. If integration testing
+shows a real workload depends on one, add a focused ticket before making the
+backend default.
 
 The current tests are unit-level backend tests. Full guest-mounted virtio-fs
 validation remains a later integration ticket.

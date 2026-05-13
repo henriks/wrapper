@@ -1,6 +1,6 @@
 ---
 id: wra-udix
-status: open
+status: closed
 deps: [wra-vy20]
 links: []
 created: 2026-05-11T20:43:59Z
@@ -32,3 +32,7 @@ Dependency insight from wra-30di: tests must cover synthetic lookup/readdir, fil
 **2026-05-12T21:16:45Z**
 
 Handoff from wra-46m5: composed-fs currently has unit coverage for hardlink inode reuse via (mount, dev, ino), lookup_count decrement through forget, unsafe component rejection, and nested overlay readdir merging host entries with mounted boundaries. Broader correctness/adversarial coverage still needs the v1 operation surface from wra-vy20 before testing readonly mutations, open-after-rename/unlink, xattrs, access, fsync, and cross-mount EXDEV.
+
+**2026-05-12T21:36:50Z**
+
+Added backend correctness/adversarial coverage in composed-fs unit tests. Coverage now includes file mounts, nested boundaries, symlink escape prevention, cross-mount rename/link EXDEV, readonly rejection for create/write-open/access/setattr/mkdir/unlink/rmdir/rename/link/symlink/mknod, open-handle read after unlink, cached getattr after unlink, mknod regular fallback/special EPERM, xattr delegation when supported, and core lookup/readdir/hardlink/lookup-count cases. Test command documented in docker/composed-fs-tests.md. Verified cargo build --manifest-path composed-fs/Cargo.toml --offline and cargo test --manifest-path composed-fs/Cargo.toml --offline; 17 tests pass. Residual gaps are guest-mounted integration behavior, stress/concurrency, and readdir offset mutation under kernel interaction; these belong to q35 composed-fs validation or focused follow-ups.
