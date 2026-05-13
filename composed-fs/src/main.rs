@@ -1487,6 +1487,9 @@ fn main() -> io::Result<()> {
     daemon
         .start(listener)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
+    daemon
+        .wait()
+        .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
     Ok(())
 }
 

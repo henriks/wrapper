@@ -408,11 +408,19 @@ Implementation order:
    Current implementation notes are in `docker/composed-fs-q35.md`.
 8. Validate Docker, payload control, auth/state sharing, and real tool smoke
    commands on `q35 + composed fs`.
+   Current validation notes are in `docker/composed-fs-q35.md`.
 9. Add a `microvm` QEMU command branch using the documented spike result.
+   Current implementation notes are in `docker/microvm-qemu-branch.md`.
 10. Validate `microvm + composed fs`.
+    Current validation notes are in `docker/microvm-composed-validation.md`.
 11. Measure startup and readiness times against the current implementation.
+    Current measurement and rollout decision are in
+    `docker/vm-startup-measurement.md`.
 12. Make the composed backend and `microvm` path default only after acceptance
     criteria are met.
+    Current outcome: `--docker` defaults to microvm composed mode, while
+    `--docker-legacy-per-share-fs` keeps the old q35 per-share fallback
+    available during the fallback window.
 13. Remove the old per-share export path after a fallback window.
 
 This order avoids duplicate implementations while still using spikes to answer
@@ -441,8 +449,10 @@ Current unit-level coverage and residual integration gaps are documented in
 ### VM Integration Tests
 
 - current `q35 + composed fs` boots and reaches payload readiness
+  (validated in `docker/composed-fs-q35.md`)
 - `microvm + ordinary virtiofsd` spike boots before production migration
 - `microvm + composed fs` boots and reaches payload readiness
+  (validated in `docker/microvm-composed-validation.md`)
 - Docker daemon is reachable through the host socket proxy
 - payload control path works
 - project path inside the guest matches host path expectations

@@ -52,3 +52,7 @@ User requirement update: arbitrary host path mounts are needed in the VM-only de
 **2026-04-02T05:31:58Z**
 
 Dependency insight from wra-mkh8: the guest payload path now expects a persistent guest HOME at <project>/.sandbox/home and will be much more useful once tool/auth state is shared there. The execution/control ticket intentionally did not complete host auth/config sharing; Codex/Copilot usability in the guest still depends on this follow-up ticket.
+
+**2026-05-13T06:16:47Z**
+
+Input from q35 composed-fs validation: composed mode currently maps tool state by source class into <project>/.sandbox/home using TOOLS host_home_mounts plus ~/.docker, with optional --gh mapping ~/.config/gh read-only when requested. Basic q35 validation proved those paths are reconstructed through the composed export, but full Codex/Copilot auth-state behavioral smoke remains a VM-only model concern for this ticket or its successors.

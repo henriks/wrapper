@@ -6,13 +6,19 @@ Date: 2026-05-13
 
 ## Switch
 
-The composed filesystem path is explicit and non-default:
+The q35 composed filesystem path remains available explicitly:
 
 ```sh
-sandbox-wrap --docker --docker-composed-fs ...
+sandbox-wrap --docker --docker-machine q35 ...
 ```
 
-Without `--docker-composed-fs`, the wrapper keeps the existing q35 path:
+The old q35 per-share fallback remains available during the fallback window:
+
+```sh
+sandbox-wrap --docker --docker-legacy-per-share-fs ...
+```
+
+The fallback uses:
 
 - primary project `virtiofsd`
 - tiny readonly guest config `virtiofsd`
@@ -72,6 +78,40 @@ If `composed-binds.json` is absent, guest init uses the old project mount plus
 
 ## Validation Status
 
-This ticket wires the gated q35 path and performs syntax/build-level checks.
-Full boot, Docker readiness, payload readiness, bind-mount behavior, and
-fallback validation are owned by `wra-oz9h`.
+`wra-oz9h` validated the gated q35 path on 2026-05-13 after rebuilding the
+appliance artifacts with the updated guest init.
+
+Preflight checks:
+
+- `python3 -m py_compile sandbox-wrap`
+- `sh -n docker/guest-init.sh`
+- `cargo build --manifest-path composed-fs/Cargo.toml --offline`
+- `cargo test --manifest-path composed-fs/Cargo.toml --offline`
+- host manifest and guest bind manifest generation probe
+
+Integration checks:
+
+- `--docker --docker-composed-fs --no-net` boots, reaches payload readiness,
+  preserves the project working directory, exposes Docker through the socket
+  proxy, and writes project files back to the host.
+- Composed mode mounts one primary `virtiofs` export at `/run/agentvm-host`;
+  guest paths such as the project directory, tool state, Docker state, and
+  `/workspace` are reconstructed as bind mounts from that export.
+- `--ro` entries reject writes with `Read-only file system`; `--rw` entries
+  accept guest writes and persist them on the host.
+- Docker bind mounts from `$PWD` work from inside the guest.
+- `--docker-publish 28081:18081` forwards host localhost traffic to a server
+  inside the guest and returned `publish-ok`.
+- The non-composed q35 fallback path still boots, reaches payload readiness,
+  and exposes Docker.
+
+Validation found one implementation bug: `agentvm-composed-fs` returned from
+`main` immediately after starting the vhost-user daemon. The backend now calls
+`daemon.wait()` after `daemon.start(listener)` so the process remains alive for
+the guest session.
+
+Remaining validation belongs to later rollout tickets:
+
+- broader Codex/Copilot auth-state smoke coverage
+- startup/readiness timing against the old q35 path
+- microvm launch and microvm plus composed-fs integration

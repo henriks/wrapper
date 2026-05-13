@@ -101,6 +101,9 @@ DOCKER_VM_USERNET_DNS_IP = "10.0.2.3"
 DOCKER_VM_CONFIG_SHARE_TAG = "agentvm-config"
 DOCKER_VM_COMPOSED_FS_TAG = "agentvm"
 DOCKER_VM_COMPOSED_FS_MOUNTPOINT = "/run/agentvm-host"
+DOCKER_VM_MACHINE_Q35 = "q35"
+DOCKER_VM_MACHINE_MICROVM = "microvm"
+DOCKER_VM_MACHINE_CHOICES = (DOCKER_VM_MACHINE_Q35, DOCKER_VM_MACHINE_MICROVM)
 
 HOST_TOOL_FALLBACKS = {
     "virtiofsd": [
@@ -373,6 +376,7 @@ class DockerVmManager:
     extra_rw: list[str] = field(default_factory=list)
     gh_enabled: bool = False
     composed_fs_enabled: bool = False
+    machine_type: str = DOCKER_VM_MACHINE_Q35
     paths: DockerVmPaths = field(init=False)
     manifest: dict | None = field(default=None, init=False)
     lock_fd: int | None = field(default=None, init=False)
@@ -1025,11 +1029,9 @@ class DockerVmManager:
 
         hostfwd_specs = self._build_hostfwd_specs(
             guest_docker_port, guest_payload_port)
-        nic_parts = [
+        netdev_parts = [
             "user",
             "id=net0",
-            "model=virtio-net-pci",
-            f"mac={self.network.guest_mac}",
             "ipv6=off",
             "hostname=agentvm",
             f"net=10.0.2.0/{DOCKER_VM_USERNET_PREFIX}",
@@ -1037,20 +1039,38 @@ class DockerVmManager:
             f"dns={DOCKER_VM_USERNET_DNS_IP}",
             f"restrict={'off' if self.network_enabled else 'on'}",
         ]
-        nic_parts.extend(hostfwd_specs)
+        netdev_parts.extend(hostfwd_specs)
 
         memory_bytes = int(vm_cfg["memory_bytes"])
         memory_mib = max(1, memory_bytes // (1024 * 1024))
         args = [
             self.host_tools["qemu-system-x86_64"],
             "-enable-kvm",
+        ]
+        if self.machine_type == DOCKER_VM_MACHINE_MICROVM:
+            args += ["-cpu", "host"]
+        args += [
             "-nodefaults",
             "-no-user-config",
             "-no-reboot",
             "-display", "none",
             "-serial", f"file:{self.paths.console_log}",
             "-monitor", "none",
-            "-machine", "q35,accel=kvm,memory-backend=mem",
+        ]
+
+        if self.machine_type == DOCKER_VM_MACHINE_MICROVM:
+            machine_arg = "microvm,acpi=off,memory-backend=mem,isa-serial=on"
+            block_device = "virtio-blk-device"
+            rng_device = "virtio-rng-device,rng=rng0"
+            fs_device = "vhost-user-fs-device"
+        else:
+            machine_arg = "q35,accel=kvm,memory-backend=mem"
+            block_device = "virtio-blk-pci"
+            rng_device = "virtio-rng-pci,rng=rng0"
+            fs_device = "vhost-user-fs-pci"
+
+        args += [
+            "-machine", machine_arg,
             "-object",
             f"memory-backend-memfd,id=mem,size={memory_bytes},share=on",
             "-m", str(memory_mib),
@@ -1060,16 +1080,16 @@ class DockerVmManager:
             "-append", kernel_cmdline,
             "-drive",
             f"if=none,file={artifacts['rootfs']},format=raw,readonly=on,id=rootfs",
-            "-device", "virtio-blk-pci,drive=rootfs",
+            "-device", f"{block_device},drive=rootfs",
             "-drive",
             f"if=none,file={self.paths.data_disk},format=raw,id=dockerdata",
-            "-device", "virtio-blk-pci,drive=dockerdata",
+            "-device", f"{block_device},drive=dockerdata",
             "-object", "rng-random,id=rng0,filename=/dev/urandom",
-            "-device", "virtio-rng-pci,rng=rng0",
+            "-device", rng_device,
             "-chardev",
             f"socket,id=charfs,path={self.paths.virtiofs_sock}",
             "-device",
-            "vhost-user-fs-pci,"
+            f"{fs_device},"
             f"chardev=charfs,tag={vm_cfg['virtiofs_tag']},"
             f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
             f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
@@ -1078,7 +1098,7 @@ class DockerVmManager:
             "-chardev",
             f"socket,id=charcfg,path={self.paths.guest_config_sock}",
             "-device",
-            "vhost-user-fs-pci,"
+            f"{fs_device},"
             "chardev=charcfg,"
             f"tag={DOCKER_VM_CONFIG_SHARE_TAG},"
             f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
@@ -1090,13 +1110,26 @@ class DockerVmManager:
                     "-chardev",
                     f"socket,id=charshare{index},path={share.socket_path}",
                     "-device",
-                    "vhost-user-fs-pci,"
+                    f"{fs_device},"
                     f"chardev=charshare{index},"
                     f"tag={share.tag},"
                     f"queue-size={DOCKER_VM_VIRTIOFS_QUEUE_SIZE},"
                     f"num-request-queues={DOCKER_VM_VIRTIOFS_NUM_QUEUES}",
                 ]
-        args += ["-nic", ",".join(nic_parts)]
+        if self.machine_type == DOCKER_VM_MACHINE_MICROVM:
+            args += [
+                "-netdev", ",".join(netdev_parts),
+                "-device",
+                f"virtio-net-device,netdev=net0,mac={self.network.guest_mac}",
+            ]
+        else:
+            nic_parts = [
+                *netdev_parts[:2],
+                "model=virtio-net-pci",
+                f"mac={self.network.guest_mac}",
+                *netdev_parts[2:],
+            ]
+            args += ["-nic", ",".join(nic_parts)]
         return args
 
     def start_qemu(self) -> None:
@@ -1108,6 +1141,16 @@ class DockerVmManager:
             close_fds=True,
         )
         self._write_pid(self.paths.qemu_pid, self.qemu_proc.pid)
+
+    def host_process_count(self) -> int:
+        processes = [
+            self.config_share_proc,
+            self.virtiofsd_proc,
+            self.qemu_proc,
+            self.proxy_proc,
+            *self.share_procs,
+        ]
+        return sum(1 for proc in processes if proc is not None)
 
     def wait_for_path(self, path: str, timeout: float) -> None:
         deadline = time.time() + timeout
@@ -1222,6 +1265,12 @@ class DockerVmManager:
         raise DockerVmError(detail)
 
     def start(self) -> None:
+        start_monotonic = time.monotonic()
+        timings_ms: dict[str, float] = {}
+
+        def elapsed_ms() -> float:
+            return round((time.monotonic() - start_monotonic) * 1000, 1)
+
         self.ensure_host_prerequisites()
         self.ensure_runtime_root()
         self.acquire_lock()
@@ -1243,9 +1292,12 @@ class DockerVmManager:
                 self.start_guest_config_share()
                 self.start_guest_shares()
             self.start_qemu()
+            timings_ms["qemu_started"] = elapsed_ms()
             self.start_proxy()
             self.wait_for_docker_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
+            timings_ms["docker_ready"] = elapsed_ms()
             self.wait_for_payload_control_ready(timeout=DOCKER_VM_BOOT_TIMEOUT)
+            timings_ms["payload_ready"] = elapsed_ms()
             self.write_state(
                 "running",
                 qemu_pid=(self.qemu_proc.pid if self.qemu_proc else None),
@@ -1260,6 +1312,13 @@ class DockerVmManager:
                                   else "restricted"),
                 published_ports=([vars(p) for p in self.published_ports]
                                  if self.published_ports else []),
+                machine_type=self.machine_type,
+                timings_ms=timings_ms,
+                host_process_count=self.host_process_count(),
+                qemu_device_count=(
+                    self.build_qemu_command().count("-device")
+                    + self.build_qemu_command().count("-nic")
+                ),
                 guest_shares=([
                     {
                         "tag": share.tag,
@@ -2190,8 +2249,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--docker-composed-fs", action="store_true",
-        help="Use the experimental composed virtio-fs backend for the Docker "
-             "VM (requires --docker; old per-share virtiofsd remains default)",
+        help="Use the composed virtio-fs backend for the Docker VM "
+             "(default when --docker is used; kept for compatibility)",
+    )
+    parser.add_argument(
+        "--docker-legacy-per-share-fs", action="store_true",
+        help="Use the old q35 per-share virtiofsd export path as a fallback "
+             "(requires --docker)",
+    )
+    parser.add_argument(
+        "--docker-machine", choices=DOCKER_VM_MACHINE_CHOICES,
+        help="QEMU machine type for the Docker VM "
+             "(default: microvm, or q35 with --docker-legacy-per-share-fs)",
     )
     parser.add_argument(
         "--docker-publish", action="append", default=[], metavar="HOST:GUEST",
@@ -2327,10 +2396,27 @@ def main() -> None:
     docker_vm: DockerVmManager | None = None
     if args.docker_composed_fs and not args.docker:
         die("--docker-composed-fs requires --docker")
+    if args.docker_legacy_per_share_fs and not args.docker:
+        die("--docker-legacy-per-share-fs requires --docker")
+    if args.docker_composed_fs and args.docker_legacy_per_share_fs:
+        die("--docker-composed-fs and --docker-legacy-per-share-fs conflict")
+    if args.docker_machine is not None and not args.docker:
+        die("--docker-machine requires --docker")
     if args.docker:
         if args.docker_publish and args.no_net:
             die("--docker-publish requires Docker VM networking; "
                 "do not combine it with --no-net")
+        docker_composed_fs = not args.docker_legacy_per_share_fs
+        if args.docker_machine is not None:
+            docker_machine = args.docker_machine
+        elif args.docker_legacy_per_share_fs:
+            docker_machine = DOCKER_VM_MACHINE_Q35
+        else:
+            docker_machine = DOCKER_VM_MACHINE_MICROVM
+        if (docker_machine == DOCKER_VM_MACHINE_MICROVM
+                and not docker_composed_fs):
+            die("--docker-machine microvm requires composed fs; remove "
+                "--docker-legacy-per-share-fs or choose --docker-machine q35")
         published_ports = [
             DockerVmForward(*parse_forward_spec(spec))
             for spec in args.docker_publish
@@ -2345,7 +2431,8 @@ def main() -> None:
             extra_ro=args.ro,
             extra_rw=args.rw,
             gh_enabled=args.gh,
-            composed_fs_enabled=args.docker_composed_fs,
+            composed_fs_enabled=docker_composed_fs,
+            machine_type=docker_machine,
         )
         try:
             docker_vm.start()

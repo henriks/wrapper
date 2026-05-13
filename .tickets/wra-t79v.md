@@ -22,3 +22,9 @@ Delete or simplify DockerVmGuestShare process management, per-share sockets, per
 
 Old per-share code is removed or explicitly retained with rationale; docs no longer describe obsolete default behavior; cleanup does not remove needed fallback before rollout criteria are met.
 
+
+## Notes
+
+**2026-05-13T06:35:04Z**
+
+Default switch completed in wra-3o6e: --docker now uses microvm composed mode; old q35 per-share path is intentionally retained behind --docker-legacy-per-share-fs for the fallback window. When this ticket runs, remove or re-justify that flag, DockerVmGuestShare process startup for per-share virtiofsd, shares.txt guest reconstruction, and docs that describe the legacy path as available.

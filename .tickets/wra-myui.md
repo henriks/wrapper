@@ -1,6 +1,6 @@
 ---
 id: wra-myui
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-11T20:42:47Z
@@ -21,3 +21,9 @@ Do not build duplicate staged-tree or symlink-projection implementations in para
 
 All child epics are closed; q35 + composed fs and microvm + composed fs pass integration tests; startup/readiness measurements are documented; old per-share path has either been removed after a fallback window or has a documented remaining reason.
 
+
+## Notes
+
+**2026-05-13T06:35:44Z**
+
+Umbrella outcome: composed virtio-fs backend is implemented and tested; q35 composed validation is documented; microvm composed validation is documented; startup/readiness measurement is documented; --docker now defaults to microvm composed mode. The old q35 per-share path remains intentionally behind --docker-legacy-per-share-fs for the fallback window, tracked by wra-t79v.

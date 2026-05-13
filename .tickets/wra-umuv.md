@@ -1,6 +1,6 @@
 ---
 id: wra-umuv
-status: open
+status: closed
 deps: [wra-jyn1]
 links: []
 created: 2026-05-11T20:43:04Z
@@ -22,3 +22,9 @@ Reuse upstream virtiofsd at the protocol boundary if the spike validates that se
 
 The backend passes correctness and adversarial filesystem tests, serves the current q35 VM path behind a feature flag, and documents semantic compromises or unsupported operations.
 
+
+## Notes
+
+**2026-05-13T06:17:06Z**
+
+Backend epic completion: composed-fs now has the v1 operation surface, readonly enforcement, namespace/safe traversal core, correctness/adversarial tests, and serves the q35 composed path behind --docker-composed-fs. The q35 validation in wra-oz9h found and fixed the daemon lifetime issue with daemon.wait(); remaining work is rollout validation/performance and microvm integration, not backend construction.
