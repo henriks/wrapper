@@ -2,7 +2,7 @@
 id: wra-oszw
 status: open
 deps: []
-links: []
+links: [wra-octf]
 created: 2026-04-01T21:16:25Z
 type: epic
 priority: 1
@@ -49,3 +49,9 @@ Child tickets cover runtime contract, guest execution/control path, guest state/
 Dependencies reflect implementation order.
 
 The final implementation uses the VM as the only sandbox boundary for the agent path.
+
+## Notes
+
+**2026-05-13T10:19:33Z**
+
+Pivot note: new epic wra-octf tracks the Rust frontend direction. Future VM-only wrapper work should be evaluated against that pivot: avoid investing in Python sandbox-wrap cleanup that will be superseded by the Rust frontend, except where needed as a bridge or to preserve currently validated behavior during migration.

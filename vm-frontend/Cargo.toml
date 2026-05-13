@@ -1,0 +1,12 @@
+[package]
+name = "agentvm-frontend"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agentvm-composed-fs = { path = "../composed-fs" }
+hickory-proto = "0.26.1"
+httparse = "1.10.1"
+ipnet = "2.12.0"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
