@@ -1,6 +1,6 @@
 ---
 id: wra-jmox
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-05-14T21:37:41Z
@@ -22,3 +22,9 @@ Adjust the wrapper TUI so the guest terminal renders without a border/frame. Kee
 - Tests are updated for the new sizing behavior.
 - Build/tests pass.
 
+
+## Notes
+
+**2026-05-14T21:49:27Z**
+
+Implemented unframed TUI terminal rendering. Guest PTY sizing now uses the full viewport above the status bar, so no border rows/columns are subtracted. Updated TUI sizing tests and validation/design docs. Verified with cargo fmt, cargo test --manifest-path vm-frontend/Cargo.toml --offline tui::tests, and cargo build --manifest-path vm-frontend/Cargo.toml --offline.
