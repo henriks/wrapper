@@ -56,6 +56,9 @@ events so blocked destinations fail closed without hanging guest connects.
 Real VM validation status and the KVM-host smoke procedure are documented in
 `vmnet-runtime-validation.md`.
 
+The broader network and filesystem validation taxonomy is documented in
+`validation-matrix.md`.
+
 Run the KVM-required VM-only self-test:
 
 ```sh

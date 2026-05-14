@@ -175,11 +175,7 @@ impl GuestTlsSession {
     }
 
     pub fn write_guest_plaintext(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TlsMitmError> {
-        self.server
-            .writer()
-            .write_all(bytes)
-            .map_err(|error| TlsMitmError::PlaintextWrite(error.to_string()))?;
-        drain_tls_writes(&mut self.server)
+        write_server_plaintext_streaming(&mut self.server, bytes)
     }
 
     pub fn is_handshaking(&self) -> bool {
@@ -234,11 +230,7 @@ impl TlsUpstreamSession {
     }
 
     pub fn write_upstream_plaintext(&mut self, bytes: &[u8]) -> Result<Vec<u8>, TlsMitmError> {
-        self.client
-            .writer()
-            .write_all(bytes)
-            .map_err(|error| TlsMitmError::PlaintextWrite(error.to_string()))?;
-        drain_client_tls_writes(&mut self.client)
+        write_client_plaintext_streaming(&mut self.client, bytes)
     }
 
     pub fn drain_tls_to_upstream(&mut self) -> Result<Vec<u8>, TlsMitmError> {
@@ -368,6 +360,68 @@ fn drain_tls_writes(server: &mut ServerConnection) -> Result<Vec<u8>, TlsMitmErr
             break;
         }
     }
+    Ok(output)
+}
+
+fn write_server_plaintext_streaming(
+    server: &mut ServerConnection,
+    bytes: &[u8],
+) -> Result<Vec<u8>, TlsMitmError> {
+    let mut output = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match server.writer().write(&bytes[offset..]) {
+            Ok(0) => {
+                let drained = drain_tls_writes(server)?;
+                if drained.is_empty() {
+                    return Err(TlsMitmError::PlaintextWrite(
+                        "rustls server writer made no progress".to_string(),
+                    ));
+                }
+                output.extend_from_slice(&drained);
+            }
+            Ok(count) => {
+                offset += count;
+                output.extend_from_slice(&drain_tls_writes(server)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                output.extend_from_slice(&drain_tls_writes(server)?);
+            }
+            Err(error) => return Err(TlsMitmError::PlaintextWrite(error.to_string())),
+        }
+    }
+    output.extend_from_slice(&drain_tls_writes(server)?);
+    Ok(output)
+}
+
+fn write_client_plaintext_streaming(
+    client: &mut ClientConnection,
+    bytes: &[u8],
+) -> Result<Vec<u8>, TlsMitmError> {
+    let mut output = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match client.writer().write(&bytes[offset..]) {
+            Ok(0) => {
+                let drained = drain_client_tls_writes(client)?;
+                if drained.is_empty() {
+                    return Err(TlsMitmError::PlaintextWrite(
+                        "rustls client writer made no progress".to_string(),
+                    ));
+                }
+                output.extend_from_slice(&drained);
+            }
+            Ok(count) => {
+                offset += count;
+                output.extend_from_slice(&drain_client_tls_writes(client)?);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                output.extend_from_slice(&drain_client_tls_writes(client)?);
+            }
+            Err(error) => return Err(TlsMitmError::PlaintextWrite(error.to_string())),
+        }
+    }
+    output.extend_from_slice(&drain_client_tls_writes(client)?);
     Ok(output)
 }
 
@@ -530,6 +584,52 @@ mod tests {
     }
 
     #[test]
+    fn guest_tls_session_handles_large_fragmented_response_without_bad_record_mac() {
+        let (ca_cert, ca_key) = test_ca_pem();
+        let authority = Arc::new(TlsMitmAuthority::from_pem(&ca_cert, &ca_key).expect("authority"));
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.ca_cert()).expect("root");
+        let client_config = Arc::new(
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let mut client = ClientConnection::new(
+            client_config,
+            ServerName::try_from("registry.npmjs.org")
+                .expect("server name")
+                .to_owned(),
+        )
+        .expect("client");
+        let mut session =
+            GuestTlsSession::new(Arc::new(authority.rustls_server_config().expect("server")))
+                .expect("session");
+        complete_guest_tls_handshake(&mut client, &mut session);
+
+        let mut body = vec![b'J'; 192 * 1024];
+        body[0..8].copy_from_slice(b"npm-meta");
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(&body);
+        let response_tls = session
+            .write_guest_plaintext(&response)
+            .expect("large response tls");
+
+        let mut decrypted = Vec::new();
+        for chunk in response_tls.chunks(137) {
+            feed_client_tls(&mut client, chunk);
+            decrypted.extend(read_client_plaintext_unbounded(&mut client));
+        }
+        decrypted.extend(read_client_plaintext_unbounded(&mut client));
+
+        assert_eq!(decrypted.len(), response.len());
+        assert_eq!(&decrypted[..15], b"HTTP/1.1 200 OK");
+        assert!(decrypted.windows(8).any(|window| window == b"npm-meta"));
+    }
+
+    #[test]
     fn upstream_tls_session_encrypts_request_and_decrypts_response() {
         let (ca_cert, ca_key) = test_ca_pem();
         let authority = TlsMitmAuthority::from_pem(&ca_cert, &ca_key).expect("authority");
@@ -687,9 +787,41 @@ mod tests {
         client.process_new_packets().expect("client process tls");
     }
 
+    fn complete_guest_tls_handshake(client: &mut ClientConnection, session: &mut GuestTlsSession) {
+        let client_hello = drain_client_tls(client);
+        let server_hello = session
+            .read_guest_tls(&client_hello)
+            .expect("server hello")
+            .tls_to_guest;
+        feed_client_tls(client, &server_hello);
+        let client_finished = drain_client_tls(client);
+        let read = session
+            .read_guest_tls(&client_finished)
+            .expect("client finished");
+        if !read.tls_to_guest.is_empty() {
+            feed_client_tls(client, &read.tls_to_guest);
+        }
+        assert!(!client.is_handshaking());
+        assert!(!session.is_handshaking());
+    }
+
     fn read_client_plaintext(client: &mut ClientConnection) -> Vec<u8> {
         let mut plaintext = Vec::new();
         let mut buffer = [0; 1024];
+        loop {
+            match client.reader().read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => plaintext.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("client plaintext read failed: {error}"),
+            }
+        }
+        plaintext
+    }
+
+    fn read_client_plaintext_unbounded(client: &mut ClientConnection) -> Vec<u8> {
+        let mut plaintext = Vec::new();
+        let mut buffer = [0; 16 * 1024];
         loop {
             match client.reader().read(&mut buffer) {
                 Ok(0) => break,

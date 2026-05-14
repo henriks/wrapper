@@ -534,41 +534,12 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use crate::runtime_manifest::workspace_mounts;
+    use crate::test_support::FrontendFixture;
 
     #[test]
     fn loads_frontend_config_from_artifact_manifest() {
-        let root = unique_temp_dir();
-        fs::create_dir_all(root.join("docker/out")).expect("out dir");
-        fs::create_dir_all(root.join("repo")).expect("repo");
-        fs::write(root.join("docker/out/vmlinuz"), b"kernel").expect("kernel");
-        fs::write(root.join("docker/out/initrd.img"), b"initrd").expect("initrd");
-        fs::write(root.join("docker/out/rootfs.raw"), b"rootfs").expect("rootfs");
-        fs::write(
-            root.join("docker/out/artifact-manifest.json"),
-            r#"{
-              "schema_version": 1,
-              "artifacts": {
-                "kernel": "docker/out/vmlinuz",
-                "initrd": "docker/out/initrd.img",
-                "rootfs": "docker/out/rootfs.raw"
-              },
-              "vm": {
-                "cpus": 2,
-                "memory_bytes": 2147483648,
-                "virtiofs_tag": "workspace",
-                "kernel_cmdline": "console=hvc0 root=/dev/vda"
-              }
-            }"#,
-        )
-        .expect("manifest");
-
-        let config = crate::FrontendConfig::from_artifact_manifest_file(
-            root.join("repo"),
-            root.join(".sandbox/docker-vm/run"),
-            "/usr/bin/qemu-system-x86_64",
-            root.join("docker/out/artifact-manifest.json"),
-        )
-        .expect("config");
+        let fixture = FrontendFixture::new("artifact-manifest");
+        let config = fixture.frontend_config().expect("config");
 
         assert_eq!(config.vm.cpus, 2);
         assert!(config
@@ -576,11 +547,17 @@ mod tests {
             .kernel_cmdline
             .starts_with("console=ttyS0,115200n8 "));
         assert!(!config.vm.kernel_cmdline.contains("console=hvc0"));
-        assert_eq!(config.vm.virtiofs_tag, "workspace");
-        assert_eq!(config.artifacts.kernel, root.join("docker/out/vmlinuz"));
+        assert_eq!(config.vm.virtiofs_tag, "agentvm");
+        assert_eq!(
+            config.artifacts.kernel,
+            fixture.root.join("docker/out/vmlinuz")
+        );
         assert_eq!(
             config.runtime.composed_bind_manifest,
-            root.join(".sandbox/docker-vm/run/guest-config/composed-binds.json")
+            fixture
+                .run_dir
+                .join("guest-config")
+                .join("composed-binds.json")
         );
         assert_eq!(config.guest_http_smoke_url, None);
     }

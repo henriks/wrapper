@@ -310,6 +310,28 @@ mod tests {
     }
 
     #[test]
+    fn ignores_arp_for_non_gateway_ip_and_malformed_frames() {
+        let gateway = gateway();
+        let guest_mac = [0x02, 0xfc, 0x12, 0x34, 0x56, 0x78];
+        let mut request = Vec::new();
+        request.extend_from_slice(&[0xff; 6]);
+        request.extend_from_slice(&guest_mac);
+        request.extend_from_slice(&ETHERTYPE_ARP.to_be_bytes());
+        request.extend_from_slice(&ARP_HTYPE_ETHERNET.to_be_bytes());
+        request.extend_from_slice(&ARP_PTYPE_IPV4.to_be_bytes());
+        request.push(6);
+        request.push(4);
+        request.extend_from_slice(&ARP_REQUEST.to_be_bytes());
+        request.extend_from_slice(&guest_mac);
+        request.extend_from_slice(&[10, 0, 2, 15]);
+        request.extend_from_slice(&[0; 6]);
+        request.extend_from_slice(&[10, 0, 2, 99]);
+
+        assert_eq!(gateway.handle_frame(&request), None);
+        assert_eq!(gateway.handle_frame(&request[..20]), None);
+    }
+
+    #[test]
     fn offers_fixed_dhcp_lease() {
         let gateway = gateway();
         let discover = dhcp_discover();
@@ -328,6 +350,17 @@ mod tests {
         assert_eq!(dhcp_option(bootp, 53), Some(&[2][..]));
         assert_eq!(dhcp_option(bootp, 54), Some(&[10, 0, 2, 2][..]));
         assert_eq!(dhcp_option(bootp, 6), Some(&[10, 0, 2, 3][..]));
+    }
+
+    #[test]
+    fn ignores_truncated_or_non_dhcp_udp_frames() {
+        let gateway = gateway();
+        let discover = dhcp_discover();
+        let mut wrong_port = discover.clone();
+        wrong_port[36..38].copy_from_slice(&1234_u16.to_be_bytes());
+
+        assert_eq!(gateway.handle_frame(&discover[..30]), None);
+        assert_eq!(gateway.handle_frame(&wrong_port), None);
     }
 
     fn dhcp_discover() -> Vec<u8> {

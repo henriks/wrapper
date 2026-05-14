@@ -354,6 +354,38 @@ mod tests {
     }
 
     #[test]
+    fn rejects_truncated_length_without_treating_as_clean_eof() {
+        let mut io = QemuFrameIo::new(Cursor::new(vec![0, 0]), DEFAULT_MAX_FRAME_LEN);
+
+        assert!(matches!(
+            io.read_frame(),
+            Err(VmnetStreamError::TruncatedLength { received: 2 })
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_length_frames_on_read_and_write() {
+        let mut reader = QemuFrameIo::new(Cursor::new(0_u32.to_be_bytes().to_vec()), 1500);
+
+        assert!(matches!(
+            reader.read_frame(),
+            Err(VmnetStreamError::InvalidFrameLength {
+                length: 0,
+                max: 1500
+            })
+        ));
+
+        let mut writer = QemuFrameIo::new(Cursor::new(Vec::new()), 1500);
+        assert!(matches!(
+            writer.write_frame(&[]),
+            Err(VmnetStreamError::FrameTooLarge {
+                length: 0,
+                max: 1500
+            })
+        ));
+    }
+
+    #[test]
     fn rejects_oversized_frame_before_allocation() {
         let input = Cursor::new(9000_u32.to_be_bytes().to_vec());
 

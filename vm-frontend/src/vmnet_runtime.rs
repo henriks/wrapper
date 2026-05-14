@@ -14,7 +14,9 @@ use crate::tcp_gateway::{
 };
 use crate::tcp_proxy::{TcpProxyBridge, TcpProxyEvent};
 use crate::tls_mitm::{TlsMitmAuthority, TlsMitmError};
-use crate::vmnet_gateway::{GuestFrameOutcome, UdpDenial, VmnetGateway, VmnetGatewayError};
+use crate::vmnet_gateway::{
+    GuestFrameOutcome, UdpDenial, UnsupportedProtocol, VmnetGateway, VmnetGatewayError,
+};
 use crate::vmnet_stream::{
     FrameRead, PcapWriter, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError,
 };
@@ -89,6 +91,7 @@ pub enum VmnetGatewayEvent {
         log: crate::dns_proxy::DnsLogEntry,
     },
     UdpDenied(UdpDenial),
+    UnsupportedProtocol(UnsupportedProtocol),
     TcpDenied {
         destination: crate::tcp_gateway::TcpDestination,
         decision: crate::tcp_gateway::TcpDecision,
@@ -392,6 +395,9 @@ fn format_gateway_event(event: &VmnetGatewayEvent) -> String {
             denial.dst_port,
             denial.reason
         ),
+        VmnetGatewayEvent::UnsupportedProtocol(unsupported) => {
+            format!("unsupported_protocol reason={}", unsupported.reason)
+        }
         VmnetGatewayEvent::TcpDenied {
             destination,
             decision,
@@ -415,6 +421,9 @@ fn gateway_event_from_outcome(outcome: &GuestFrameOutcome) -> Option<VmnetGatewa
             Some(VmnetGatewayEvent::DnsQuery { log: log.clone() })
         }
         GuestFrameOutcome::UdpDenied(denial) => Some(VmnetGatewayEvent::UdpDenied(denial.clone())),
+        GuestFrameOutcome::UnsupportedProtocol(unsupported) => {
+            Some(VmnetGatewayEvent::UnsupportedProtocol(unsupported.clone()))
+        }
         GuestFrameOutcome::TcpDenied {
             destination,
             decision,
@@ -664,7 +673,7 @@ mod tests {
     use crate::network_policy::VmnetPolicy;
     use crate::tcp_gateway::{TcpConnectError, TcpDestination};
     use crate::tcp_proxy::TcpProxyBridge;
-    use crate::vmnet_gateway::VmnetGateway;
+    use crate::vmnet_gateway::{UnsupportedProtocol, VmnetGateway};
     use crate::vmnet_stream::DEFAULT_MAX_FRAME_LEN;
     use crate::GuestNetwork;
     use smoltcp::phy::ChecksumCapabilities;
@@ -761,6 +770,18 @@ mod tests {
             .events
             .iter()
             .any(|event| matches!(event, TcpProxyEvent::UpstreamPayload { .. })));
+    }
+
+    #[test]
+    fn unsupported_protocol_gateway_event_has_log_detail() {
+        let event = VmnetGatewayEvent::UnsupportedProtocol(UnsupportedProtocol {
+            reason: "IPv6 DenyAndLog by policy".to_string(),
+        });
+
+        assert_eq!(
+            format_gateway_event(&event),
+            "unsupported_protocol reason=IPv6 DenyAndLog by policy"
+        );
     }
 
     #[derive(Debug, Clone)]

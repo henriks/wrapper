@@ -2147,6 +2147,9 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
+mod test_support;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::FileExt;
@@ -2243,6 +2246,18 @@ mod tests {
         }
     }
 
+    fn assert_invalid_input<T>(result: io::Result<T>, message: &str) {
+        let error = match result {
+            Ok(_) => panic!("{message} succeeded unexpectedly"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+        assert!(
+            error.to_string().contains(message),
+            "expected error containing {message:?}, got {error}"
+        );
+    }
+
     struct VecReader {
         data: Vec<u8>,
     }
@@ -2279,6 +2294,326 @@ mod tests {
             self.data.truncate(start + read);
             Ok(read)
         }
+    }
+
+    #[test]
+    fn shared_guest_share_fixture_builds_expected_mounts() {
+        let fixture = test_support::GuestShareFixture::new("shared-fixture");
+        let fs = fixture.filesystem();
+
+        let workspace = test_support::lookup_root(&fs, "workspace").expect("lookup workspace");
+        let project =
+            test_support::lookup(&fs, workspace.inode, "project.txt").expect("lookup project");
+        let (handle, _options) = fs
+            .open(ctx(), project.inode, false, libc::O_RDONLY as u32)
+            .expect("open project file");
+        let mut reader = test_support::VecWriter::default();
+        fs.read(
+            ctx(),
+            project.inode,
+            handle.expect("handle"),
+            &mut reader,
+            64,
+            0,
+            None,
+            0,
+        )
+        .expect("read project file");
+
+        assert_eq!(reader.data, b"workspace");
+        assert!(fixture.root.path().exists());
+    }
+
+    #[test]
+    fn manifest_validation_rejects_schema_empty_duplicate_and_protected_paths() {
+        let fixture = test_support::GuestShareFixture::new("manifest-validation");
+
+        let mut bad_schema = fixture.manifest();
+        bad_schema.schema_version = 999;
+        assert_invalid_input(
+            Namespace::from_manifest(&bad_schema),
+            "unsupported schema_version",
+        );
+
+        let empty = test_support::manifest_with_mounts(Vec::new());
+        assert_invalid_input(
+            Namespace::from_manifest(&empty),
+            "manifest must contain at least one mount",
+        );
+
+        let duplicate = test_support::manifest_with_mounts(vec![
+            test_support::dir_mount(
+                "left",
+                "/workspace",
+                &fixture.workspace,
+                AccessMode::Rw,
+                SourceClass::Workspace,
+            ),
+            test_support::dir_mount(
+                "right",
+                "/workspace",
+                &fixture.readonly,
+                AccessMode::Ro,
+                SourceClass::UserRo,
+            ),
+        ]);
+        assert_invalid_input(
+            Namespace::from_manifest(&duplicate),
+            "duplicate guest_path in manifest",
+        );
+
+        let mut protected = fixture.manifest();
+        protected.protected_guest_paths = vec!["/workspace".to_string()];
+        assert_invalid_input(
+            Namespace::from_manifest(&protected),
+            "mount targets protected guest path",
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_relative_dotdot_and_missing_sources() {
+        let fixture = test_support::GuestShareFixture::new("manifest-paths");
+
+        let relative_host = test_support::manifest_with_mounts(vec![MountSpec {
+            id: "relative-host".to_string(),
+            guest_path: "/workspace".to_string(),
+            host_path: "relative".to_string(),
+            kind: MountKind::Dir,
+            access: AccessMode::Rw,
+            source_class: SourceClass::Workspace,
+            required: true,
+            bind: true,
+            metadata: MetadataSpec {
+                uid_gid: MetadataPolicy::Host,
+                permissions: MetadataPolicy::Host,
+            },
+        }]);
+        assert_invalid_input(
+            Namespace::from_manifest(&relative_host),
+            "host_path must be absolute",
+        );
+
+        let dotdot_guest = test_support::manifest_with_mounts(vec![test_support::dir_mount(
+            "dotdot",
+            "/workspace/../escape",
+            &fixture.workspace,
+            AccessMode::Rw,
+            SourceClass::Workspace,
+        )]);
+        assert_invalid_input(
+            Namespace::from_manifest(&dotdot_guest),
+            "guest_path contains invalid component",
+        );
+
+        let missing = test_support::manifest_with_mounts(vec![test_support::dir_mount(
+            "missing",
+            "/missing",
+            &fixture.root.join("missing"),
+            AccessMode::Rw,
+            SourceClass::Workspace,
+        )]);
+        assert!(matches!(
+            Namespace::from_manifest(&missing)
+                .expect_err("missing source")
+                .kind(),
+            io::ErrorKind::NotFound
+        ));
+    }
+
+    #[test]
+    fn operation_model_sequence_matches_host_tree_for_rw_mount() {
+        let fixture = test_support::GuestShareFixture::new("operation-model-rw");
+        let fs = fixture.filesystem();
+        let mut ops = Vec::new();
+        macro_rules! step {
+            ($label:expr, $expr:expr) => {{
+                ops.push($label);
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => panic!(
+                        "operation {:?} failed: {}; sequence: {:?}",
+                        $label, error, ops
+                    ),
+                }
+            }};
+        }
+
+        let workspace = step!(
+            "lookup /workspace",
+            test_support::lookup_root(&fs, "workspace")
+        );
+        let missing = raw_error(
+            test_support::lookup(&fs, workspace.inode, "missing"),
+            "lookup missing",
+        );
+        assert_eq!(missing, Some(libc::ENOENT), "sequence: {ops:?}");
+
+        let dir_name = CString::new("model-dir").expect("dir name");
+        let dir = step!(
+            "mkdir /workspace/model-dir",
+            fs.mkdir(
+                ctx(),
+                workspace.inode,
+                dir_name.as_c_str(),
+                0o755,
+                0,
+                Extensions::default(),
+            )
+        );
+        assert!(fixture.workspace.join("model-dir").is_dir());
+
+        let file_name = CString::new("data.bin").expect("file name");
+        let (file, handle, _options) = step!(
+            "create /workspace/model-dir/data.bin",
+            fs.create(
+                ctx(),
+                dir.inode,
+                file_name.as_c_str(),
+                0o644,
+                false,
+                (libc::O_RDWR | libc::O_TRUNC) as u32,
+                0,
+                Extensions::default(),
+            )
+        );
+        let handle = handle.expect("file handle");
+        let initial = b"\0abc\xffdef";
+        let written = step!(
+            "write initial binary content",
+            fs.write(
+                ctx(),
+                file.inode,
+                handle,
+                test_support::VecReader {
+                    data: initial.to_vec()
+                },
+                initial.len() as u32,
+                0,
+                None,
+                false,
+                false,
+                0,
+            )
+        );
+        assert_eq!(written, initial.len());
+        assert_eq!(
+            fs::read(fixture.workspace.join("model-dir/data.bin")).expect("host read"),
+            initial
+        );
+
+        let mut reader = test_support::VecWriter::default();
+        let read = step!(
+            "read offset slice",
+            fs.read(ctx(), file.inode, handle, &mut reader, 4, 2, None, 0)
+        );
+        assert_eq!(read, 4);
+        assert_eq!(reader.data, b"bc\xffd");
+
+        let append = b"-tail";
+        step!(
+            "append content at explicit EOF offset",
+            fs.write(
+                ctx(),
+                file.inode,
+                handle,
+                test_support::VecReader {
+                    data: append.to_vec()
+                },
+                append.len() as u32,
+                initial.len() as u64,
+                None,
+                false,
+                false,
+                0,
+            )
+        );
+        assert_eq!(
+            fs::read(fixture.workspace.join("model-dir/data.bin")).expect("host read append"),
+            [initial.as_slice(), append.as_slice()].concat()
+        );
+
+        let mut attr = fuse::SetattrIn::default();
+        attr.size = 5;
+        step!(
+            "truncate file to five bytes",
+            fs.setattr(ctx(), file.inode, attr, None, SetattrValid::SIZE)
+        );
+        assert_eq!(
+            fs::read(fixture.workspace.join("model-dir/data.bin")).expect("host read truncate"),
+            b"\0abc\xff"
+        );
+        step!(
+            "flush writable handle",
+            fs.flush(ctx(), file.inode, handle, 0)
+        );
+        step!(
+            "fsync writable handle",
+            fs.fsync(ctx(), file.inode, false, handle)
+        );
+
+        fs::write(fixture.workspace.join("host-created.txt"), b"host-side").expect("host mutation");
+        let host_created = step!(
+            "lookup host-created file",
+            test_support::lookup(&fs, workspace.inode, "host-created.txt")
+        );
+        let (host_handle, _options) = step!(
+            "open host-created file",
+            fs.open(ctx(), host_created.inode, false, libc::O_RDONLY as u32)
+        );
+        let mut host_reader = test_support::VecWriter::default();
+        step!(
+            "read host-created file",
+            fs.read(
+                ctx(),
+                host_created.inode,
+                host_handle.expect("host handle"),
+                &mut host_reader,
+                64,
+                0,
+                None,
+                0,
+            )
+        );
+        assert_eq!(host_reader.data, b"host-side");
+
+        let mut names = Vec::new();
+        let mut iter = step!(
+            "readdir workspace",
+            fs.readdir(ctx(), workspace.inode, workspace.inode, 4096, 0)
+        );
+        while let Some(entry) = iter.next() {
+            names.push(entry.name.to_str().expect("utf8").to_string());
+        }
+        names.sort();
+        assert!(names.contains(&"host-created.txt".to_string()));
+        assert!(names.contains(&"model-dir".to_string()));
+        assert!(names.contains(&"project.txt".to_string()));
+
+        let renamed = CString::new("renamed.bin").expect("renamed");
+        step!(
+            "rename data.bin to renamed.bin",
+            fs.rename(
+                ctx(),
+                dir.inode,
+                file_name.as_c_str(),
+                dir.inode,
+                renamed.as_c_str(),
+                0,
+            )
+        );
+        assert!(!fixture.workspace.join("model-dir/data.bin").exists());
+        assert!(fixture.workspace.join("model-dir/renamed.bin").exists());
+
+        step!(
+            "unlink renamed file",
+            fs.unlink(ctx(), dir.inode, renamed.as_c_str())
+        );
+        assert!(!fixture.workspace.join("model-dir/renamed.bin").exists());
+        step!(
+            "rmdir empty model-dir",
+            fs.rmdir(ctx(), workspace.inode, dir_name.as_c_str())
+        );
+        assert!(!fixture.workspace.join("model-dir").exists());
     }
 
     #[test]

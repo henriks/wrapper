@@ -24,6 +24,9 @@ pub mod vmnet_gateway;
 pub mod vmnet_runtime;
 pub mod vmnet_stream;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub const MACHINE_MICROVM: &str = "microvm";
 pub const COMPOSED_FS_TAG: &str = "agentvm";
 pub const CONFIG_FS_TAG: &str = "agentvm-config";

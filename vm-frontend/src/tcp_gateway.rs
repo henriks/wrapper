@@ -330,6 +330,71 @@ mod tests {
     }
 
     #[test]
+    fn allow_domain_and_wildcard_domain_enable_tcp_without_ip_allow() {
+        let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
+        policy
+            .egress
+            .allow_domains
+            .push("*.example.com".to_string());
+
+        let decision = evaluate_tcp_destination(
+            &policy,
+            &TcpDestination {
+                ip: Ipv4Addr::new(93, 184, 216, 35),
+                port: 8080,
+                domain: Some("api.example.com".to_string()),
+            },
+        );
+
+        assert_eq!(decision.action, TcpAction::Connect);
+        assert_eq!(decision.reason, "generic TCP connect allowed");
+    }
+
+    #[test]
+    fn public_egress_profile_allows_public_tcp_but_still_intercepts_http() {
+        let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
+        policy.egress.default_action = EgressAction::AllowPublicInternet;
+
+        let generic = evaluate_tcp_destination(
+            &policy,
+            &TcpDestination {
+                ip: Ipv4Addr::new(93, 184, 216, 35),
+                port: 8080,
+                domain: None,
+            },
+        );
+        let http = evaluate_tcp_destination(
+            &policy,
+            &TcpDestination {
+                ip: Ipv4Addr::new(93, 184, 216, 35),
+                port: 80,
+                domain: None,
+            },
+        );
+
+        assert_eq!(generic.action, TcpAction::Connect);
+        assert_eq!(http.action, TcpAction::InterceptHttp);
+    }
+
+    #[test]
+    fn denied_range_wins_over_public_egress_profile() {
+        let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
+        policy.egress.default_action = EgressAction::AllowPublicInternet;
+
+        let decision = evaluate_tcp_destination(
+            &policy,
+            &TcpDestination {
+                ip: Ipv4Addr::new(169, 254, 169, 254),
+                port: 80,
+                domain: None,
+            },
+        );
+
+        assert_eq!(decision.action, TcpAction::Deny);
+        assert_eq!(decision.reason, "destination is in a denied range");
+    }
+
+    #[test]
     fn parses_complete_http_request_summary() {
         let request = b"GET /status?q=1 HTTP/1.1\r\nHost: example.com\r\nUser-Agent: test\r\n\r\n";
         let summary = parse_http_request(request)

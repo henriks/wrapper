@@ -263,6 +263,16 @@ mod tests {
     }
 
     #[test]
+    fn no_net_sets_explicit_deny_reason_without_published_ports() {
+        let policy = VmnetPolicy::from_cli(GuestNetwork::default(), true, Vec::new())
+            .expect("no-net policy");
+
+        assert_eq!(policy.egress.default_action, EgressAction::Deny);
+        assert_eq!(policy.egress.reason, EgressReason::NoNetFlag);
+        assert!(policy.host_listeners.is_empty());
+    }
+
+    #[test]
     fn published_ports_become_frontend_host_listeners() {
         let policy = VmnetPolicy::from_cli(
             GuestNetwork::default(),
@@ -278,5 +288,28 @@ mod tests {
             policy.host_listeners,
             vec![HostListener::published_tcp(8080, 80)]
         );
+    }
+
+    #[test]
+    fn default_deny_ranges_cover_private_metadata_loopback_and_nonunicast() {
+        let policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
+
+        for range in [
+            "0.0.0.0/8",
+            "10.0.0.0/8",
+            "100.64.0.0/10",
+            "127.0.0.0/8",
+            "169.254.0.0/16",
+            "169.254.169.254/32",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "224.0.0.0/4",
+            "240.0.0.0/4",
+        ] {
+            assert!(
+                policy.egress.deny_ranges.contains(&range.to_string()),
+                "missing deny range {range}"
+            );
+        }
     }
 }

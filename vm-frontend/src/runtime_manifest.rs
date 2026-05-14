@@ -586,6 +586,41 @@ mod tests {
     }
 
     #[test]
+    fn config_fs_mounts_expose_mitm_ca_cert_without_private_key() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join("repo")).expect("repo");
+        let ca_cert = root.join("mitm-ca.crt");
+        let ca_key = root.join("mitm-ca.key");
+        fs::write(&ca_cert, "test ca").expect("ca cert");
+        fs::write(&ca_key, "private key").expect("ca key");
+        let config = config(&root);
+        let extra = RuntimeMount {
+            id: "m0002_mitm_ca_cert".to_string(),
+            host_path: ca_cert.clone(),
+            guest_path: PathBuf::from("/mitm-ca.crt"),
+            readonly: true,
+            source_class: ManifestSourceClass::SystemRo,
+            required: true,
+            bind: false,
+        };
+
+        write_runtime_manifests_with_config_mounts(
+            &config,
+            &workspace_mounts(config.project.clone()),
+            &[extra],
+        )
+        .expect("write manifests");
+
+        let config_manifest =
+            fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
+        assert!(config_manifest.contains(&ca_cert.display().to_string()));
+        assert!(config_manifest.contains("\"access\": \"ro\""));
+        assert!(!config_manifest.contains(&ca_key.display().to_string()));
+        assert!(!config_manifest.contains("mitm-ca.key"));
+        assert!(!config_manifest.contains("private key"));
+    }
+
+    #[test]
     fn guest_runtime_mounts_add_tool_auth_docker_and_user_shares() {
         let root = unique_temp_dir();
         let project = root.join("repo");
@@ -624,6 +659,165 @@ mod tests {
         assert!(host_manifest.contains("\"source_class\": \"user-rw\""));
         assert!(host_manifest.contains(&extra_ro.display().to_string()));
         assert!(host_manifest.contains(&extra_rw.display().to_string()));
+    }
+
+    #[test]
+    fn guest_runtime_mounts_cover_copilot_state_and_gh_opt_in() {
+        let root = unique_temp_dir();
+        let project = root.join("repo");
+        let home = root.join("host-home");
+        let mounts = guest_runtime_mounts(
+            project.clone(),
+            &GuestShareSpec {
+                tool: Some(GuestTool::Copilot),
+                host_home: home.clone(),
+                gh: false,
+                extra_ro: Vec::new(),
+                extra_rw: Vec::new(),
+            },
+        );
+
+        assert!(mounts.iter().any(|mount| mount.guest_path == project));
+        for rel in [
+            ".copilot",
+            ".config/github-copilot",
+            ".cache/github-copilot",
+            ".docker",
+        ] {
+            assert!(
+                mounts.iter().any(|mount| {
+                    mount.host_path == home.join(rel)
+                        && mount.guest_path == project.join(".sandbox/home").join(rel)
+                        && !mount.readonly
+                        && mount.source_class == ManifestSourceClass::ToolState
+                }),
+                "missing copilot/tool-state mount for {rel}"
+            );
+        }
+        assert!(!mounts
+            .iter()
+            .any(|mount| mount.guest_path.ends_with(".config/gh")));
+    }
+
+    #[test]
+    fn validation_rejects_relative_dotdot_duplicate_and_missing_required_mounts() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join("repo")).expect("repo");
+        fs::create_dir_all(root.join("source")).expect("source");
+        let config = config(&root);
+
+        let cases = [
+            (
+                RuntimeMount {
+                    id: "relative-host".to_string(),
+                    host_path: PathBuf::from("relative"),
+                    guest_path: PathBuf::from("/guest"),
+                    readonly: false,
+                    source_class: ManifestSourceClass::UserRw,
+                    required: true,
+                    bind: true,
+                },
+                "host_path must be absolute",
+            ),
+            (
+                RuntimeMount {
+                    id: "dotdot-guest".to_string(),
+                    host_path: root.join("source"),
+                    guest_path: PathBuf::from("/guest/../escape"),
+                    readonly: false,
+                    source_class: ManifestSourceClass::UserRw,
+                    required: true,
+                    bind: true,
+                },
+                "guest_path must not contain . or ..",
+            ),
+            (
+                RuntimeMount {
+                    id: "missing-required".to_string(),
+                    host_path: root.join("missing"),
+                    guest_path: PathBuf::from("/missing"),
+                    readonly: false,
+                    source_class: ManifestSourceClass::UserRw,
+                    required: true,
+                    bind: true,
+                },
+                "required composed filesystem source is missing",
+            ),
+        ];
+
+        for (mount, expected) in cases {
+            let error = write_runtime_manifests(&config, &[mount]).expect_err(expected);
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got {error}"
+            );
+        }
+
+        let duplicate_id = RuntimeMount {
+            id: "dup".to_string(),
+            host_path: root.join("source"),
+            guest_path: PathBuf::from("/one"),
+            readonly: false,
+            source_class: ManifestSourceClass::UserRw,
+            required: true,
+            bind: true,
+        };
+        let error = write_runtime_manifests(&config, &[duplicate_id.clone(), duplicate_id])
+            .expect_err("duplicate id");
+        assert!(error.to_string().contains("duplicate mount id"));
+        let duplicate_guest_left = RuntimeMount {
+            id: "dup1".to_string(),
+            host_path: root.join("source"),
+            guest_path: PathBuf::from("/one"),
+            readonly: false,
+            source_class: ManifestSourceClass::UserRw,
+            required: true,
+            bind: true,
+        };
+        let duplicate_guest_right = RuntimeMount {
+            id: "dup2".to_string(),
+            host_path: root.join("source"),
+            guest_path: PathBuf::from("/one"),
+            readonly: false,
+            source_class: ManifestSourceClass::UserRw,
+            required: true,
+            bind: true,
+        };
+        let error =
+            write_runtime_manifests(&config, &[duplicate_guest_left, duplicate_guest_right])
+                .expect_err("duplicate guest path");
+        assert!(error
+            .to_string()
+            .contains("duplicate composed filesystem guest path"));
+    }
+
+    #[test]
+    fn optional_missing_mounts_are_skipped_without_bind_entries() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join("repo")).expect("repo");
+        let config = config(&root);
+        let optional = RuntimeMount {
+            id: "optional".to_string(),
+            host_path: root.join("missing-optional"),
+            guest_path: PathBuf::from("/optional"),
+            readonly: true,
+            source_class: ManifestSourceClass::UserRo,
+            required: false,
+            bind: true,
+        };
+
+        write_runtime_manifests(
+            &config,
+            &[RuntimeMount::workspace(config.project.clone()), optional],
+        )
+        .expect("write manifests");
+
+        let host_manifest =
+            fs::read_to_string(&config.runtime.composed_fs_manifest).expect("host manifest");
+        let bind_manifest =
+            fs::read_to_string(&config.runtime.composed_bind_manifest).expect("bind manifest");
+        assert!(!host_manifest.contains("/optional"));
+        assert!(!bind_manifest.contains("/optional"));
     }
 
     #[test]

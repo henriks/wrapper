@@ -78,6 +78,13 @@ impl<'a> VmnetGateway<'a> {
             };
         }
 
+        if let Some(unsupported) = unsupported_protocol_from_frame(self.policy, &frame) {
+            return GuestFrameResult {
+                outcome: GuestFrameOutcome::UnsupportedProtocol(unsupported),
+                guest_frames: Vec::new(),
+            };
+        }
+
         if let Some((destination, decision)) = evaluate_tcp_syn_frame(self.policy, &frame) {
             if decision.action == TcpAction::Deny {
                 let guest_frames = tcp_reset_for_denied_syn(&frame).into_iter().collect();
@@ -164,9 +171,20 @@ impl<'a> VmnetGateway<'a> {
         data: &[u8],
         now: Instant,
     ) -> Result<Vec<Vec<u8>>, smoltcp::socket::tcp::SendError> {
-        self.tcp_core.send_to_session(handle, data)?;
+        let _ = self.tcp_core.send_to_session(handle, data)?;
         self.tcp_core.poll(now, &mut self.tcp_device);
         Ok(self.drain_tcp_frames())
+    }
+
+    pub fn send_tcp_session_partial(
+        &mut self,
+        handle: smoltcp::iface::SocketHandle,
+        data: &[u8],
+        now: Instant,
+    ) -> Result<(usize, Vec<Vec<u8>>), smoltcp::socket::tcp::SendError> {
+        let written = self.tcp_core.send_to_session(handle, data)?;
+        self.tcp_core.poll(now, &mut self.tcp_device);
+        Ok((written, self.drain_tcp_frames()))
     }
 
     pub fn close_tcp_session(
@@ -225,6 +243,7 @@ pub enum GuestFrameOutcome {
         log: DnsLogEntry,
     },
     UdpDenied(UdpDenial),
+    UnsupportedProtocol(UnsupportedProtocol),
     TcpAccepted {
         destination: TcpDestination,
         decision: TcpDecision,
@@ -247,6 +266,11 @@ pub struct UdpDenial {
     pub dst_ip: [u8; 4],
     pub src_port: u16,
     pub dst_port: u16,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedProtocol {
     pub reason: String,
 }
 
@@ -367,6 +391,68 @@ fn udp_denial_from_frame(policy: &VmnetPolicy, frame: &[u8]) -> Option<UdpDenial
         dst_port: udp.dst_port,
         reason,
     })
+}
+
+fn unsupported_protocol_from_frame(
+    policy: &VmnetPolicy,
+    frame: &[u8],
+) -> Option<UnsupportedProtocol> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    match ethertype {
+        0x0806 => None,
+        0x86dd => Some(UnsupportedProtocol {
+            reason: format!("IPv6 {:?} by policy", policy.protocols.ipv6),
+        }),
+        0x0800 => unsupported_ipv4_protocol_from_frame(policy, frame),
+        other => Some(UnsupportedProtocol {
+            reason: format!(
+                "ethertype 0x{other:04x} {:?} by policy",
+                policy.protocols.ethernet.unknown_ethertypes
+            ),
+        }),
+    }
+}
+
+fn unsupported_ipv4_protocol_from_frame(
+    policy: &VmnetPolicy,
+    frame: &[u8],
+) -> Option<UnsupportedProtocol> {
+    let ip = &frame[14..];
+    if ip.len() < 20 || ip[0] >> 4 != 4 {
+        return Some(UnsupportedProtocol {
+            reason: "malformed IPv4 denied by policy".to_string(),
+        });
+    }
+    let ihl = usize::from(ip[0] & 0x0f) * 4;
+    let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+    if ihl < 20 || total_len < ihl || ip.len() < total_len {
+        return Some(UnsupportedProtocol {
+            reason: "malformed IPv4 denied by policy".to_string(),
+        });
+    }
+    match ip[9] {
+        6 => None,
+        17 => {
+            if parse_udp_frame(frame).is_some() {
+                Some(UnsupportedProtocol {
+                    reason: "UDP forwarding is not implemented".to_string(),
+                })
+            } else {
+                Some(UnsupportedProtocol {
+                    reason: "malformed UDP denied by policy".to_string(),
+                })
+            }
+        }
+        protocol => Some(UnsupportedProtocol {
+            reason: format!(
+                "IPv4 protocol {protocol} {:?} by policy",
+                policy.protocols.ipv4.unknown_protocols
+            ),
+        }),
+    }
 }
 
 struct UdpFrame {
@@ -597,6 +683,85 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_udp_is_denied_by_default_with_diagnostic_reason() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+
+        let result = gateway.handle_guest_frame(
+            udp_frame(53000, 1234, GUEST_IP, PUBLIC_IP, b"not dns"),
+            Instant::from_millis(1),
+        );
+
+        let GuestFrameOutcome::UdpDenied(denial) = result.outcome else {
+            panic!("expected UDP denial");
+        };
+        assert_eq!(denial.dst_port, 1234);
+        assert_eq!(denial.reason, "unsupported UDP denied by default");
+        assert!(result.guest_frames.is_empty());
+    }
+
+    #[test]
+    fn public_egress_does_not_implement_non_quic_udp_forwarding() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        policy.protocols.udp.default_action =
+            crate::network_policy::EgressAction::AllowPublicInternet;
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+
+        let result = gateway.handle_guest_frame(
+            udp_frame(53000, 1234, GUEST_IP, PUBLIC_IP, b"allowed udp"),
+            Instant::from_millis(1),
+        );
+
+        let GuestFrameOutcome::UnsupportedProtocol(unsupported) = result.outcome else {
+            panic!("expected unsupported UDP outcome");
+        };
+        assert_eq!(unsupported.reason, "UDP forwarding is not implemented");
+        assert!(result.guest_frames.is_empty());
+    }
+
+    #[test]
+    fn unsupported_ipv6_unknown_ethertype_and_unknown_ipv4_protocol_are_ignored() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+
+        for frame in [
+            ipv6_frame(),
+            unknown_ethertype_frame(),
+            unknown_ipv4_protocol_frame(132),
+        ] {
+            let result = gateway.handle_guest_frame(frame, Instant::from_millis(1));
+            assert!(matches!(
+                result.outcome,
+                GuestFrameOutcome::UnsupportedProtocol(_)
+            ));
+            assert!(result.guest_frames.is_empty());
+        }
+    }
+
+    #[test]
+    fn malformed_udp_lengths_are_ignored_without_policy_decision() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+
+        let result = gateway.handle_guest_frame(malformed_udp_frame(), Instant::from_millis(1));
+
+        let GuestFrameOutcome::UnsupportedProtocol(unsupported) = result.outcome else {
+            panic!("expected unsupported malformed UDP outcome");
+        };
+        assert_eq!(unsupported.reason, "malformed UDP denied by policy");
+        assert!(result.guest_frames.is_empty());
+    }
+
+    #[test]
     fn denied_syn_fails_closed_before_tcp_core() {
         let network = GuestNetwork::default();
         let policy = VmnetPolicy::default_sandbox(network.clone());
@@ -714,6 +879,54 @@ mod tests {
         frame.extend_from_slice(GUEST_MAC.as_bytes());
         frame.extend_from_slice(&0x0800_u16.to_be_bytes());
         frame.extend_from_slice(&ipv4);
+        frame
+    }
+
+    fn ipv6_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+        frame.extend_from_slice(GUEST_MAC.as_bytes());
+        frame.extend_from_slice(&0x86dd_u16.to_be_bytes());
+        frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 0, 59, 64]);
+        frame.extend_from_slice(&[0; 32]);
+        frame
+    }
+
+    fn unknown_ethertype_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+        frame.extend_from_slice(GUEST_MAC.as_bytes());
+        frame.extend_from_slice(&0x88b5_u16.to_be_bytes());
+        frame.extend_from_slice(b"unknown");
+        frame
+    }
+
+    fn unknown_ipv4_protocol_frame(protocol: u8) -> Vec<u8> {
+        let mut ipv4 = Vec::new();
+        ipv4.push(0x45);
+        ipv4.push(0);
+        ipv4.extend_from_slice(&20_u16.to_be_bytes());
+        ipv4.extend_from_slice(&0_u16.to_be_bytes());
+        ipv4.extend_from_slice(&0_u16.to_be_bytes());
+        ipv4.push(64);
+        ipv4.push(protocol);
+        ipv4.extend_from_slice(&0_u16.to_be_bytes());
+        ipv4.extend_from_slice(&GUEST_IP.octets());
+        ipv4.extend_from_slice(&PUBLIC_IP.octets());
+        let checksum = ipv4_checksum(&ipv4);
+        ipv4[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+        frame.extend_from_slice(GUEST_MAC.as_bytes());
+        frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+        frame.extend_from_slice(&ipv4);
+        frame
+    }
+
+    fn malformed_udp_frame() -> Vec<u8> {
+        let mut frame = udp_frame(53000, 1234, GUEST_IP, PUBLIC_IP, b"short");
+        frame[38..40].copy_from_slice(&4_u16.to_be_bytes());
         frame
     }
 
