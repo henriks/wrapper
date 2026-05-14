@@ -1,7 +1,7 @@
 # Docker Appliance Build
 
-This directory contains the build assets for the immutable Docker appliance VM
-used by `sandbox-wrap --docker`.
+This directory contains the build assets for the immutable appliance VM used by
+the Rust VM-only frontend.
 
 The current build target is a genuinely smaller Alpine-based guest rather than
 the earlier Debian-based appliance. The goal is to keep the VM small and quick
@@ -35,12 +35,17 @@ The build downloads Alpine `minirootfs`, configures `apk` repositories for the
 selected Alpine branch, and installs only the packages needed for the guest:
 
 - `docker-engine`
+- `docker-cli`
 - `linux-virt`
 - `mkinitfs`
 - `python3`
 - `e2fsprogs`
 - `iproute2`
 - `util-linux`
+- `bubblewrap`
+- `nodejs`
+- `npm`
+- pinned upstream `mise`
 
 This intentionally excludes guest-side Docker CLI plugins like buildx and
 compose.
@@ -72,13 +77,14 @@ automating the lookup against Alpine's official package indexes.
 The guest boots with `init=/usr/local/sbin/agentvm-init`. That init:
 
 - mounts the Docker data disk at `/var/lib/docker`
-- mounts the `virtio-fs` workspace share at the original absolute project path
-  seen by the sandboxed Docker client and keeps `/workspace` as a compatibility
-  alias
-- configures the guest NIC for QEMU user-mode networking
+- mounts the Rust composed-fs workspace/config shares at the original absolute
+  project path and keeps `/workspace` as a compatibility alias
+- configures the guest NIC for the Rust userspace vmnet gateway
 - starts `dockerd`
 - starts `docker/guest-socket-bridge.py` to forward a guest TCP port to
   `/var/run/docker.sock`
+- starts `docker/guest-payload-server.py` so the host frontend can launch the
+  requested payload inside the guest
 
 Persistent Docker state belongs only on the separate sparse Docker data disk.
 The rootfs stays read-only at runtime.

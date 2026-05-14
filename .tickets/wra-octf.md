@@ -1,6 +1,6 @@
 ---
 id: wra-octf
-status: open
+status: closed
 deps: []
 links: [wra-oszw]
 created: 2026-05-13T10:19:15Z
@@ -21,3 +21,9 @@ Initial direction: treat Rust as the process supervisor/frontend for QEMU and an
 
 A Rust frontend design is documented; implementation tickets cover process supervision, QEMU command construction, composed filesystem integration, runtime state/logging, readiness/control paths, and the described network features; dependencies reflect implementation order; tickets explicitly document outcomes so investigation work is not repeated. The plan should avoid duplicate legacy implementations and should identify what Python sandbox-wrap code will be retired or temporarily bridged.
 
+
+## Notes
+
+**2026-05-14T18:15:48Z**
+
+Epic completion: the Rust frontend now owns the VM process lifecycle, embedded composed-fs serving, runtime manifest/config sharing, QEMU microvm command construction, QEMU stream networking, userspace vmnet policy/enforcement, host ingress listeners for Docker/payload/published ports, payload execution/control, shutdown behavior, VM-only wrapper mode, and the KVM self-test. The old Python/Python-managed frontend path has been retired rather than preserved as a duplicate implementation. Remaining future work should be tracked as specific Rust frontend enhancements rather than as this bootstrap epic.

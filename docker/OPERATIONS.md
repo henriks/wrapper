@@ -1,146 +1,150 @@
-# Docker VM Operations
+# VM Operations
 
-This document describes the current VM-backed Docker behavior implemented in
-`sandbox-wrap`.
+This document describes the current VM-only runtime operated by the Rust
+`agentvm-frontend` binary.
 
 ## Summary
 
-- `--docker` means VM-backed Docker only.
-- The wrapper starts a project-local QEMU VM before launching `bwrap`.
-- The sandbox sees only the project-local Docker socket at
-  `/run/docker.sock` and `/var/run/docker.sock`.
-- Outbound guest networking uses QEMU user-mode networking, so no `sudo`,
-  TAP, `iptables`, or `nft` setup is required.
-- `--docker-publish HOST:GUEST` exposes a guest TCP port on
-  `127.0.0.1:HOST` through QEMU `hostfwd`.
-- The wrapper shuts the VM down when the sandbox exits.
-- Persistent Docker state lives in `.sandbox/docker-vm/docker-data.raw`.
+- The agent payload always runs inside a project-scoped QEMU microvm.
+- Docker runs inside the same guest and is available at
+  `unix:///var/run/docker.sock`.
+- The host does not run the payload under Bubblewrap.
+- Filesystem sharing is served by embedded Rust composed-fs instances.
+- Guest networking is enforced by the Rust userspace vmnet gateway over QEMU
+  `-netdev stream`, not by QEMU user networking or `hostfwd`.
+- Persistent state is project-local under `.sandbox/`.
 
 ## Host Prerequisites
 
 Required on the host:
 
-- Linux
-- `bwrap`
-- `mise`
+- Linux with `/dev/kvm`
 - `qemu-system-x86_64`
-- `virtiofsd`
 - `mkfs.ext4`
-- `/dev/kvm`
+- Rust/Cargo for local development runs
 
-The appliance artifacts must also exist under `docker/out/`. Build them with:
+The appliance artifacts must exist under `docker/out/`. Build them with:
 
-```bash
+```sh
 docker/refresh-pins.sh
 sudo docker/build-appliance.sh
 ```
 
 ## Runtime Layout
 
-The project-local runtime lives under:
-
 ```text
-.sandbox/docker-vm/
-```
-
-Files:
-
-```text
-.sandbox/docker-vm/
-  docker-data.raw
-  docker-data.meta.json
-  lock
-  run/
-    state.json
-    docker.sock
-    virtiofs.sock
-    qemu.pid
-    virtiofsd.pid
-    qemu.log
-    virtiofsd.log
+.sandbox/
+  home/
+  docker-vm/
+    docker-data.raw
+    lock
+    run/
+      state.json
+      console.log
+      qemu.log
+      vmnet-events.log
+      guest-dockerd.log
+      guest-socket-bridge.log
+      guest-payload-server.log
+      docker.sock
+      virtiofs.sock
+      guest-config.sock
+      composed-fs-manifest.json
+      config-fs-manifest.json
+      guest-config/composed-binds.json
 ```
 
 Meaning:
 
-- `docker-data.raw` is the persistent sparse ext4 disk mounted inside the
-  guest at `/var/lib/docker`.
-- `docker-data.meta.json` records the disk metadata written by the launcher.
-- `lock` prevents more than one active `--docker` sandbox for the same
-  project.
-- `run/` is transient runtime state for the current sandbox process.
+- `.sandbox/home/` is the persistent guest `$HOME`.
+- `docker-data.raw` is the persistent sparse ext4 disk mounted at
+  `/var/lib/docker`.
+- `lock` prevents concurrent VM launches for the same project.
+- `run/` contains the current launch's manifests, sockets, state, and logs.
 
 ## Lifecycle
 
 Normal flow:
 
-1. `sandbox-wrap --docker` acquires the project lock.
-2. It creates `.sandbox/docker-vm/run/`.
-3. It starts `virtiofsd`.
-4. It starts QEMU from `docker/out/artifact-manifest.json`.
-5. QEMU exposes `.sandbox/docker-vm/run/docker.sock` as a host Unix socket
-   that forwards to the guest Docker bridge.
-6. The wrapper waits for Docker `GET /_ping` to succeed through that socket.
-7. If `--docker-publish` was used, the same QEMU user-network backend exposes
-   those forwarded TCP ports on `127.0.0.1`.
-8. It launches `bwrap` as a child process.
-9. When the sandbox exits, the wrapper terminates the VM and helper processes
-   and removes `.sandbox/docker-vm/run/`.
+1. The Rust frontend resolves the project, tool, policy, and guest shares.
+2. It acquires `.sandbox/docker-vm/lock`.
+3. It creates `.sandbox/home/`, `.sandbox/docker-vm/`, and the selected
+   run directory.
+4. It creates and formats `docker-data.raw` on first use.
+5. It writes composed-fs and config-fs manifests.
+6. It starts embedded composed-fs servers for workspace/config sharing.
+7. It starts the Rust vmnet gateway and any requested host listeners.
+8. It starts QEMU with microvm, read-only rootfs, Docker data disk,
+   virtio-fs devices, and stream networking.
+9. It waits for the guest payload control path.
+10. It launches the requested payload in the guest.
+11. It forwards stdio, signals, terminal resize events, and guest exit status.
+12. It terminates QEMU and releases the project lock.
 
-Failure flow:
-
-- If startup fails, the wrapper leaves `.sandbox/docker-vm/run/` and the log
-  files in place for inspection.
-- The next `--docker` launch removes that stale `run/` directory before
-  retrying.
+Failed launches leave `run/` logs and manifests available for inspection.
 
 ## Networking
 
-The Docker VM always has a QEMU user-network NIC because that is also how the
-host Docker socket is exposed into the guest.
+The guest NIC connects to the Rust vmnet gateway through QEMU stream frames.
 
-- With normal `--docker`, outbound guest networking is enabled.
-- With `--docker --no-net`, the VM still boots with the same internal NIC and
-  Docker socket forward, but guest egress is restricted by QEMU user-network.
-- `--docker-publish HOST:GUEST` adds extra QEMU `hostfwd` rules. These are not
-  available with `--no-net`.
+- Direct `launch` can use `--allow-public-internet` for public egress.
+- Wrapper mode enables public egress unless `--no-net` is supplied.
+- `--no-net` denies guest egress while preserving frontend control listeners.
+- `--docker-publish HOST:GUEST` maps to frontend `--publish HOST:GUEST`.
+- Published ports are implemented by frontend-owned loopback listeners.
 
-## Reset Behavior
+## Reset
 
-`--reset` removes the full `.sandbox/` directory, including:
+`--reset` removes `.sandbox/`, including guest home and Docker state, unless
+the project VM lock is currently held.
 
-- `.sandbox/docker-vm/docker-data.raw`
-- `.sandbox/docker-vm/docker-data.meta.json`
-- `.sandbox/docker-vm/run/`
+## Verification
 
-Safety rule:
+Non-KVM checks:
 
-- If `.sandbox/docker-vm/lock` is currently held by an active Docker sandbox,
-  `--reset` fails instead of removing active VM state.
+```sh
+cargo test --manifest-path vm-frontend/Cargo.toml --offline
+```
+
+KVM self-test:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  self-test \
+  --project "$PWD" \
+  --run-dir "$PWD/.sandbox/docker-vm/self-test" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64 \
+  --publish-payload-port 12079
+```
+
+Expected output includes:
+
+```text
+self-test: published payload port 12079 ok
+self-test: payload-start
+docker-run-ok
+bind-ok
+self-test: payload-ok
+self-test: ok
+```
 
 ## Troubleshooting
 
-Common failures:
+Inspect:
 
-- `Missing required Docker VM host tools: qemu-system-x86_64, virtiofsd`
-  Install the missing host binaries before using `--docker`.
-- `/dev/kvm is required for Docker VM support`
-  KVM is not available on the host.
-- `Docker VM manifest is missing the vm stanza`
-  Rebuild the appliance with `docker/build-appliance.sh`.
-- `Docker VM manifest is missing guest.docker_tcp_port`
-  Rebuild the appliance with `docker/build-appliance.sh`.
-- Docker startup timeout
-  Inspect:
-  - `.sandbox/docker-vm/run/qemu.log`
-  - `.sandbox/docker-vm/run/virtiofsd.log`
-  - `.sandbox/docker-vm/run/state.json`
-- Registry pull or container egress failures
-  Inspect `.sandbox/docker-vm/run/qemu.log` and the guest logs mirrored into
-  the workspace under `.sandbox/docker-vm/run/guest-*.log`.
+- `.sandbox/docker-vm/run/state.json`
+- `.sandbox/docker-vm/run/qemu.log`
+- `.sandbox/docker-vm/run/console.log`
+- `.sandbox/docker-vm/run/vmnet-events.log`
+- `.sandbox/docker-vm/run/guest-dockerd.log`
+- `.sandbox/docker-vm/run/guest-socket-bridge.log`
+- `.sandbox/docker-vm/run/guest-payload-server.log`
 
-Manual cleanup:
+Common causes:
 
-- If no Docker sandbox is active for the project, `--reset` is the supported
-  cleanup path.
-- If you need to inspect a failed launch before resetting, preserve
-  `.sandbox/docker-vm/run/` and read the logs there.
+- Missing `/dev/kvm`: run on a KVM-capable Linux host.
+- Missing appliance artifacts: rebuild with `sudo docker/build-appliance.sh`.
+- Docker pull failures: inspect `vmnet-events.log` and guest Docker logs.
+- Concurrent launch: wait for the active VM process or use `--reset` only
+  after the lock is released.

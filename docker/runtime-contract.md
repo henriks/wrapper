@@ -1,7 +1,6 @@
 # Sandbox VM Runtime Contract
 
-This document defines the target runtime contract for the VM-only rewrite of
-`sandbox-wrap`.
+This document defines the runtime contract for the VM-only Rust frontend.
 
 It supersedes the earlier "host Bubblewrap sandbox plus guest Docker VM" model.
 The supported end state is one isolation boundary only: the project-scoped VM.
@@ -16,7 +15,7 @@ The supported end state is one isolation boundary only: the project-scoped VM.
 - Persistent Docker state is limited to the sparse data disk under
   `.sandbox/docker-vm/`.
 - Persistent tool state is project-local under `.sandbox/`.
-- v1 of the rewrite supports Linux hosts with KVM, QEMU, and `virtiofsd`.
+- v1 supports Linux hosts with KVM, QEMU, and `mkfs.ext4`.
 
 ## Host And Guest Responsibilities
 
@@ -26,9 +25,10 @@ The host wrapper is only responsible for:
 
 - resolving the project and selected tool
 - preparing `.sandbox/` state and project-local runtime directories
-- starting `virtiofsd`
+- starting embedded composed-fs servers
 - starting QEMU
-- exposing any configured localhost port forwards
+- starting the userspace vmnet gateway
+- exposing any configured localhost listeners
 - passing the requested payload command into the guest
 - wiring stdio, signals, and exit status between host and guest
 - supervising the VM lifetime and tearing it down on exit
@@ -59,7 +59,8 @@ the old host-side Bubblewrap model.
 - `--project PATH`
 - `--tool codex|copilot`
 - `--no-net`
-- `--docker-publish HOST:GUEST`
+- `--docker-publish HOST:GUEST` in wrapper mode, mapped to frontend
+  `--publish HOST:GUEST`
 - `--ro PATH`
 - `--rw PATH`
 - `--gh`
@@ -108,19 +109,21 @@ Layout:
   home/
   docker-vm/
     docker-data.raw
-    docker-data.meta.json
     lock
     run/
       state.json
       docker.sock
       virtiofs.sock
-      qemu.pid
-      virtiofsd.pid
-      proxy.pid
       qemu.log
-      virtiofsd.log
-      proxy.log
       console.log
+      vmnet-events.log
+      guest-dockerd.log
+      guest-socket-bridge.log
+      guest-payload-server.log
+      guest-config.sock
+      composed-fs-manifest.json
+      config-fs-manifest.json
+      guest-config/composed-binds.json
 ```
 
 Rules:
@@ -128,8 +131,7 @@ Rules:
 - `.sandbox/home/` is the persistent guest home for the selected tool.
 - `.sandbox/docker-vm/docker-data.raw` is the persistent sparse disk mounted in
   the guest at `/var/lib/docker`.
-- `.sandbox/docker-vm/run/` is transient per-launch runtime state.
-- A clean exit removes `.sandbox/docker-vm/run/` completely.
+- `.sandbox/docker-vm/run/` is per-launch runtime and diagnostic state.
 - `--reset` removes the entire `.sandbox/` tree, including guest home, Docker
   data, and all runtime logs, unless an active lock is held.
 
@@ -179,8 +181,8 @@ Transitions:
 
 - `absent -> starting`: wrapper acquires the lock, removes stale runtime files,
   creates a new runtime directory, and starts helper processes
-- `starting -> running`: QEMU, `virtiofsd`, guest init, and `dockerd` are up,
-  and the payload launch channel is ready
+- `starting -> running`: QEMU, embedded composed-fs, vmnet, guest init, and
+  `dockerd` are up, and the payload launch channel is ready
 - `running -> payload_running`: the wrapper asks the guest to launch the
   requested command
 - `payload_running -> stopping`: the payload exits or the host wrapper receives
@@ -197,14 +199,14 @@ Required sequence:
 2. Ensure `.sandbox/`, `.sandbox/home/`, and `.sandbox/docker-vm/` exist.
 3. Acquire an exclusive non-blocking lock on `.sandbox/docker-vm/lock`.
 4. Remove stale `.sandbox/docker-vm/run/` from a previous failed or aborted run.
-5. Ensure `docker-data.raw` and `docker-data.meta.json` exist.
+5. Ensure `docker-data.raw` exists and is formatted.
 6. Create `.sandbox/docker-vm/run/`.
-7. Start `virtiofsd`.
+7. Start embedded composed-fs servers for workspace and config sharing.
 8. Start QEMU with:
    - read-only root disk
    - persistent Docker data disk
    - `virtio-fs` workspace sharing
-   - user-mode networking
+   - QEMU stream networking
    - the guest control path needed to launch the payload
    - any requested localhost port forwards
 9. Wait for guest init and `dockerd` readiness.
@@ -233,7 +235,7 @@ runtime contract only requires the behavior above.
 The VM is considered ready for payload launch only when all of these are true:
 
 - QEMU is alive
-- `virtiofsd` is alive
+- embedded composed-fs servers are alive
 - required guest mounts are in place
 - `dockerd` is ready inside the guest
 - the payload launch/control path is ready
@@ -254,15 +256,13 @@ Required order:
 
 1. Mark `state.json` as `stopping`.
 2. Stop or interrupt the guest payload if it is still active.
-3. Terminate QEMU, `virtiofsd`, and any host-side helper process that remains
-   necessary in the VM-only design.
+3. Terminate QEMU and mark frontend helper loops as shutting down.
 4. Wait up to the configured timeout before force-killing remaining processes.
 5. Remove transient files under `.sandbox/docker-vm/run/`.
 6. Release the project lock.
 
-Clean exit removes `.sandbox/docker-vm/run/` entirely.
-
-Failed startup leaves logs in place until the next launch or `--reset`.
+Launch logs remain under `.sandbox/docker-vm/run/` for inspection until the
+next launch overwrites them or `--reset` removes `.sandbox/`.
 
 ## Concurrency And Reset Rules
 

@@ -619,6 +619,10 @@ struct SelfTestConfig {
 }
 
 fn run_self_test(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_self_test_usage();
+        return Ok(());
+    }
     let self_test = self_test_config_from_args(args)?;
     let config = FrontendConfig::from_artifact_manifest_file(
         self_test.project.clone(),
@@ -702,7 +706,9 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "--project" => config.project = absolute_cli_path(&value(args, &mut index, "--project")?)?,
+            "--project" => {
+                config.project = absolute_cli_path(&value(args, &mut index, "--project")?)?
+            }
             "--run-dir" => config.run_dir = PathBuf::from(value(args, &mut index, "--run-dir")?),
             "--artifact-manifest" => {
                 config.artifact_manifest =
@@ -1713,6 +1719,59 @@ mod tests {
             .expect_err("pass env"),
             "--pass-env has been removed; use explicit VM guest shares/auth options instead"
         );
+    }
+
+    #[test]
+    fn parses_self_test_config_defaults_and_options() {
+        let root = frontend_test_root();
+        let config = self_test_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/self-test")
+                .display()
+                .to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--qemu".to_string(),
+            "/usr/bin/qemu-system-x86_64".to_string(),
+            "--image".to_string(),
+            "alpine:3.22".to_string(),
+            "--publish-payload-port".to_string(),
+            "12079".to_string(),
+            "--tool".to_string(),
+            "copilot".to_string(),
+        ])
+        .expect("self-test config");
+
+        assert_eq!(config.project, root.join("repo"));
+        assert_eq!(config.run_dir, root.join(".sandbox/docker-vm/self-test"));
+        assert_eq!(config.image, "alpine:3.22");
+        assert_eq!(config.publish_payload_port, Some(12079));
+        assert_eq!(config.tool, GuestTool::Copilot);
+    }
+
+    #[test]
+    fn self_test_payload_covers_workspace_docker_and_bind_mount() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(&config, "alpine:3.22");
+
+        assert!(script.contains("self-test: payload-start"));
+        assert!(script.contains(".agentvm-self-test-workspace"));
+        assert!(script.contains("docker info"));
+        assert!(script.contains("docker run --rm -v \"$PWD:/work:ro\" alpine:3.22"));
+        assert!(script.contains(".agentvm-self-test-bind"));
+        assert!(script.contains("self-test: payload-ok"));
     }
 
     #[test]

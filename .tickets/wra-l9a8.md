@@ -1,6 +1,6 @@
 ---
 id: wra-l9a8
-status: open
+status: closed
 deps: [wra-snm9, wra-l6ed]
 links: []
 created: 2026-04-01T21:17:14Z
@@ -53,3 +53,7 @@ Docs follow-up from the contract correction: the steady-state docs should presen
 **2026-04-02T07:06:26Z**
 
 Implementation follow-up from wra-mkh8: docs will need to explain the new guest-share model explicitly. In the VM-only path, host-backed inputs are no longer described as Bubblewrap binds; they are provided through supplemental virtio-fs shares, including arbitrary --ro/--rw paths at the same guest path.
+
+**2026-05-14T18:14:08Z**
+
+Updated the main docs for the implemented VM-only Rust model. Rewrote requirements.md around agentvm-frontend/codex-wrap/copilot-wrap Rust invocation, supported VM-era flags, removed flags, project-local state, guest shares, payload environment, Rust vmnet networking, and verification. Rewrote docker/OPERATIONS.md to describe embedded composed-fs, QEMU stream vmnet, Rust-owned lifecycle, current runtime layout, reset, self-test, and troubleshooting. Updated docker/runtime-contract.md to remove stale virtiofsd/QEMU user networking/docker-data.meta assumptions and align startup/readiness/shutdown with the Rust frontend. Updated docker/README.md to describe the current appliance contents and guest init services. Updated vm-frontend/README.md with the one-command KVM self-test and non-KVM cargo test coverage. Verification: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed after the docs/self-test updates; grep of the main docs shows no remaining positive references to the old Bubblewrap or QEMU user-networking model.

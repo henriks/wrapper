@@ -56,6 +56,26 @@ events so blocked destinations fail closed without hanging guest connects.
 Real VM validation status and the KVM-host smoke procedure are documented in
 `vmnet-runtime-validation.md`.
 
+Run the KVM-required VM-only self-test:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  self-test \
+  --project "$PWD" \
+  --run-dir "$PWD/.sandbox/docker-vm/self-test" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64 \
+  --publish-payload-port 12079
+```
+
+This boots the real microvm path, verifies the guest payload control channel,
+checks optional host-published guest access by pinging the payload service
+through `--publish-payload-port`, runs a trivial payload inside the guest,
+checks `$HOME` and workspace sharing, verifies `dockerd` with `docker version`
+and `docker info`, then runs `docker run --rm -v "$PWD:/work:ro" alpine:3.22`
+and reads a workspace file from inside that container. The image is pulled into
+the project-local Docker data disk if it is not already present.
+
 Prepare manifests and print the Rust stream QEMU command:
 
 ```sh
@@ -102,3 +122,7 @@ Validate:
 ```sh
 cargo test --manifest-path vm-frontend/Cargo.toml --offline
 ```
+
+The unit suite is the non-KVM coverage for command parsing, wrapper flag
+translation, manifest generation, network policy, payload framing, and self-test
+script construction.

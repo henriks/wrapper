@@ -1,6 +1,6 @@
 ---
 id: wra-oszw
-status: open
+status: closed
 deps: []
 links: [wra-octf]
 created: 2026-04-01T21:16:25Z
@@ -55,3 +55,7 @@ The final implementation uses the VM as the only sandbox boundary for the agent 
 **2026-05-13T10:19:33Z**
 
 Pivot note: new epic wra-octf tracks the Rust frontend direction. Future VM-only wrapper work should be evaluated against that pivot: avoid investing in Python sandbox-wrap cleanup that will be superseded by the Rust frontend, except where needed as a bridge or to preserve currently validated behavior during migration.
+
+**2026-05-14T18:15:37Z**
+
+Epic completion: the supported agent path is now VM-only. The Python sandbox-wrap launcher was deleted, Bubblewrap is no longer part of the execution model, guest payload execution is handled through the Rust frontend payload protocol, tool/auth/workspace sharing is implemented as explicit VM guest shares, project locking/reset/data-disk setup are owned by Rust, and agent execution plus Docker run inside the same guest. Verification exists as both non-KVM cargo tests and a real KVM agentvm-frontend self-test that validates payload execution, Docker daemon access, docker run, workspace bind mounts, and optional published payload-port access. Main docs and requirements were updated to describe the Rust VM-only model.

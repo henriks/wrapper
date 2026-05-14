@@ -1,6 +1,6 @@
 ---
 id: wra-1ro6
-status: in_progress
+status: closed
 deps: []
 links: []
 created: 2026-04-02T12:13:22Z
@@ -51,3 +51,7 @@ Success criteria for the investigation phase: produce a short reproduction recip
 **2026-04-02T19:00:09Z**
 
 New hypothesis from user: the mounted ~/.codex directory may be the interference vector. Current code to verify: TOOLS["codex"]["host_home_mounts"] includes .codex, and DockerVmManager.build_guest_shares() maps host ~/.codex into the guest HOME under <project>/.sandbox/home/.codex as a read-write virtio-fs share. If the outer Codex session and wrapped guest Codex both rely on the same host ~/.codex state concurrently, that is a concrete shared mutable surface worth isolating in the repro matrix.
+
+**2026-05-14T18:15:18Z**
+
+Resolved by the Rust-only launcher pivot rather than by preserving the old Python path. The original high-signal hazards were: active sessions executing a mutable working-tree sandbox-wrap, helper subprocesses launched from that mutable Python file, and ambiguous same-project VM overlap. The current implementation deletes the Python sandbox-wrap, moves launcher execution into vm-frontend, holds a project-scoped flock at .sandbox/docker-vm/lock for the VM lifetime, rejects same-project concurrent launches clearly, and provides wrapper mode through the Rust binary/argv0 instead of a mutable Python helper. Live self-test and direct launch validation show no lingering QEMU after payload exit. Remaining shared surfaces are explicit VM-era guest shares (for example --gh, --aws, ~/.docker, and selected tool state as implemented by wra-eh7c), not implicit Bubblewrap/home replay. If future interference appears, it should be tracked as a new Rust guest-share/auth-state bug with a concrete reproducer; the old self-hosted Python wrapper failure mode no longer exists.
