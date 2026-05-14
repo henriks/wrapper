@@ -235,8 +235,11 @@ fn parse_ipv4(value: &str) -> Option<[u8; 4]> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use hickory_proto::op::{Message, Query, ResponseCode};
-    use hickory_proto::rr::{Name, RecordType};
+    use hickory_proto::rr::rdata::{AAAA, CNAME};
+    use hickory_proto::rr::{Name, RData, Record, RecordType};
 
     use super::*;
     use crate::{network_policy::VmnetPolicy, GuestNetwork};
@@ -252,6 +255,35 @@ mod tests {
         }
     }
 
+    struct RecordingUpstream {
+        calls: RefCell<Vec<(String, RecordType)>>,
+        response: Message,
+    }
+
+    impl RecordingUpstream {
+        fn new(response: Message) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                response,
+            }
+        }
+    }
+
+    impl DnsUpstream for RecordingUpstream {
+        fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
+            let question = query.queries.first().expect("question");
+            self.calls.borrow_mut().push((
+                question
+                    .name()
+                    .to_ascii()
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase(),
+                question.query_type(),
+            ));
+            Ok(self.response.clone())
+        }
+    }
+
     fn policy_allowing(domain: &str) -> VmnetPolicy {
         let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
         policy.egress.allow_domains.push(domain.to_string());
@@ -259,21 +291,43 @@ mod tests {
     }
 
     fn query(domain: &str) -> Vec<u8> {
+        query_with_type(domain, RecordType::A)
+    }
+
+    fn query_with_type(domain: &str, record_type: RecordType) -> Vec<u8> {
         let mut message = Message::query();
         message.metadata.id = 0x1234;
         message.add_query(Query::query(
             Name::from_ascii(domain).expect("query name"),
+            record_type,
+        ));
+        message.to_vec().expect("serialize query")
+    }
+
+    fn multi_question_query() -> Vec<u8> {
+        let mut message = Message::query();
+        message.metadata.id = 0x5678;
+        message.add_query(Query::query(
+            Name::from_ascii("one.example").expect("query name"),
             RecordType::A,
+        ));
+        message.add_query(Query::query(
+            Name::from_ascii("two.example").expect("query name"),
+            RecordType::AAAA,
         ));
         message.to_vec().expect("serialize query")
     }
 
     fn empty_success_response(id: u16, domain: &str) -> Message {
+        response_with_query(id, domain, RecordType::A)
+    }
+
+    fn response_with_query(id: u16, domain: &str, record_type: RecordType) -> Message {
         let mut message = Message::response(id, hickory_proto::op::OpCode::Query);
         message.metadata.recursion_available = true;
         message.add_query(Query::query(
             Name::from_ascii(domain).expect("query name"),
-            RecordType::A,
+            record_type,
         ));
         message
     }
@@ -327,6 +381,18 @@ mod tests {
     }
 
     #[test]
+    fn blocked_domain_does_not_call_upstream() {
+        let policy = policy_allowing("allowed.example");
+        let upstream = RecordingUpstream::new(empty_success_response(0x1234, "blocked.example"));
+        let proxy = DnsProxy::new(&policy, &upstream);
+
+        let result = proxy.handle_udp_payload(&query("blocked.example"));
+
+        assert_eq!(result.log.decision, DnsDecision::Blocked);
+        assert!(upstream.calls.borrow().is_empty());
+    }
+
+    #[test]
     fn wildcard_allow_matches_subdomains() {
         let policy = policy_allowing("*.example.com");
         let proxy = DnsProxy::new(
@@ -339,6 +405,57 @@ mod tests {
         let result = proxy.handle_udp_payload(&query("api.example.com"));
 
         assert_eq!(result.log.decision, DnsDecision::Allowed);
+    }
+
+    #[test]
+    fn forwards_repeated_allowed_queries_without_cache_or_coalescing() {
+        let policy = policy_allowing("example.com");
+        let upstream = RecordingUpstream::new(empty_success_response(0x1234, "example.com"));
+        let proxy = DnsProxy::new(&policy, &upstream);
+
+        let first = proxy.handle_udp_payload(&query("example.com"));
+        let second = proxy.handle_udp_payload(&query("EXAMPLE.com."));
+
+        assert_eq!(first.log.decision, DnsDecision::Allowed);
+        assert_eq!(second.log.decision, DnsDecision::Allowed);
+        assert_eq!(
+            *upstream.calls.borrow(),
+            vec![
+                ("example.com".to_string(), RecordType::A),
+                ("example.com".to_string(), RecordType::A),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_upstream_cname_and_aaaa_answers() {
+        let policy = policy_allowing("*.example.com");
+        let mut response = response_with_query(0x1234, "api.example.com", RecordType::AAAA);
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("api.example.com").expect("answer name"),
+            60,
+            RData::CNAME(CNAME(Name::from_ascii("edge.example.com").expect("cname"))),
+        ));
+        response.add_answer(Record::from_rdata(
+            Name::from_ascii("edge.example.com").expect("edge name"),
+            60,
+            RData::AAAA(AAAA::new(0x2606, 0x2800, 0x0220, 0x0001, 0, 0, 0, 0x0025)),
+        ));
+        let upstream = RecordingUpstream::new(response);
+        let proxy = DnsProxy::new(&policy, &upstream);
+
+        let result =
+            proxy.handle_udp_payload(&query_with_type("api.example.com", RecordType::AAAA));
+        let response = Message::from_vec(&result.response.expect("response")).expect("parse");
+
+        assert_eq!(result.log.decision, DnsDecision::Allowed);
+        assert_eq!(response.answers.len(), 2);
+        assert_eq!(response.answers[0].record_type(), RecordType::CNAME);
+        assert_eq!(response.answers[1].record_type(), RecordType::AAAA);
+        assert_eq!(
+            *upstream.calls.borrow(),
+            vec![("api.example.com".to_string(), RecordType::AAAA)]
+        );
     }
 
     #[test]
@@ -355,6 +472,26 @@ mod tests {
 
         assert_eq!(result.response, None);
         assert_eq!(result.log.decision, DnsDecision::Malformed);
+    }
+
+    #[test]
+    fn multi_question_query_returns_formerr_without_upstream_call() {
+        let policy = policy_allowing("*.example");
+        let upstream = RecordingUpstream::new(empty_success_response(0x5678, "one.example"));
+        let proxy = DnsProxy::new(&policy, &upstream);
+
+        let result = proxy.handle_udp_payload(&multi_question_query());
+        let response =
+            Message::from_vec(&result.response.expect("formerr response")).expect("parse");
+
+        assert_eq!(result.log.decision, DnsDecision::Malformed);
+        assert_eq!(
+            result.log.detail,
+            "expected exactly one DNS question".to_string()
+        );
+        assert_eq!(response.metadata.id, 0x5678);
+        assert_eq!(response.metadata.response_code, ResponseCode::FormErr);
+        assert!(upstream.calls.borrow().is_empty());
     }
 
     #[test]

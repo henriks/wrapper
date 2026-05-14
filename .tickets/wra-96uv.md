@@ -24,3 +24,11 @@ Stress tests exist behind an explicit command/filter so they do not slow normal 
 **2026-05-14T19:36:34Z**
 
 wra-czl0 added a large fragmented guest-side TLS MITM regression and fixed plaintext streaming under rustls backpressure. Stress coverage should extend this with repeated large HTTP/HTTPS responses, adversarial TLS chunk sizes, and real proxy success paths against live or more robust TLS peers.
+
+**2026-05-14T19:38:53Z**
+
+wra-0452 added deterministic model-style filesystem operation sequences. Stress/fuzz work should extend this pattern with generated operation sequences, seeds in failure output, deep trees, large files, repeated host mutation, and concurrent lookup/write/unlink churn.
+
+**2026-05-14T19:46:30Z**
+
+composed-fs now has deterministic protocol-boundary tests for handle lifecycle and distinct-offset concurrent writes. Stress/fuzz coverage should still vary operation interleavings over lookup/forget/open/release/rename/unlink/readdir and include raw virtiofs/FUSE request corruption once a byte-level harness exists.

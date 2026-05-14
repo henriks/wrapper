@@ -1,6 +1,6 @@
 ---
 id: wra-jwaz
-status: open
+status: closed
 deps: [wra-s8nn]
 links: []
 created: 2026-05-14T18:42:32Z
@@ -24,3 +24,7 @@ Fast tests cover wrapper/runtime sharing behavior and ensure no redundant legacy
 **2026-05-14T18:59:53Z**
 
 Filesystem manifest validation now asserts guest config FS exposes the MITM CA certificate but not the private key, and runtime_manifest tests cover Copilot state dirs, Docker state, gh opt-in behavior, optional missing mounts, and explicit ro/rw path invariants. Wrapper contract tests should build on these invariants rather than rechecking raw manifest validation.
+
+**2026-05-14T19:43:03Z**
+
+Added fast wrapper/runtime contract coverage in vm-frontend/src/main.rs for guest payload environment defaults (HOME/XDG/PATH/Docker/host secret deny defaults/CA env), Copilot wrapper launch defaults including public egress and VM-side npm install command composition, absolute runtime manifest path behavior, removed legacy wrapper flags, and project-scoped --reset removal of .sandbox guest-home/runtime state. Offline coverage relies on runtime_manifest tests for cert-only guest config FS and private-key host-only guarantees; full in-guest verification remains with live KVM tests.

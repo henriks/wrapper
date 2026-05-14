@@ -1,6 +1,6 @@
 ---
 id: wra-9udq
-status: open
+status: in_progress
 deps: [wra-czl0, wra-bc6k, wra-jwaz, wra-1joy]
 links: []
 created: 2026-05-14T18:42:44Z
@@ -24,3 +24,15 @@ A live KVM test command validates representative network and filesystem behavior
 **2026-05-14T19:36:34Z**
 
 wra-czl0 covers proxy HTTPS failure paths and large guest-side MITM record integrity in-process, but not a fully synthetic TcpProxyBridge HTTPS success path with a memory upstream TLS server. Live KVM tests should continue to validate real HTTPS MITM success against public/local HTTPS endpoints and npm-like large responses.
+
+**2026-05-14T19:43:06Z**
+
+Runtime/wrapper contract fast tests now cover host-side composition of guest HOME/XDG/env, wrapper tool defaults, public egress CA bootstrap input, and reset semantics. Live VM tests should still assert the composed contract from inside the guest: CA bundle path is readable, CA private key is absent, tool state dirs persist in .sandbox/home, Docker socket path works when listener is enabled, and reset removes persisted guest state before the next boot.
+
+**2026-05-14T19:49:32Z**
+
+DNS and host-ingress now have in-process coverage. Live KVM tests should still validate published ports from a real host TCP client into the guest, Docker listener behavior against the guest Docker socket path, payload-control forwarding, and DNS behavior as observed from the guest resolver rather than direct frame/proxy calls.
+
+**2026-05-14T19:51:18Z**
+
+Expanded agentvm-frontend self-test setup so live self-test now generates and wires a project MITM CA by default, injects guest CA env, and runs a broader in-guest payload script. The payload now verifies /run/agentvm-config/mitm-ca.crt exists, the CA private key is absent from guest config FS, /run/agentvm-ca-bundle.pem and Node/npm CA env are present, config FS rejects writes, HOME-backed tool state can be written/read, guest DNS lookup works when network is allowed, workspace writes are visible, Docker CLI works, and Docker bind-mounted workspace reads host files. Not run live here because /dev/kvm is unavailable inside this sandbox; run agentvm-frontend self-test on the host to validate the real appliance.

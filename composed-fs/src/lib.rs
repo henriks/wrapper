@@ -1356,13 +1356,18 @@ impl FileSystem for ComposedFs {
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
         let mut handles = self.handles.write().expect("handle table lock poisoned");
+        let file_inode = handles
+            .files
+            .get(&handle)
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
+            .inode;
+        if file_inode != inode {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
         let file = handles
             .files
             .remove(&handle)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
-        if file.inode != inode {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
+            .expect("handle was checked before removal");
         if flush && file.writable {
             file.file.sync_all()?;
         }
@@ -2153,6 +2158,7 @@ mod test_support;
 mod tests {
     use super::*;
     use std::os::unix::fs::FileExt;
+    use std::thread;
     use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 
     struct TestDir {
@@ -2244,6 +2250,24 @@ mod tests {
             Ok(_) => panic!("{label} succeeded unexpectedly"),
             Err(error) => error.raw_os_error(),
         }
+    }
+
+    fn lookup_count(fs: &ComposedFs, inode: u64) -> u64 {
+        fs.namespace
+            .read()
+            .expect("namespace lock")
+            .nodes
+            .get(&inode)
+            .expect("inode")
+            .lookup_count
+    }
+
+    fn dir_names(mut iter: VecDirIter) -> Vec<String> {
+        let mut names = Vec::new();
+        while let Some(entry) = iter.next() {
+            names.push(entry.name.to_str().expect("utf8").to_string());
+        }
+        names
     }
 
     fn assert_invalid_input<T>(result: io::Result<T>, message: &str) {
@@ -2614,6 +2638,154 @@ mod tests {
             fs.rmdir(ctx(), workspace.inode, dir_name.as_c_str())
         );
         assert!(!fixture.workspace.join("model-dir").exists());
+    }
+
+    #[test]
+    fn operation_model_error_sequence_covers_ro_system_and_boundaries() {
+        let fixture = test_support::GuestShareFixture::new("operation-model-errors");
+        let fs = fixture.filesystem();
+        let mut ops = Vec::new();
+        macro_rules! step {
+            ($label:expr, $expr:expr) => {{
+                ops.push($label);
+                match $expr {
+                    Ok(value) => value,
+                    Err(error) => panic!(
+                        "operation {:?} failed: {}; sequence: {:?}",
+                        $label, error, ops
+                    ),
+                }
+            }};
+        }
+        macro_rules! expect_errno {
+            ($label:expr, $expr:expr, $errno:expr) => {{
+                ops.push($label);
+                match $expr {
+                    Ok(_) => panic!(
+                        "operation {:?} succeeded unexpectedly; sequence: {:?}",
+                        $label, ops
+                    ),
+                    Err(error) => assert_eq!(
+                        error.raw_os_error(),
+                        Some($errno),
+                        "operation {:?}; sequence: {:?}; error: {}",
+                        $label,
+                        ops,
+                        error
+                    ),
+                }
+            }};
+        }
+
+        let workspace = step!(
+            "lookup /workspace",
+            test_support::lookup_root(&fs, "workspace")
+        );
+        let readonly = step!(
+            "lookup /readonly",
+            test_support::lookup_root(&fs, "readonly")
+        );
+        let run = step!("lookup /run", test_support::lookup_root(&fs, "run"));
+        let config = step!(
+            "lookup /run/agentvm-config",
+            test_support::lookup(&fs, run.inode, "agentvm-config")
+        );
+
+        let blocked = CString::new("blocked.txt").expect("blocked");
+        expect_errno!(
+            "create in user readonly mount",
+            fs.create(
+                ctx(),
+                readonly.inode,
+                blocked.as_c_str(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            ),
+            libc::EROFS
+        );
+        expect_errno!(
+            "create in system config mount",
+            fs.create(
+                ctx(),
+                config.inode,
+                blocked.as_c_str(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            ),
+            libc::EROFS
+        );
+        expect_errno!(
+            "open directory as file",
+            fs.open(ctx(), workspace.inode, false, libc::O_RDONLY as u32),
+            libc::EISDIR
+        );
+        expect_errno!(
+            "unsafe lookup component",
+            test_support::lookup(&fs, workspace.inode, ".."),
+            libc::ENOENT
+        );
+
+        let project = step!(
+            "lookup project.txt",
+            test_support::lookup(&fs, workspace.inode, "project.txt")
+        );
+        let moved = CString::new("moved.txt").expect("moved");
+        let project_name = CString::new("project.txt").expect("project");
+        expect_errno!(
+            "cross-mount link into readonly",
+            fs.link(ctx(), project.inode, readonly.inode, moved.as_c_str()),
+            libc::EXDEV
+        );
+        expect_errno!(
+            "cross-mount rename into readonly",
+            fs.rename(
+                ctx(),
+                workspace.inode,
+                project_name.as_c_str(),
+                readonly.inode,
+                moved.as_c_str(),
+                0,
+            ),
+            libc::EXDEV
+        );
+
+        let nonempty = CString::new("nonempty").expect("nonempty");
+        let child = CString::new("child").expect("child");
+        let dir = step!(
+            "mkdir nonempty",
+            fs.mkdir(
+                ctx(),
+                workspace.inode,
+                nonempty.as_c_str(),
+                0o755,
+                0,
+                Extensions::default(),
+            )
+        );
+        step!(
+            "create child in nonempty",
+            fs.create(
+                ctx(),
+                dir.inode,
+                child.as_c_str(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+        );
+        expect_errno!(
+            "rmdir nonempty directory",
+            fs.rmdir(ctx(), workspace.inode, nonempty.as_c_str()),
+            libc::ENOTEMPTY
+        );
     }
 
     #[test]
@@ -3216,6 +3388,300 @@ mod tests {
         fs.read(ctx(), file.inode, handle, &mut reader, 64, 0, None, 0)
             .expect("read after unlink");
         assert_eq!(reader.data, b"still here");
+    }
+
+    #[test]
+    fn lookup_forget_counts_saturate_and_reject_malformed_components() {
+        let test_dir = TestDir::new("lookup-forget");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        assert_eq!(
+            raw_error(lookup(&fs, workspace.inode, "."), "lookup dot"),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            raw_error(
+                lookup(&fs, workspace.inode, "nested/path"),
+                "lookup slash component"
+            ),
+            Some(libc::ENOENT)
+        );
+
+        let first = lookup(&fs, workspace.inode, "file").expect("first lookup");
+        let second = lookup(&fs, workspace.inode, "file").expect("second lookup");
+        assert_eq!(first.inode, second.inode);
+        assert_eq!(lookup_count(&fs, first.inode), 2);
+        let root_lookup_count = lookup_count(&fs, ROOT_ID);
+
+        fs.forget(ctx(), first.inode, 1);
+        assert_eq!(lookup_count(&fs, first.inode), 1);
+        fs.batch_forget(ctx(), vec![(first.inode, 99), (ROOT_ID, 99)]);
+        assert_eq!(lookup_count(&fs, first.inode), 0);
+        assert_eq!(lookup_count(&fs, ROOT_ID), root_lookup_count);
+    }
+
+    #[test]
+    fn release_with_wrong_inode_does_not_consume_valid_handle() {
+        let test_dir = TestDir::new("release-wrong-inode");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("left"), b"left-data").expect("write left");
+        fs::write(root.join("right"), b"right-data").expect("write right");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let left = lookup(&fs, workspace.inode, "left").expect("lookup left");
+        let right = lookup(&fs, workspace.inode, "right").expect("lookup right");
+        let (handle, _options) = fs
+            .open(ctx(), left.inode, false, libc::O_RDONLY as u32)
+            .expect("open left");
+        let handle = handle.expect("handle");
+
+        assert_eq!(
+            raw_error(
+                fs.release(ctx(), right.inode, 0, handle, false, false, None),
+                "mismatched release",
+            ),
+            Some(libc::EBADF)
+        );
+
+        let mut reader = VecWriter::default();
+        fs.read(ctx(), left.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("handle remains valid after rejected release");
+        assert_eq!(reader.data, b"left-data");
+        fs.release(ctx(), left.inode, 0, handle, false, false, None)
+            .expect("correct release");
+        assert_eq!(
+            raw_error(
+                fs.read(
+                    ctx(),
+                    left.inode,
+                    handle,
+                    &mut VecWriter::default(),
+                    64,
+                    0,
+                    None,
+                    0
+                ),
+                "read released handle",
+            ),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn open_handle_survives_rename_for_writes() {
+        let test_dir = TestDir::new("open-rename");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"hello").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let (handle, _options) = fs
+            .open(ctx(), file.inode, false, libc::O_RDWR as u32)
+            .expect("open file");
+        let handle = handle.expect("handle");
+        let old_name = CString::new("file").expect("old");
+        let new_name = CString::new("renamed").expect("new");
+
+        fs.rename(
+            ctx(),
+            workspace.inode,
+            old_name.as_c_str(),
+            workspace.inode,
+            new_name.as_c_str(),
+            0,
+        )
+        .expect("rename while open");
+        fs.write(
+            ctx(),
+            file.inode,
+            handle,
+            VecReader {
+                data: b" after".to_vec(),
+            },
+            6,
+            5,
+            None,
+            false,
+            false,
+            0,
+        )
+        .expect("write through renamed handle");
+        fs.release(ctx(), file.inode, 0, handle, true, false, None)
+            .expect("release");
+
+        assert!(!root.join("file").exists());
+        assert_eq!(
+            fs::read(root.join("renamed")).expect("renamed contents"),
+            b"hello after"
+        );
+    }
+
+    #[test]
+    fn concurrent_distinct_offset_writes_share_handle_safely() {
+        let test_dir = TestDir::new("concurrent-writes");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let block = 32usize;
+        let writers = 8usize;
+        fs::write(root.join("file"), vec![0; block * writers]).expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = std::sync::Arc::new(ComposedFs::new(namespace));
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let (handle, _options) = fs
+            .open(ctx(), file.inode, false, libc::O_RDWR as u32)
+            .expect("open file");
+        let handle = handle.expect("handle");
+
+        let threads = (0..writers)
+            .map(|index| {
+                let fs = std::sync::Arc::clone(&fs);
+                let inode = file.inode;
+                thread::spawn(move || {
+                    let data = vec![b'a' + index as u8; block];
+                    fs.write(
+                        ctx(),
+                        inode,
+                        handle,
+                        VecReader { data },
+                        block as u32,
+                        (index * block) as u64,
+                        None,
+                        false,
+                        false,
+                        0,
+                    )
+                    .expect("thread write");
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("writer thread");
+        }
+        fs.fsync(ctx(), file.inode, false, handle).expect("fsync");
+
+        let mut reader = VecWriter::default();
+        fs.read(
+            ctx(),
+            file.inode,
+            handle,
+            &mut reader,
+            (block * writers) as u32,
+            0,
+            None,
+            0,
+        )
+        .expect("read merged writes");
+        for index in 0..writers {
+            assert_eq!(
+                &reader.data[index * block..(index + 1) * block],
+                vec![b'a' + index as u8; block].as_slice()
+            );
+        }
+        fs.release(ctx(), file.inode, 0, handle, true, false, None)
+            .expect("release");
+    }
+
+    #[test]
+    fn readdir_iterator_is_snapshot_when_directory_mutates() {
+        let test_dir = TestDir::new("readdir-mutate");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("a"), b"a").expect("write a");
+        fs::write(root.join("b"), b"b").expect("write b");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let mut iter = fs
+            .readdir(ctx(), workspace.inode, workspace.inode, 4096, 0)
+            .expect("readdir snapshot");
+        let first = iter.next().expect("first entry").name.to_bytes().to_vec();
+
+        fs::remove_file(root.join("b")).expect("remove b");
+        fs::write(root.join("c"), b"c").expect("write c");
+
+        let remaining = dir_names(iter);
+        assert_eq!(first, b"a");
+        assert_eq!(remaining, vec!["b".to_string()]);
+
+        let fresh = dir_names(
+            fs.readdir(ctx(), workspace.inode, workspace.inode, 4096, 0)
+                .expect("fresh readdir"),
+        );
+        assert_eq!(fresh, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn unsupported_device_mknod_fails_without_creating_host_node() {
+        let test_dir = TestDir::new("unsupported-mknod");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let name = CString::new("device").expect("device");
+
+        assert_eq!(
+            raw_error(
+                fs.mknod(
+                    ctx(),
+                    workspace.inode,
+                    name.as_c_str(),
+                    libc::S_IFCHR | 0o600,
+                    0,
+                    0,
+                    Extensions::default(),
+                ),
+                "char device mknod",
+            ),
+            Some(libc::EPERM)
+        );
+        assert!(!root.join("device").exists());
     }
 
     #[test]

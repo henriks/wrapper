@@ -743,6 +743,10 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         tool: Some(self_test.tool),
         ..PolicyArgs::default()
     };
+    let ca = ensure_wrapper_mitm_ca(&self_test.project)?;
+    policy_args.tls_ca_cert = Some(ca.cert);
+    policy_args.tls_ca_key = Some(ca.key);
+    policy_args.tls_generate_per_host_certs = true;
     if let Some(host_port) = self_test.publish_payload_port {
         policy_args
             .host_listeners
@@ -753,6 +757,10 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
     guest_env.insert(
         "AGENTVM_SELF_TEST_PROJECT".to_string(),
         config.project.display().to_string(),
+    );
+    guest_env.insert(
+        "AGENTVM_SELF_TEST_NETWORK".to_string(),
+        if self_test.no_net { "deny" } else { "allow" }.to_string(),
     );
     let mut policy = policy_from_args(config.network.clone(), policy_args);
     let _lock = ProjectLock::acquire(&config)?;
@@ -868,6 +876,16 @@ fn self_test_payload_script(config: &FrontendConfig, image: &str) -> String {
         ),
         "test -d \"$HOME\"".to_string(),
         "test \"$PWD\" = \"$AGENTVM_SELF_TEST_PROJECT\"".to_string(),
+        "test -f /run/agentvm-config/mitm-ca.crt".to_string(),
+        "test ! -e /run/agentvm-config/mitm-ca.key".to_string(),
+        "test -f /run/agentvm-ca-bundle.pem".to_string(),
+        "test \"${NODE_EXTRA_CA_CERTS:-}\" = /run/agentvm-ca-bundle.pem".to_string(),
+        "test \"${NPM_CONFIG_CAFILE:-}\" = /run/agentvm-ca-bundle.pem".to_string(),
+        "if touch /run/agentvm-config/agentvm-self-test-ro 2>/tmp/agentvm-config-ro.err; then echo config-fs-write-unexpected; exit 1; fi".to_string(),
+        "mkdir -p \"$HOME/.codex\"".to_string(),
+        "printf state-ok > \"$HOME/.codex/agentvm-self-test-state\"".to_string(),
+        "test \"$(cat \"$HOME/.codex/agentvm-self-test-state\")\" = state-ok".to_string(),
+        "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = allow ]; then node -e 'const dns = require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) throw err; });'; fi".to_string(),
         "printf workspace-ok > .agentvm-self-test-workspace".to_string(),
         "test \"$(cat .agentvm-self-test-workspace)\" = workspace-ok".to_string(),
         "printf bind-ok > .agentvm-self-test-bind".to_string(),
@@ -1845,6 +1863,62 @@ mod tests {
     }
 
     #[test]
+    fn payload_env_sets_home_xdg_docker_and_host_secret_defaults() {
+        let root = frontend_test_root();
+        let (config, policy) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/run").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--tool".to_string(),
+            "copilot".to_string(),
+            "--tls-ca-cert".to_string(),
+            root.join("repo/.sandbox/docker-vm/ca/mitm-ca.crt")
+                .display()
+                .to_string(),
+        ])
+        .expect("config");
+
+        let env = guest_payload_env(&config, &policy).expect("env");
+        let guest_home = root.join("repo/.sandbox/home").display().to_string();
+
+        assert_eq!(env.get("HOME"), Some(&guest_home));
+        assert_eq!(
+            env.get("XDG_CACHE_HOME"),
+            Some(&format!("{guest_home}/.cache"))
+        );
+        assert_eq!(
+            env.get("XDG_CONFIG_HOME"),
+            Some(&format!("{guest_home}/.config"))
+        );
+        assert_eq!(
+            env.get("DOCKER_HOST").map(String::as_str),
+            Some("unix:///var/run/docker.sock")
+        );
+        assert_eq!(env.get("SSH_AUTH_SOCK").map(String::as_str), Some(""));
+        assert_eq!(
+            env.get("GIT_CONFIG_GLOBAL").map(String::as_str),
+            Some("/dev/null")
+        );
+        assert_eq!(
+            env.get("AWS_SHARED_CREDENTIALS_FILE").map(String::as_str),
+            Some("/dev/null")
+        );
+        assert!(env
+            .get("PATH")
+            .expect("PATH")
+            .starts_with(&format!("{guest_home}/.local/share/mise/shims:")));
+        assert_eq!(
+            env.get("NODE_EXTRA_CA_CERTS").map(String::as_str),
+            Some("/run/agentvm-ca-bundle.pem")
+        );
+    }
+
+    #[test]
     fn wrapper_args_translate_to_launch_args() {
         let args = parse_wrapper_args(
             "codex-wrap",
@@ -1892,6 +1966,45 @@ mod tests {
     }
 
     #[test]
+    fn copilot_wrapper_defaults_to_vm_tool_install_and_public_egress() {
+        let root = frontend_test_root();
+        let args = parse_wrapper_args(
+            "copilot-wrap",
+            &[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+                "--artifact-manifest".to_string(),
+                root.join("docker/out/artifact-manifest.json")
+                    .display()
+                    .to_string(),
+                "--".to_string(),
+                "suggest".to_string(),
+            ],
+        )
+        .expect("wrapper args");
+
+        assert!(args.tls_bootstrap);
+        assert!(args
+            .launch_args
+            .contains(&"--allow-public-internet".to_string()));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "copilot"));
+        let (config, policy) = frontend_config_from_args(&args.launch_args).expect("config");
+        let payload = launch_payload_args(&config, &policy)
+            .expect("payload")
+            .expect("tool payload");
+        assert!(payload
+            .script
+            .contains("npm install --global @github/copilot@latest"));
+        assert!(payload
+            .script
+            .contains("github-copilot-cli --allow-all --no-auto-update suggest"));
+        assert_eq!(payload.cwd, root.join("repo").display().to_string());
+    }
+
+    #[test]
     fn wrapper_mitm_ca_is_generated_and_loadable() {
         let root = frontend_test_root();
         let paths = ensure_wrapper_mitm_ca(&root.join("repo")).expect("ca");
@@ -1931,6 +2044,23 @@ mod tests {
             root.join("repo/.sandbox/docker-vm/run/guest-config/composed-binds.json")
         );
         assert!(config.runtime.composed_bind_manifest.is_absolute());
+    }
+
+    #[test]
+    fn reset_project_removes_project_local_sandbox_state() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let codex_state = project.join(".sandbox/home/.codex/auth.json");
+        let runtime_state = project.join(".sandbox/docker-vm/run/state.json");
+        std::fs::create_dir_all(codex_state.parent().expect("codex parent")).expect("codex dir");
+        std::fs::create_dir_all(runtime_state.parent().expect("runtime parent"))
+            .expect("runtime dir");
+        std::fs::write(&codex_state, "{}").expect("codex state");
+        std::fs::write(&runtime_state, "{}").expect("runtime state");
+
+        reset_project(&project).expect("reset");
+
+        assert!(!project.join(".sandbox").exists());
     }
 
     #[test]
@@ -1995,6 +2125,13 @@ mod tests {
         let script = self_test_payload_script(&config, "alpine:3.22");
 
         assert!(script.contains("self-test: payload-start"));
+        assert!(script.contains("/run/agentvm-config/mitm-ca.crt"));
+        assert!(script.contains("test ! -e /run/agentvm-config/mitm-ca.key"));
+        assert!(script.contains("NODE_EXTRA_CA_CERTS"));
+        assert!(script.contains("NPM_CONFIG_CAFILE"));
+        assert!(script.contains("agentvm-config-ro"));
+        assert!(script.contains("agentvm-self-test-state"));
+        assert!(script.contains("dns.lookup"));
         assert!(script.contains(".agentvm-self-test-workspace"));
         assert!(script.contains("docker info"));
         assert!(script.contains("docker run --rm -v \"$PWD:/work:ro\" alpine:3.22"));

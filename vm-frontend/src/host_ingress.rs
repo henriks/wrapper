@@ -79,6 +79,14 @@ impl HostIngressListenerSet {
     pub fn is_empty(&self) -> bool {
         self.listeners.is_empty()
     }
+
+    #[cfg(test)]
+    fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+        self.listeners
+            .iter()
+            .map(|listener| listener.listener.local_addr())
+            .collect()
+    }
 }
 
 impl<C> HostIngressBridge<C> {
@@ -506,6 +514,157 @@ mod tests {
         assert!(bridge.session_connection(open.handle).is_none());
     }
 
+    #[test]
+    fn multiple_host_sessions_allocate_distinct_guest_side_ports() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = HostIngressBridge::new();
+
+        let first = bridge
+            .open_session(
+                &mut gateway,
+                1075,
+                MemoryConnection::new(vec![]),
+                Instant::from_millis(1),
+            )
+            .expect("first open");
+        let second = bridge
+            .open_session(
+                &mut gateway,
+                8080,
+                MemoryConnection::new(vec![]),
+                Instant::from_millis(2),
+            )
+            .expect("second open");
+
+        assert_eq!(first.local_port, DEFAULT_HOST_INGRESS_FIRST_LOCAL_PORT);
+        assert_eq!(second.local_port, DEFAULT_HOST_INGRESS_FIRST_LOCAL_PORT + 1);
+        assert_ne!(first.handle, second.handle);
+        assert_eq!(first.guest_port, 1075);
+        assert_eq!(second.guest_port, 8080);
+        assert_eq!(gateway.host_ingress_sessions().len(), 2);
+    }
+
+    #[test]
+    fn host_read_failure_closes_guest_session_and_removes_bridge_session() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = HostIngressBridge::new();
+
+        let open = bridge
+            .open_session(
+                &mut gateway,
+                1075,
+                FailingReadConnection,
+                Instant::from_millis(1),
+            )
+            .expect("open");
+        complete_guest_accept(&mut gateway, &open);
+
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(4));
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostIngressEvent::HostReadFailed { handle, .. } if *handle == open.handle
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostIngressEvent::HostClosed {
+                    handle,
+                    guest_port: 1075,
+                    ..
+                } if *handle == open.handle
+            )
+        }));
+        assert!(bridge.session_connection(open.handle).is_none());
+    }
+
+    #[test]
+    fn host_write_failure_closes_guest_session_and_removes_bridge_session() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = HostIngressBridge::new();
+
+        let open = bridge
+            .open_session(
+                &mut gateway,
+                1075,
+                FailingWriteConnection,
+                Instant::from_millis(1),
+            )
+            .expect("open");
+        let gateway_ack = complete_guest_accept(&mut gateway, &open);
+        gateway.handle_guest_frame(
+            tcp_frame(
+                1075,
+                open.local_port,
+                TcpControl::Psh,
+                TcpSeqNumber(201),
+                Some(gateway_ack),
+                b"guest payload",
+            ),
+            Instant::from_millis(4),
+        );
+
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostIngressEvent::HostWriteFailed { handle, .. } if *handle == open.handle
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                HostIngressEvent::HostClosed {
+                    handle,
+                    guest_port: 1075,
+                    ..
+                } if *handle == open.handle
+            )
+        }));
+        assert!(bridge.session_connection(open.handle).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires loopback TCP bind/connect outside the command sandbox"]
+    fn listener_set_accepts_each_configured_listener_with_purpose() {
+        let configs = vec![
+            HostListener::docker_api(0, 1075),
+            HostListener::payload_control(0, 1076),
+            HostListener::published_tcp(0, 8080),
+        ];
+        let listeners = HostIngressListenerSet::bind(&configs).expect("bind listeners");
+        let addrs = listeners.local_addrs().expect("local addrs");
+        for addr in addrs {
+            let _stream = TcpStream::connect(addr).expect("connect listener");
+        }
+
+        let accepted = listeners
+            .accept_pending()
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("accepted");
+
+        assert_eq!(accepted.len(), 3);
+        assert_eq!(accepted[0].guest_port, 1075);
+        assert_eq!(accepted[0].purpose, HostListenerPurpose::DockerApi);
+        assert_eq!(accepted[1].guest_port, 1076);
+        assert_eq!(accepted[1].purpose, HostListenerPurpose::PayloadControl);
+        assert_eq!(accepted[2].guest_port, 8080);
+        assert_eq!(accepted[2].purpose, HostListenerPurpose::PublishedTcp);
+    }
+
     #[derive(Debug)]
     struct MemoryConnection {
         reads: VecDeque<Vec<u8>>,
@@ -541,6 +700,63 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[derive(Debug)]
+    struct FailingReadConnection;
+
+    impl Read for FailingReadConnection {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::ConnectionReset))
+        }
+    }
+
+    impl Write for FailingReadConnection {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingWriteConnection;
+
+    impl Read for FailingWriteConnection {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::WouldBlock))
+        }
+    }
+
+    impl Write for FailingWriteConnection {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn complete_guest_accept(
+        gateway: &mut VmnetGateway<'_>,
+        open: &HostIngressOpen,
+    ) -> TcpSeqNumber {
+        let result = gateway.handle_guest_frame(arp_reply_frame(), Instant::from_millis(2));
+        let syn = parse_tcp_frame(&result.guest_frames[0]).expect("syn");
+        let gateway_ack = syn.seq_number + 1;
+        let syn_ack = tcp_frame(
+            open.guest_port,
+            open.local_port,
+            TcpControl::Syn,
+            TcpSeqNumber(200),
+            Some(gateway_ack),
+            &[],
+        );
+        gateway.handle_guest_frame(syn_ack, Instant::from_millis(3));
+        gateway_ack
     }
 
     fn tcp_frame(

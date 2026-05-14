@@ -1,6 +1,6 @@
 ---
 id: wra-1joy
-status: open
+status: closed
 deps: [wra-0452]
 links: []
 created: 2026-05-14T18:42:20Z
@@ -18,3 +18,13 @@ Add deeper tests at the virtiofs/FUSE request handling boundary. Cover lookup/fo
 
 Protocol-level tests cover lifecycle, malformed/unsupported requests, and concurrency scenarios. The ticket notes any protocol operations intentionally unsupported and verifies they fail safely. Outcomes include whether additional instrumentation or counters were added for diagnosability.
 
+
+## Notes
+
+**2026-05-14T19:38:53Z**
+
+wra-0452 added model-style backend operation sequences but did not cover protocol-level lookup/forget/open/release ordering, request IDs, concurrent operations, or directory mutation during readdir. Those remain in scope for this virtiofs protocol adversarial ticket.
+
+**2026-05-14T19:46:26Z**
+
+Added protocol-boundary composed-fs tests for lookup/forget count saturation, malformed lookup components, mismatched release handling, open-then-rename writes, concurrent distinct-offset writes through a shared handle, readdir iterator snapshots during host directory mutation, and unsupported character-device mknod failure. Fixed a lifecycle bug where release(handle, wrong_inode) removed the handle before returning EBADF; release now verifies inode ownership before consuming the handle. Offline protocol tests pass; raw malformed FUSE byte-level request decoding remains out of scope for these direct FileSystem trait tests and should be covered by a future harness if needed.

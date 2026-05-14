@@ -74,10 +74,13 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
 This boots the real microvm path, verifies the guest payload control channel,
 checks optional host-published guest access by pinging the payload service
 through `--publish-payload-port`, runs a trivial payload inside the guest,
-checks `$HOME` and workspace sharing, verifies `dockerd` with `docker version`
-and `docker info`, then runs `docker run --rm -v "$PWD:/work:ro" alpine:3.22`
-and reads a workspace file from inside that container. The image is pulled into
-the project-local Docker data disk if it is not already present.
+checks `$HOME` and workspace sharing, verifies the guest-visible MITM CA bundle
+and cert-only config filesystem, confirms config FS is read-only, performs a
+guest DNS lookup when network is enabled, verifies `dockerd` with
+`docker version` and `docker info`, then runs
+`docker run --rm -v "$PWD:/work:ro" alpine:3.22` and reads a workspace file
+from inside that container. The image is pulled into the project-local Docker
+data disk if it is not already present.
 
 Prepare manifests and print the Rust stream QEMU command:
 

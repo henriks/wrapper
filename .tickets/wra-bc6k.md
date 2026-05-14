@@ -1,6 +1,6 @@
 ---
 id: wra-bc6k
-status: open
+status: closed
 deps: [wra-y325]
 links: []
 created: 2026-05-14T18:41:43Z
@@ -18,3 +18,9 @@ Add in-process and, where necessary, ignored local integration tests for DNS pro
 
 Tests cover DNS and host-ingress behavior without relying on external network access. Published-port and Docker/payload listener semantics have regression coverage. Notes document which behavior is in-process only and which requires live QEMU.
 
+
+## Notes
+
+**2026-05-14T19:49:29Z**
+
+Added deterministic DNS proxy tests for blocked domains not calling upstream, repeated allowed queries being forwarded without cache/coalescing, multi-question FormErr handling without upstream calls, and preserving upstream CNAME+AAAA answers. Added host-ingress bridge tests for multiple simultaneous host sessions/local-port allocation, host read failure closure, and host write failure closure. Added an ignored loopback listener-set integration test proving DockerApi, PayloadControl, and PublishedTcp listener purposes/guest ports are preserved through accept_pending; ignored because this command sandbox blocks loopback bind/connect. Offline vm-frontend tests pass.
