@@ -1,6 +1,6 @@
 ---
 id: wra-mkh8
-status: in_progress
+status: closed
 deps: [wra-fj7n]
 links: []
 created: 2026-04-01T21:17:14Z
@@ -92,3 +92,15 @@ Live testing showed the guest had `dockerd` but not the `docker` CLI on PATH. Th
 **2026-04-02T12:13:28Z**
 
 Concurrency follow-up tracked separately in wra-1ro6. Important current finding: sandbox-wrap already takes a per-project flock in DockerVmManager.acquire_lock() before removing .sandbox/docker-vm/run, so the earlier interference is unlikely to be a simple same-project run-dir deletion race. Investigation should focus on broader shared-workspace/shared-launcher effects or host-side resource interactions.
+
+**2026-05-14T17:22:04Z**
+
+Rust frontend progress on guest payload execution: added vm-frontend/src/payload_client.rs and an agentvm-frontend payload-client CLI. The client speaks the existing guest-payload-server framed protocol (P ping, R request, O output, I stdin, X exit, F failure), streams guest output to host stdout, can forward stdin, accepts --cwd and repeated --env KEY=VALUE, and exits with the guest payload exit code. Boot validation with run-dir .sandbox/docker-vm/payload-client-final and launch --host-payload-listener 12096:1076: payload-client --ping succeeded; payload-client --script 'printf ...; exit 7' printed payload:ok and / from inside the guest and the host process exited 7; piped stdin validation printed stdin:abc. Tests: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 73 lib tests, 1 existing ignored, and 8 bin tests. Remaining gap before closing this ticket: the Rust frontend still needs a single launch-and-run lifecycle that starts the VM, waits for payload readiness, runs the payload, forwards termination/resize signals if needed, and tears QEMU down deterministically without requiring a separate launch plus payload-client command.
+
+**2026-05-14T17:29:58Z**
+
+Added integrated Rust payload launch lifecycle. agentvm-frontend launch now accepts --payload-script, --payload-cwd, --payload-env KEY=VALUE, --payload-rows, --payload-cols, and --payload-no-stdin. When --payload-script is present, launch ensures a payload host listener exists, starts the Rust frontend/QEMU stack, waits for the guest payload control path with bounded/retriable pings, runs the payload via the Rust payload client, terminates QEMU, writes final state.json, and exits with the guest payload exit code. Boot validation: run-dir .sandbox/docker-vm/payload-launch-final, script printed launch-payload:ok and / from inside the guest; one run with exit 5 returned host exit code 5, and a subsequent exit-0 run shut QEMU down without noisy vmnet reset logs. state.json ended with status=exited and qemu_status signal: 9 (SIGKILL), and ps showed no remaining qemu for the run dir. Tests: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 73 lib tests, 1 existing ignored, and 8 bin tests. Remaining caveat: Rust payload signal/terminal resize forwarding is not yet at Python parity; stdin/stdout and exit-code/teardown are validated.
+
+**2026-05-14T17:42:20Z**
+
+Rust frontend payload execution is now implemented and validated end to end. Added vm-frontend/src/payload_client.rs with the existing guest-payload-server framed protocol, payload-client CLI support, integrated launch --payload-script lifecycle, readiness polling, deterministic QEMU teardown, stdin/stdout streaming, guest exit-code propagation, and Unix signal/terminal-resize forwarding. Signal forwarding uses SIGINT/SIGTERM/SIGHUP/SIGWINCH handlers that write to a pipe and forward S/W protocol frames from a normal thread; terminal size defaults come from TIOCGWINSZ when available. Tests: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 74 lib tests, 1 existing ignored connector test, and 8 CLI tests. Live validation: payload-client --ping against QEMU listener 12097 succeeded; a long-lived guest payload trapped TERM, printed got-term, exited 42, and the Rust host client returned 42 after receiving host SIGTERM; final integrated launch --payload-script 'echo final-payload-ok; exit 3' printed final-payload-ok, returned host exit code 3, and left no QEMU process for the validation run dir. Remaining work belongs to follow-on tickets: auth/tool/workspace state sharing in wra-eh7c, sandbox-wrap collapse in wra-snm9, and VM self-test/docs tickets.

@@ -1,6 +1,6 @@
 ---
 id: wra-eh7c
-status: open
+status: closed
 deps: [wra-fj7n]
 links: []
 created: 2026-04-01T21:17:14Z
@@ -56,3 +56,7 @@ Dependency insight from wra-mkh8: the guest payload path now expects a persisten
 **2026-05-13T06:16:47Z**
 
 Input from q35 composed-fs validation: composed mode currently maps tool state by source class into <project>/.sandbox/home using TOOLS host_home_mounts plus ~/.docker, with optional --gh mapping ~/.config/gh read-only when requested. Basic q35 validation proved those paths are reconstructed through the composed export, but full Codex/Copilot auth-state behavioral smoke remains a VM-only model concern for this ticket or its successors.
+
+**2026-05-14T17:59:08Z**
+
+Implemented the Rust frontend guest-share/state layer needed before deleting the Bubblewrap path. vm-frontend now plans composed-fs mounts from explicit VM-era options instead of replaying the old host namespace matrix: --tool codex|copilot maps only the selected tool state under <project>/.sandbox/home, ~/.docker maps as writable tool-state when present, --gh maps ~/.config/gh read-only and forwards GH_TOKEN when gh auth token is available, --aws PROFILE exports AWS credentials via aws configure export-credentials into the guest env, and --ro/--rw are preserved as explicit required guest shares at the same absolute path. The payload environment now sets HOME/XDG/PATH/DOCKER_HOST and credential nulls for tool launches, and --tool can synthesize the default tool bootstrap payload while --payload-script remains available for explicit commands. Validation: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 75 lib tests, 1 existing ignored connector test, and 10 CLI tests. Live QEMU smoke with --tool codex --rw /tmp/agentvm-extra-rw and explicit payload verified guest HOME=/home/hsaksela/ai/wrapper/.sandbox/home, wrote through the user-rw share back to /tmp/agentvm-extra-rw/from-guest, generated a manifest containing only workspace, codex state, docker config, and user-rw mounts, and left no QEMU process for the validation run dir. AWS credential export is implemented but not live-tested because no profile was requested/provided.

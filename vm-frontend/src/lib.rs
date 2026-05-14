@@ -15,6 +15,7 @@ pub mod host_ingress;
 pub mod l2_gateway;
 pub mod launch;
 pub mod network_policy;
+pub mod payload_client;
 pub mod runtime_manifest;
 pub mod tcp_gateway;
 pub mod tcp_proxy;
@@ -35,6 +36,7 @@ pub struct RuntimePaths {
     pub run_dir: PathBuf,
     pub console_log: PathBuf,
     pub state_json: PathBuf,
+    pub lock: PathBuf,
     pub data_disk: PathBuf,
     pub composed_fs_manifest: PathBuf,
     pub composed_fs_sock: PathBuf,
@@ -57,6 +59,7 @@ impl RuntimePaths {
         Self {
             console_log: run_dir.join("console.log"),
             state_json: run_dir.join("state.json"),
+            lock: root_dir.join("lock"),
             data_disk: root_dir.join("docker-data.raw"),
             composed_fs_manifest: run_dir.join("composed-fs-manifest.json"),
             composed_fs_sock: run_dir.join("virtiofs.sock"),

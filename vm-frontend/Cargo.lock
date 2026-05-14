@@ -23,6 +23,7 @@ dependencies = [
  "hickory-proto",
  "httparse",
  "ipnet",
+ "libc",
  "rcgen",
  "rustls",
  "rustls-native-certs",

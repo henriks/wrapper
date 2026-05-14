@@ -1,6 +1,6 @@
 ---
 id: wra-snm9
-status: open
+status: closed
 deps: [wra-mkh8, wra-eh7c]
 links: []
 created: 2026-04-01T21:17:14Z
@@ -51,3 +51,7 @@ User requirement update from after wra-fj7n: deleting Bubblewrap still stands, b
 **2026-04-02T07:06:26Z**
 
 Implementation insight from wra-mkh8: once the VM-only path is made default, the cleanup ticket should delete the old Bubblewrap bind matrix but keep the new smaller guest-share layer (fixed config share + supplemental virtio-fs shares) as the supported implementation of --ro/--rw and tool/auth mounts.
+
+**2026-05-14T18:06:47Z**
+
+Pivoted cleanup to drop the Python wrapper entirely instead of maintaining a thin shim. Deleted the root sandbox-wrap Python launcher and moved the remaining launcher responsibilities into vm-frontend: launch now takes the project VM lock, creates/formats the Docker data disk if needed, and the Rust binary exposes wrapper mode via agentvm-frontend wrap or via an argv0 symlink named codex-wrap/copilot-wrap/sandbox-wrap. Wrapper mode preserves the VM-era interface (--project, --tool, --no-net, --docker-publish mapped to --publish, --ro, --rw, --gh, --aws, --reset, and extra args after -- as tool args) and explicitly rejects removed Bubblewrap flags (--docker, --docker-machine, --pass-env). Verification: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 75 lib tests, 1 existing ignored connector test, and 12 CLI tests; wrapper help and removed-flag checks passed through cargo run; live Rust launch smoke printed rust-direct-ok, returned guest exit code 4, and left no QEMU process for the validation run dir. Remaining work should be docs/self-test tickets, not keeping legacy launcher code.

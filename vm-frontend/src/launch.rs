@@ -23,6 +23,7 @@ use crate::{FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, 
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_WAIT_STEP: Duration = Duration::from_millis(20);
+const DATA_DISK_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum LaunchError {
@@ -155,6 +156,64 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
     policy: VmnetPolicy,
     qemu_timeout: Option<Duration>,
 ) -> Result<QemuExit, LaunchError> {
+    let running = start_frontend_with_policy(config, mounts, policy)?;
+    running.wait(qemu_timeout)
+}
+
+pub struct RunningFrontend {
+    config: FrontendConfig,
+    policy: VmnetPolicy,
+    child: std::process::Child,
+    shutting_down: Arc<AtomicBool>,
+}
+
+impl RunningFrontend {
+    pub fn qemu_pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    pub fn wait(mut self, qemu_timeout: Option<Duration>) -> Result<QemuExit, LaunchError> {
+        let qemu_exit = wait_for_qemu(&mut self.child, qemu_timeout)?;
+        self.finish(qemu_exit)
+    }
+
+    pub fn terminate(mut self) -> Result<QemuExit, LaunchError> {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        let status = self.child.wait()?;
+        self.finish(QemuExit {
+            status,
+            timed_out: false,
+        })
+    }
+
+    fn finish(self, qemu_exit: QemuExit) -> Result<QemuExit, LaunchError> {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let state_status = if qemu_exit.timed_out {
+            "timed_out"
+        } else {
+            "exited"
+        };
+        let qemu_status = qemu_exit.status.to_string();
+        write_launch_state(
+            &self.config,
+            state_status,
+            None,
+            Some(&qemu_status),
+            Some(&self.policy),
+        )?;
+        Ok(qemu_exit)
+    }
+}
+
+pub fn start_frontend_with_policy(
+    config: FrontendConfig,
+    mounts: Vec<RuntimeMount>,
+    policy: VmnetPolicy,
+) -> Result<RunningFrontend, LaunchError> {
+    ensure_data_disk(&config.runtime.data_disk)?;
     validate_launch_inputs(&config)?;
     write_launch_state(&config, "starting", None, None, Some(&policy))?;
     prepare_frontend_launch_with_policy(&config, &mounts, &policy)?;
@@ -226,28 +285,18 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
         _ => unreachable!("supervisor qemu task must be a child process"),
     };
     let qemu_log = File::create(&process.stdout_log)?;
-    let mut child = Command::new(&process.program)
+    let child = Command::new(&process.program)
         .args(&process.args)
         .stdout(Stdio::from(qemu_log.try_clone()?))
         .stderr(Stdio::from(qemu_log))
         .spawn()?;
     write_launch_state(&config, "running", Some(child.id()), None, Some(&policy))?;
-    let qemu_exit = wait_for_qemu(&mut child, qemu_timeout)?;
-    shutting_down.store(true, Ordering::SeqCst);
-    let state_status = if qemu_exit.timed_out {
-        "timed_out"
-    } else {
-        "exited"
-    };
-    let qemu_status = qemu_exit.status.to_string();
-    write_launch_state(
-        &config,
-        state_status,
-        None,
-        Some(&qemu_status),
-        Some(&policy),
-    )?;
-    Ok(qemu_exit)
+    Ok(RunningFrontend {
+        config,
+        policy,
+        child,
+        shutting_down,
+    })
 }
 
 #[derive(Debug)]
@@ -297,6 +346,29 @@ fn validate_launch_inputs(config: &FrontendConfig) -> Result<(), LaunchError> {
         return Err(LaunchError::Artifact(format!(
             "Docker data disk is missing: {}",
             config.runtime.data_disk.display()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_data_disk(path: &Path) -> Result<(), LaunchError> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let disk = File::create(path)?;
+    disk.set_len(DATA_DISK_SIZE_BYTES)?;
+    let status = Command::new("mkfs.ext4")
+        .arg("-F")
+        .arg(path)
+        .status()
+        .map_err(LaunchError::Io)?;
+    if !status.success() {
+        return Err(LaunchError::Artifact(format!(
+            "mkfs.ext4 failed for {} with status {status}",
+            path.display()
         )));
     }
     Ok(())

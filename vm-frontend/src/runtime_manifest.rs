@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::Serialize;
 
@@ -40,6 +41,79 @@ impl RuntimeMount {
             source_class: ManifestSourceClass::Workspace,
             required: true,
             bind: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuestTool {
+    Codex,
+    Copilot,
+}
+
+impl GuestTool {
+    pub fn cli(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Copilot => "github-copilot-cli",
+        }
+    }
+
+    pub fn auto_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["--dangerously-bypass-approvals-and-sandbox"],
+            Self::Copilot => &["--allow-all", "--no-auto-update"],
+        }
+    }
+
+    pub fn npm_package(self) -> &'static str {
+        match self {
+            Self::Codex => "@openai/codex",
+            Self::Copilot => "@github/copilot",
+        }
+    }
+
+    fn state_dirs(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &[".codex"],
+            Self::Copilot => &[
+                ".copilot",
+                ".config/github-copilot",
+                ".cache/github-copilot",
+            ],
+        }
+    }
+}
+
+impl FromStr for GuestTool {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "copilot" => Ok(Self::Copilot),
+            _ => Err(format!("unknown tool: {value}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestShareSpec {
+    pub tool: Option<GuestTool>,
+    pub host_home: PathBuf,
+    pub gh: bool,
+    pub extra_ro: Vec<PathBuf>,
+    pub extra_rw: Vec<PathBuf>,
+}
+
+impl GuestShareSpec {
+    pub fn minimal(host_home: impl Into<PathBuf>) -> Self {
+        Self {
+            tool: None,
+            host_home: host_home.into(),
+            gh: false,
+            extra_ro: Vec::new(),
+            extra_rw: Vec::new(),
         }
     }
 }
@@ -107,6 +181,120 @@ struct BindEntry {
 
 pub fn workspace_mounts(project: impl Into<PathBuf>) -> Vec<RuntimeMount> {
     vec![RuntimeMount::workspace(project)]
+}
+
+pub fn guest_runtime_mounts(
+    project: impl Into<PathBuf>,
+    spec: &GuestShareSpec,
+) -> Vec<RuntimeMount> {
+    let project = project.into();
+    let guest_home = project.join(".sandbox/home");
+    let mut mounts = vec![RuntimeMount::workspace(project)];
+    let mut next_id = 2;
+
+    if let Some(tool) = spec.tool {
+        for rel_dir in tool.state_dirs() {
+            mounts.push(home_mount(
+                next_id,
+                &spec.host_home,
+                &guest_home,
+                rel_dir,
+                false,
+                ManifestSourceClass::ToolState,
+            ));
+            next_id += 1;
+        }
+    }
+
+    mounts.push(home_mount(
+        next_id,
+        &spec.host_home,
+        &guest_home,
+        ".docker",
+        false,
+        ManifestSourceClass::ToolState,
+    ));
+    next_id += 1;
+
+    if spec.gh {
+        mounts.push(home_mount(
+            next_id,
+            &spec.host_home,
+            &guest_home,
+            ".config/gh",
+            true,
+            ManifestSourceClass::AuthConfig,
+        ));
+        next_id += 1;
+    }
+
+    for path in &spec.extra_ro {
+        mounts.push(user_mount(next_id, path, true, ManifestSourceClass::UserRo));
+        next_id += 1;
+    }
+    for path in &spec.extra_rw {
+        mounts.push(user_mount(
+            next_id,
+            path,
+            false,
+            ManifestSourceClass::UserRw,
+        ));
+        next_id += 1;
+    }
+
+    mounts
+}
+
+fn home_mount(
+    index: usize,
+    host_home: &Path,
+    guest_home: &Path,
+    rel_path: &str,
+    readonly: bool,
+    source_class: ManifestSourceClass,
+) -> RuntimeMount {
+    RuntimeMount {
+        id: format!("m{index:04}_{}", mount_id_suffix(rel_path)),
+        host_path: host_home.join(rel_path),
+        guest_path: guest_home.join(rel_path),
+        readonly,
+        source_class,
+        required: false,
+        bind: true,
+    }
+}
+
+fn user_mount(
+    index: usize,
+    path: &Path,
+    readonly: bool,
+    source_class: ManifestSourceClass,
+) -> RuntimeMount {
+    RuntimeMount {
+        id: format!(
+            "m{index:04}_{}",
+            mount_id_suffix(&path.display().to_string())
+        ),
+        host_path: path.to_path_buf(),
+        guest_path: path.to_path_buf(),
+        readonly,
+        source_class,
+        required: true,
+        bind: true,
+    }
+}
+
+fn mount_id_suffix(value: &str) -> String {
+    let suffix: String = value
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    let suffix = suffix.trim_matches('_');
+    if suffix.is_empty() {
+        "root".to_string()
+    } else {
+        suffix.to_string()
+    }
 }
 
 pub fn write_runtime_manifests(
@@ -395,6 +583,47 @@ mod tests {
             fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
         assert!(config_manifest.contains("\"guest_path\": \"/composed-binds.json\""));
         assert!(config_manifest.contains("\"guest_path\": \"/mitm-ca.crt\""));
+    }
+
+    #[test]
+    fn guest_runtime_mounts_add_tool_auth_docker_and_user_shares() {
+        let root = unique_temp_dir();
+        let project = root.join("repo");
+        let home = root.join("host-home");
+        let extra_ro = root.join("extra-ro");
+        let extra_rw = root.join("extra-rw");
+        fs::create_dir_all(&project).expect("repo");
+        fs::create_dir_all(home.join(".codex")).expect("codex");
+        fs::create_dir_all(home.join(".docker")).expect("docker");
+        fs::create_dir_all(home.join(".config/gh")).expect("gh");
+        fs::create_dir_all(&extra_ro).expect("extra ro");
+        fs::create_dir_all(&extra_rw).expect("extra rw");
+        let config = config(&root);
+        let mounts = guest_runtime_mounts(
+            project,
+            &GuestShareSpec {
+                tool: Some(GuestTool::Codex),
+                host_home: home,
+                gh: true,
+                extra_ro: vec![extra_ro.clone()],
+                extra_rw: vec![extra_rw.clone()],
+            },
+        );
+
+        write_runtime_manifests(&config, &mounts).expect("write manifests");
+
+        let host_manifest =
+            fs::read_to_string(&config.runtime.composed_fs_manifest).expect("host manifest");
+        assert!(host_manifest.contains("\"guest_path\": \""));
+        assert!(host_manifest.contains(".sandbox/home/.codex"));
+        assert!(host_manifest.contains(".sandbox/home/.docker"));
+        assert!(host_manifest.contains(".sandbox/home/.config/gh"));
+        assert!(host_manifest.contains("\"source_class\": \"tool-state\""));
+        assert!(host_manifest.contains("\"source_class\": \"auth-config\""));
+        assert!(host_manifest.contains("\"source_class\": \"user-ro\""));
+        assert!(host_manifest.contains("\"source_class\": \"user-rw\""));
+        assert!(host_manifest.contains(&extra_ro.display().to_string()));
+        assert!(host_manifest.contains(&extra_rw.display().to_string()));
     }
 
     #[test]
