@@ -1,6 +1,6 @@
 ---
 id: wra-mvxd
-status: open
+status: in_progress
 deps: [wra-y325, wra-s8nn]
 links: []
 created: 2026-05-14T18:43:15Z
@@ -28,3 +28,7 @@ Network packet/policy work added GuestFrameOutcome::UnsupportedProtocol and Vmne
 **2026-05-14T18:59:53Z**
 
 Filesystem validation added explicit assertions around skipped optional mounts and MITM CA private-key non-exposure. Observability/artifact tests should ensure manifest summaries and config-fs artifacts make it easy to verify cert-only exposure without printing or mounting private key material.
+
+**2026-05-14T20:03:10Z**
+
+Added artifact/observability assertions and implementation support. state.json now records qemu.log, console.log, vmnet-events.log, composed-fs-manifest.json, config-fs-manifest.json, and composed-binds.json so live failures point directly at diagnostics. Added vmnet_runtime::event_log_includes_representative_failure_artifacts_without_secrets, covering DNS blocked decisions, UDP/443 denial, unsupported protocol classification, TCP preaccept deny/setup failure, TLS MITM unavailable/failure, upstream write failure, and host-ingress open/write failures; the test also asserts event logs do not contain private key material or mitm-ca.key. README documents artifact collection and event-log content. vm-frontend offline tests pass.

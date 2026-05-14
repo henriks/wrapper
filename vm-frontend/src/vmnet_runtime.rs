@@ -670,10 +670,13 @@ fn smoltcp_now(started: StdInstant) -> Instant {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::network_policy::VmnetPolicy;
-    use crate::tcp_gateway::{TcpConnectError, TcpDestination};
+    use crate::dns_proxy::{DnsDecision, DnsLogEntry};
+    use crate::host_ingress::HostIngressEvent;
+    use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
+    use crate::tcp_gateway::{TcpAction, TcpConnectError, TcpDecision, TcpDestination};
     use crate::tcp_proxy::TcpProxyBridge;
-    use crate::vmnet_gateway::{UnsupportedProtocol, VmnetGateway};
+    use crate::tls_mitm::TlsMitmError;
+    use crate::vmnet_gateway::{UdpDenial, UnsupportedProtocol, VmnetGateway};
     use crate::vmnet_stream::DEFAULT_MAX_FRAME_LEN;
     use crate::GuestNetwork;
     use smoltcp::phy::ChecksumCapabilities;
@@ -782,6 +785,108 @@ mod tests {
             format_gateway_event(&event),
             "unsupported_protocol reason=IPv6 DenyAndLog by policy"
         );
+    }
+
+    #[test]
+    fn event_log_includes_representative_failure_artifacts_without_secrets() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let handle = gateway
+            .connect_host_to_guest(1075, 40000, Instant::from_millis(1))
+            .expect("host ingress handle")
+            .handle;
+        let destination = TcpDestination {
+            ip: std::net::Ipv4Addr::new(169, 254, 169, 254),
+            port: 443,
+            domain: Some("metadata.invalid".to_string()),
+        };
+        let decision = TcpDecision {
+            action: TcpAction::Deny,
+            reason: "metadata range denied".to_string(),
+        };
+        let log_path = unique_temp_file("vmnet-failures.log");
+        let mut event_log = open_event_log(Some(&log_path)).expect("event log");
+
+        write_gateway_events(
+            &mut event_log,
+            &[
+                VmnetGatewayEvent::DnsQuery {
+                    log: DnsLogEntry {
+                        domain: Some("blocked.example".to_string()),
+                        decision: DnsDecision::Blocked,
+                        detail: "domain denied by VmnetPolicy".to_string(),
+                    },
+                },
+                VmnetGatewayEvent::UdpDenied(UdpDenial {
+                    src_ip: [10, 0, 2, 15],
+                    dst_ip: [93, 184, 216, 34],
+                    src_port: 53000,
+                    dst_port: 443,
+                    reason: "UDP/443 blocked to prevent QUIC bypass".to_string(),
+                }),
+                VmnetGatewayEvent::UnsupportedProtocol(UnsupportedProtocol {
+                    reason: "IPv6 DenyAndLog by policy".to_string(),
+                }),
+                VmnetGatewayEvent::TcpDenied {
+                    destination: destination.clone(),
+                    decision: decision.clone(),
+                },
+                VmnetGatewayEvent::TcpSetupFailed {
+                    destination: destination.clone(),
+                    detail: "listener provisioning failed".to_string(),
+                },
+            ],
+        )
+        .expect("gateway events");
+        write_proxy_events(
+            &mut event_log,
+            &[
+                TcpProxyEvent::TlsMitmUnavailable {
+                    handle,
+                    destination: destination.clone(),
+                },
+                TcpProxyEvent::TlsMitmFailed {
+                    handle,
+                    error: TlsMitmError::Tls("bad record mac".to_string()),
+                },
+                TcpProxyEvent::UpstreamWriteFailed {
+                    handle,
+                    error: "broken pipe".to_string(),
+                },
+            ],
+        )
+        .expect("proxy events");
+        write_host_ingress_events(
+            &mut event_log,
+            &[
+                HostIngressEvent::OpenFailed {
+                    guest_port: 1075,
+                    purpose: HostListenerPurpose::DockerApi,
+                    error: "connection refused".to_string(),
+                },
+                HostIngressEvent::HostWriteFailed {
+                    handle,
+                    error: "broken pipe".to_string(),
+                },
+            ],
+        )
+        .expect("host ingress events");
+
+        let log = std::fs::read_to_string(log_path).expect("read event log");
+        assert!(log.contains("dns_query domain=blocked.example decision=Blocked"));
+        assert!(log.contains("udp_denied src=10.0.2.15:53000 dst=93.184.216.34:443"));
+        assert!(log.contains("unsupported_protocol reason=IPv6 DenyAndLog by policy"));
+        assert!(log.contains("tcp_denied_preaccept dst=169.254.169.254:443"));
+        assert!(log.contains("tcp_setup_failed_preaccept dst=169.254.169.254:443"));
+        assert!(log.contains("tls_mitm_unavailable"));
+        assert!(log.contains("tls_mitm_failed"));
+        assert!(log.contains("upstream_write_failed"));
+        assert!(log.contains("host_ingress_open_failed guest_port=1075 purpose=DockerApi"));
+        assert!(log.contains("host_ingress_host_write_failed"));
+        assert!(!log.contains("BEGIN PRIVATE KEY"));
+        assert!(!log.contains("mitm-ca.key"));
     }
 
     #[derive(Debug, Clone)]

@@ -12,3 +12,6 @@ vhost = "0.13.0"
 vhost-user-backend = "0.17.0"
 virtiofsd = { version = "1.13.3", default-features = false }
 vm-memory = { version = "0.16.0", features = ["backend-mmap", "backend-atomic"] }
+
+[dev-dependencies]
+proptest = "1.11.0"

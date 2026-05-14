@@ -1,6 +1,6 @@
 ---
 id: wra-9udq
-status: in_progress
+status: closed
 deps: [wra-czl0, wra-bc6k, wra-jwaz, wra-1joy]
 links: []
 created: 2026-05-14T18:42:44Z
@@ -36,3 +36,7 @@ DNS and host-ingress now have in-process coverage. Live KVM tests should still v
 **2026-05-14T19:51:18Z**
 
 Expanded agentvm-frontend self-test setup so live self-test now generates and wires a project MITM CA by default, injects guest CA env, and runs a broader in-guest payload script. The payload now verifies /run/agentvm-config/mitm-ca.crt exists, the CA private key is absent from guest config FS, /run/agentvm-ca-bundle.pem and Node/npm CA env are present, config FS rejects writes, HOME-backed tool state can be written/read, guest DNS lookup works when network is allowed, workspace writes are visible, Docker CLI works, and Docker bind-mounted workspace reads host files. Not run live here because /dev/kvm is unavailable inside this sandbox; run agentvm-frontend self-test on the host to validate the real appliance.
+
+**2026-05-14T19:53:59Z**
+
+User ran the expanded live KVM self-test on the host after the self-test changes and reported that it appeared to pass. Treating the representative live frontend contract as validated: payload-control path, published payload port, workspace/composed FS, config FS CA cert/private-key separation, readonly config FS, guest CA env, DNS lookup, Docker CLI, and Docker bind-mounted workspace. Remaining deeper cases, such as high-volume network/filesystem stress and artifact assertions, are tracked by wra-96uv and wra-mvxd.

@@ -82,6 +82,13 @@ guest DNS lookup when network is enabled, verifies `dockerd` with
 from inside that container. The image is pulled into the project-local Docker
 data disk if it is not already present.
 
+When validation fails, collect the run directory shown in `state.json`. The
+state file records the primary diagnostics: `qemu.log`, `console.log`,
+`vmnet-events.log`, the composed/config filesystem manifests, and the guest bind
+manifest. Event logs include DNS decisions, UDP denials, unsupported protocol
+classification, TCP policy/setup failures, TLS MITM failures, and host-ingress
+errors without logging private key material.
+
 Prepare manifests and print the Rust stream QEMU command:
 
 ```sh

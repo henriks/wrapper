@@ -611,6 +611,18 @@ impl Namespace {
         };
         if let Some(inode) = self.host_inodes.get(&key).copied() {
             if let Some(node) = self.nodes.get_mut(&inode) {
+                if let NodeKind::Host {
+                    mount,
+                    relative_path: known_path,
+                } = &mut node.kind
+                {
+                    if *mount == mount_index {
+                        *known_path = relative_path;
+                    }
+                }
+                node.mode = metadata.mode();
+                node.uid = metadata.uid();
+                node.gid = metadata.gid();
                 node.cached_attr = Some(attr_from_metadata(inode, metadata));
             }
             return inode;
@@ -2157,6 +2169,8 @@ mod test_support;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
     use std::os::unix::fs::FileExt;
     use std::thread;
     use virtiofsd::oslib::{ReadvFlags, WritevFlags};
@@ -2268,6 +2282,287 @@ mod tests {
             names.push(entry.name.to_str().expect("utf8").to_string());
         }
         names
+    }
+
+    #[derive(Clone)]
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn usize(&mut self, upper: usize) -> usize {
+            if upper == 0 {
+                0
+            } else {
+                (self.next_u64() as usize) % upper
+            }
+        }
+    }
+
+    fn traced<T>(result: io::Result<T>, seed: u64, ops: &[String], label: &str) -> T {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "{label} failed for seed {seed:#x}: {error}\noperation trace:\n{}",
+                ops.join("\n")
+            )
+        })
+    }
+
+    fn traced_ops<T>(result: io::Result<T>, ops: &[String], label: &str) -> T {
+        result.unwrap_or_else(|error| {
+            panic!(
+                "{label} failed: {error}\noperation trace:\n{}",
+                ops.join("\n")
+            )
+        })
+    }
+
+    #[derive(Clone, Debug)]
+    enum FsStressOp {
+        Put { name: usize, len: usize, byte: u8 },
+        Read { name: usize },
+        Rename { from: usize, to: usize },
+        Unlink { name: usize },
+        HostPut { name: usize, len: usize, byte: u8 },
+        Readdir,
+    }
+
+    fn fs_stress_ops() -> impl Strategy<Value = Vec<FsStressOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0usize..48, 0usize..128, any::<u8>()).prop_map(|(name, len, byte)| {
+                    FsStressOp::Put {
+                        name,
+                        len: len + 1,
+                        byte,
+                    }
+                }),
+                (0usize..48).prop_map(|name| FsStressOp::Read { name }),
+                (0usize..48, 0usize..48).prop_map(|(from, to)| FsStressOp::Rename { from, to }),
+                (0usize..48).prop_map(|name| FsStressOp::Unlink { name }),
+                (0usize..48, 0usize..128, any::<u8>()).prop_map(|(name, len, byte)| {
+                    FsStressOp::HostPut {
+                        name,
+                        len: len + 1,
+                        byte,
+                    }
+                }),
+                Just(FsStressOp::Readdir),
+            ],
+            1..160,
+        )
+    }
+
+    fn stress_name(index: usize) -> String {
+        format!("p{index:03}.txt")
+    }
+
+    fn run_flat_file_ops_case(case_name: &str, generated_ops: &[FsStressOp]) {
+        let test_dir = TestDir::new(case_name);
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let mut model = BTreeMap::<String, Vec<u8>>::new();
+        let mut trace = Vec::<String>::new();
+
+        for (step, op) in generated_ops.iter().enumerate() {
+            match op {
+                FsStressOp::Put { name, len, byte } => {
+                    let name = stress_name(*name);
+                    let data = vec![*byte; *len];
+                    trace.push(format!("{step}: put {name} len={len} byte={byte}"));
+                    let c_name = CString::new(name.as_str()).expect("name");
+                    let (entry, handle, _options) = traced_ops(
+                        fs.create(
+                            ctx(),
+                            workspace.inode,
+                            c_name.as_c_str(),
+                            0o644,
+                            false,
+                            (libc::O_RDWR | libc::O_TRUNC) as u32,
+                            0,
+                            Extensions::default(),
+                        ),
+                        &trace,
+                        "create",
+                    );
+                    let handle = handle.expect("handle");
+                    traced_ops(
+                        fs.write(
+                            ctx(),
+                            entry.inode,
+                            handle,
+                            VecReader { data: data.clone() },
+                            data.len() as u32,
+                            0,
+                            None,
+                            false,
+                            false,
+                            0,
+                        ),
+                        &trace,
+                        "write",
+                    );
+                    traced_ops(
+                        fs.release(ctx(), entry.inode, 0, handle, true, false, None),
+                        &trace,
+                        "release",
+                    );
+                    model.insert(name, data);
+                }
+                FsStressOp::Read { name } => {
+                    let name = stress_name(*name);
+                    trace.push(format!("{step}: read {name}"));
+                    let Some(expected) = model.get(&name).cloned() else {
+                        assert_eq!(
+                            raw_error(lookup(&fs, workspace.inode, &name), "missing read lookup"),
+                            Some(libc::ENOENT),
+                            "operation trace:\n{}",
+                            trace.join("\n")
+                        );
+                        continue;
+                    };
+                    let entry = traced_ops(lookup(&fs, workspace.inode, &name), &trace, "lookup");
+                    let (handle, _options) = traced_ops(
+                        fs.open(ctx(), entry.inode, false, libc::O_RDONLY as u32),
+                        &trace,
+                        "open read",
+                    );
+                    let handle = handle.expect("handle");
+                    let mut reader = VecWriter::default();
+                    traced_ops(
+                        fs.read(
+                            ctx(),
+                            entry.inode,
+                            handle,
+                            &mut reader,
+                            (expected.len() + 16) as u32,
+                            0,
+                            None,
+                            0,
+                        ),
+                        &trace,
+                        "read",
+                    );
+                    assert_eq!(
+                        reader.data,
+                        expected,
+                        "read mismatch\noperation trace:\n{}",
+                        trace.join("\n")
+                    );
+                    traced_ops(
+                        fs.release(ctx(), entry.inode, 0, handle, false, false, None),
+                        &trace,
+                        "release read",
+                    );
+                    fs.forget(ctx(), entry.inode, 1);
+                }
+                FsStressOp::Rename { from, to } => {
+                    let from = stress_name(*from);
+                    let to = stress_name(*to);
+                    trace.push(format!("{step}: rename {from} -> {to}"));
+                    let old_c = CString::new(from.as_str()).expect("old");
+                    let new_c = CString::new(to.as_str()).expect("new");
+                    if !model.contains_key(&from) {
+                        assert_eq!(
+                            raw_error(
+                                fs.rename(
+                                    ctx(),
+                                    workspace.inode,
+                                    old_c.as_c_str(),
+                                    workspace.inode,
+                                    new_c.as_c_str(),
+                                    0,
+                                ),
+                                "missing rename",
+                            ),
+                            Some(libc::ENOENT),
+                            "operation trace:\n{}",
+                            trace.join("\n")
+                        );
+                        continue;
+                    }
+                    traced_ops(
+                        fs.rename(
+                            ctx(),
+                            workspace.inode,
+                            old_c.as_c_str(),
+                            workspace.inode,
+                            new_c.as_c_str(),
+                            0,
+                        ),
+                        &trace,
+                        "rename",
+                    );
+                    if from != to {
+                        let data = model.remove(&from).expect("from");
+                        model.insert(to, data);
+                    }
+                }
+                FsStressOp::Unlink { name } => {
+                    let name = stress_name(*name);
+                    trace.push(format!("{step}: unlink {name}"));
+                    let c_name = CString::new(name.as_str()).expect("name");
+                    let result = fs.unlink(ctx(), workspace.inode, c_name.as_c_str());
+                    if model.remove(&name).is_some() {
+                        traced_ops(result, &trace, "unlink");
+                    } else {
+                        assert_eq!(
+                            raw_error(result, "missing unlink"),
+                            Some(libc::ENOENT),
+                            "operation trace:\n{}",
+                            trace.join("\n")
+                        );
+                    }
+                }
+                FsStressOp::HostPut { name, len, byte } => {
+                    let name = stress_name(*name);
+                    let data = vec![*byte; *len];
+                    trace.push(format!("{step}: host-put {name} len={len} byte={byte}"));
+                    fs::write(root.join(&name), &data).unwrap_or_else(|error| {
+                        panic!(
+                            "host put failed: {error}\noperation trace:\n{}",
+                            trace.join("\n")
+                        )
+                    });
+                    model.insert(name, data);
+                }
+                FsStressOp::Readdir => {
+                    trace.push(format!("{step}: readdir"));
+                    let mut names = dir_names(traced_ops(
+                        fs.readdir(ctx(), workspace.inode, workspace.inode, 16 * 1024, 0),
+                        &trace,
+                        "readdir",
+                    ));
+                    names.sort();
+                    let expected = model.keys().cloned().collect::<Vec<_>>();
+                    assert_eq!(
+                        names,
+                        expected,
+                        "readdir mismatch\noperation trace:\n{}",
+                        trace.join("\n")
+                    );
+                }
+            }
+        }
     }
 
     fn assert_invalid_input<T>(result: io::Result<T>, message: &str) {
@@ -3544,6 +3839,47 @@ mod tests {
     }
 
     #[test]
+    fn lookup_after_rename_refreshes_reused_host_inode_path() {
+        let test_dir = TestDir::new("rename-refresh");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"renamed-data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("lookup file");
+        let old_name = CString::new("file").expect("old");
+        let new_name = CString::new("renamed").expect("new");
+
+        fs.rename(
+            ctx(),
+            workspace.inode,
+            old_name.as_c_str(),
+            workspace.inode,
+            new_name.as_c_str(),
+            0,
+        )
+        .expect("rename");
+        let renamed = lookup(&fs, workspace.inode, "renamed").expect("lookup renamed");
+
+        assert_eq!(renamed.inode, file.inode);
+        let (handle, _options) = fs
+            .open(ctx(), renamed.inode, false, libc::O_RDONLY as u32)
+            .expect("open renamed");
+        let handle = handle.expect("handle");
+        let mut reader = VecWriter::default();
+        fs.read(ctx(), renamed.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("read renamed");
+        assert_eq!(reader.data, b"renamed-data");
+    }
+
+    #[test]
     fn concurrent_distinct_offset_writes_share_handle_safely() {
         let test_dir = TestDir::new("concurrent-writes");
         let root = test_dir.path.join("root");
@@ -3682,6 +4018,212 @@ mod tests {
             Some(libc::EPERM)
         );
         assert!(!root.join("device").exists());
+    }
+
+    #[test]
+    #[ignore = "property stress: run explicitly with `cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_flat_file_operation_sequences -- --ignored --nocapture`"]
+    fn proptest_flat_file_operation_sequences() {
+        let mut runner = TestRunner::new(Config {
+            cases: 128,
+            max_shrink_iters: 2048,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&fs_stress_ops(), |ops| {
+                run_flat_file_ops_case("proptest-flat-sequence", &ops);
+                Ok(())
+            })
+            .expect("proptest flat file operation sequence");
+    }
+
+    #[test]
+    #[ignore = "stress regression: run explicitly with `cargo test --manifest-path composed-fs/Cargo.toml --offline stress_seeded_flat_file_operation_sequences -- --ignored --nocapture`"]
+    fn stress_seeded_flat_file_operation_sequences() {
+        const SEED: u64 = 0x5eed_f17e_2026_0514;
+        const STEPS: usize = 512;
+        let test_dir = TestDir::new("stress-flat-sequence");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let mut rng = TestRng::new(SEED);
+        let mut model = BTreeMap::<String, Vec<u8>>::new();
+        let mut ops = Vec::<String>::new();
+
+        for step in 0..STEPS {
+            let op = if model.is_empty() { 0 } else { rng.usize(6) };
+            match op {
+                0 => {
+                    let name = format!("f{:03}.txt", rng.usize(128));
+                    let len = 1 + rng.usize(96);
+                    let fill = b'a' + rng.usize(26) as u8;
+                    let data = vec![fill; len];
+                    ops.push(format!(
+                        "{step}: create/truncate {name} len={len} fill={fill}"
+                    ));
+                    let c_name = CString::new(name.as_str()).expect("name");
+                    let (entry, handle, _options) = traced(
+                        fs.create(
+                            ctx(),
+                            workspace.inode,
+                            c_name.as_c_str(),
+                            0o644,
+                            false,
+                            (libc::O_RDWR | libc::O_TRUNC) as u32,
+                            0,
+                            Extensions::default(),
+                        ),
+                        SEED,
+                        &ops,
+                        "create",
+                    );
+                    let handle = handle.expect("handle");
+                    traced(
+                        fs.write(
+                            ctx(),
+                            entry.inode,
+                            handle,
+                            VecReader { data: data.clone() },
+                            data.len() as u32,
+                            0,
+                            None,
+                            false,
+                            false,
+                            0,
+                        ),
+                        SEED,
+                        &ops,
+                        "write created file",
+                    );
+                    traced(
+                        fs.release(ctx(), entry.inode, 0, handle, true, false, None),
+                        SEED,
+                        &ops,
+                        "release created file",
+                    );
+                    model.insert(name, data);
+                }
+                1 => {
+                    let name = model.keys().nth(rng.usize(model.len())).unwrap().clone();
+                    let expected = model.get(&name).expect("model entry").clone();
+                    ops.push(format!("{step}: lookup/read {name} len={}", expected.len()));
+                    let entry = traced(lookup(&fs, workspace.inode, &name), SEED, &ops, "lookup");
+                    let (handle, _options) = traced(
+                        fs.open(ctx(), entry.inode, false, libc::O_RDONLY as u32),
+                        SEED,
+                        &ops,
+                        "open read",
+                    );
+                    let handle = handle.expect("handle");
+                    let mut reader = VecWriter::default();
+                    traced(
+                        fs.read(ctx(), entry.inode, handle, &mut reader, 256, 0, None, 0),
+                        SEED,
+                        &ops,
+                        "read",
+                    );
+                    assert_eq!(
+                        reader.data,
+                        expected,
+                        "seed {SEED:#x} mismatch after trace:\n{}",
+                        ops.join("\n")
+                    );
+                    traced(
+                        fs.release(ctx(), entry.inode, 0, handle, false, false, None),
+                        SEED,
+                        &ops,
+                        "release read",
+                    );
+                    fs.forget(ctx(), entry.inode, 1);
+                }
+                2 => {
+                    let name = model.keys().nth(rng.usize(model.len())).unwrap().clone();
+                    let new_name = format!("renamed-{:03}.txt", rng.usize(128));
+                    ops.push(format!("{step}: rename {name} -> {new_name}"));
+                    let old_c = CString::new(name.as_str()).expect("old");
+                    let new_c = CString::new(new_name.as_str()).expect("new");
+                    traced(
+                        fs.rename(
+                            ctx(),
+                            workspace.inode,
+                            old_c.as_c_str(),
+                            workspace.inode,
+                            new_c.as_c_str(),
+                            0,
+                        ),
+                        SEED,
+                        &ops,
+                        "rename",
+                    );
+                    let data = model.remove(&name).expect("old model");
+                    model.insert(new_name, data);
+                }
+                3 => {
+                    let name = model.keys().nth(rng.usize(model.len())).unwrap().clone();
+                    ops.push(format!("{step}: unlink {name}"));
+                    let c_name = CString::new(name.as_str()).expect("name");
+                    traced(
+                        fs.unlink(ctx(), workspace.inode, c_name.as_c_str()),
+                        SEED,
+                        &ops,
+                        "unlink",
+                    );
+                    model.remove(&name);
+                }
+                4 => {
+                    let name = format!("host-{:03}.txt", rng.usize(128));
+                    let data = format!("host-step-{step}").into_bytes();
+                    ops.push(format!("{step}: host-write {name} len={}", data.len()));
+                    fs::write(root.join(&name), &data).unwrap_or_else(|error| {
+                        panic!(
+                            "host write failed for seed {SEED:#x}: {error}\noperation trace:\n{}",
+                            ops.join("\n")
+                        )
+                    });
+                    model.insert(name, data);
+                }
+                _ => {
+                    ops.push(format!("{step}: readdir expect {} files", model.len()));
+                    let mut names = dir_names(traced(
+                        fs.readdir(ctx(), workspace.inode, workspace.inode, 16 * 1024, 0),
+                        SEED,
+                        &ops,
+                        "readdir",
+                    ));
+                    names.sort();
+                    let expected = model.keys().cloned().collect::<Vec<_>>();
+                    assert_eq!(
+                        names,
+                        expected,
+                        "seed {SEED:#x} readdir mismatch after trace:\n{}",
+                        ops.join("\n")
+                    );
+                }
+            }
+        }
+
+        for (name, expected) in model {
+            let actual = fs::read(root.join(&name)).unwrap_or_else(|error| {
+                panic!(
+                    "final host read failed for {name} seed {SEED:#x}: {error}\noperation trace:\n{}",
+                    ops.join("\n")
+                )
+            });
+            assert_eq!(
+                actual,
+                expected,
+                "seed {SEED:#x} final host mismatch for {name}\noperation trace:\n{}",
+                ops.join("\n")
+            );
+        }
     }
 
     #[test]

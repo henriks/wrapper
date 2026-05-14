@@ -390,6 +390,12 @@ struct LaunchState<'a> {
     composed_fs_socket: String,
     config_fs_socket: String,
     docker_socket: Option<String>,
+    qemu_log: String,
+    console_log: String,
+    vmnet_event_log: String,
+    composed_fs_manifest: String,
+    config_fs_manifest: String,
+    composed_bind_manifest: String,
 }
 
 fn write_launch_state(
@@ -418,6 +424,17 @@ fn write_launch_state(
         docker_socket: policy
             .and_then(|policy| docker_listener_tcp_port(policy))
             .map(|_| config.runtime.docker_sock.display().to_string()),
+        qemu_log: config
+            .runtime
+            .run_dir
+            .join("qemu.log")
+            .display()
+            .to_string(),
+        console_log: config.runtime.console_log.display().to_string(),
+        vmnet_event_log: config.runtime.vmnet_event_log.display().to_string(),
+        composed_fs_manifest: config.runtime.composed_fs_manifest.display().to_string(),
+        config_fs_manifest: config.runtime.config_fs_manifest.display().to_string(),
+        composed_bind_manifest: config.runtime.composed_bind_manifest.display().to_string(),
     };
     let bytes = serde_json::to_vec_pretty(&state).map_err(LaunchError::Json)?;
     fs::write(
@@ -643,6 +660,12 @@ mod tests {
         assert!(state.contains("\"egress_default_action\": \"Deny\""));
         assert!(state.contains("guest-config.sock"));
         assert!(state.contains("docker.sock"));
+        assert!(state.contains("qemu.log"));
+        assert!(state.contains("console.log"));
+        assert!(state.contains("vmnet-events.log"));
+        assert!(state.contains("composed-fs-manifest.json"));
+        assert!(state.contains("config-fs-manifest.json"));
+        assert!(state.contains("composed-binds.json"));
     }
 
     fn unique_temp_dir() -> PathBuf {

@@ -269,6 +269,30 @@ mod tests {
         }
     }
 
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn usize(&mut self, upper: usize) -> usize {
+            if upper == 0 {
+                0
+            } else {
+                (self.next_u64() as usize) % upper
+            }
+        }
+    }
+
     impl DnsUpstream for RecordingUpstream {
         fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
             let question = query.queries.first().expect("question");
@@ -519,5 +543,73 @@ mod tests {
         assert!(dns_allowed_to_destination(&policy, [10, 0, 2, 3], DNS_PORT));
         assert!(!dns_allowed_to_destination(&policy, [8, 8, 8, 8], DNS_PORT));
         assert!(!dns_allowed_to_destination(&policy, [10, 0, 2, 3], 5353));
+    }
+
+    #[test]
+    #[ignore = "stress regression: run explicitly with `cargo test --manifest-path vm-frontend/Cargo.toml --offline dns_proxy_stress -- --ignored --nocapture`"]
+    fn dns_proxy_stress_seeded_repeated_policy_queries() {
+        const SEED: u64 = 0xd15c_2026_0514;
+        const QUERIES: usize = 1_024;
+        let policy = policy_allowing("*.allowed.example");
+        let upstream = RecordingUpstream::new(response_with_query(
+            0x1234,
+            "api.allowed.example",
+            RecordType::A,
+        ));
+        let proxy = DnsProxy::new(&policy, &upstream);
+        let mut rng = TestRng::new(SEED);
+        let mut expected_upstream_calls = Vec::new();
+        let mut trace = Vec::new();
+
+        for index in 0..QUERIES {
+            let allowed = rng.usize(4) != 0;
+            let label = rng.usize(64);
+            let record_type = if rng.usize(2) == 0 {
+                RecordType::A
+            } else {
+                RecordType::AAAA
+            };
+            let domain = if allowed {
+                format!("n{label}.allowed.example")
+            } else {
+                format!("n{label}.blocked.example")
+            };
+            trace.push(format!(
+                "{index}: {domain} {record_type:?} allowed={allowed}"
+            ));
+
+            let result = proxy.handle_udp_payload(&query_with_type(&domain, record_type));
+            if allowed {
+                assert_eq!(
+                    result.log.decision,
+                    DnsDecision::Allowed,
+                    "seed {SEED:#x} trace:\n{}",
+                    trace.join("\n")
+                );
+                expected_upstream_calls.push((domain, record_type));
+            } else {
+                assert_eq!(
+                    result.log.decision,
+                    DnsDecision::Blocked,
+                    "seed {SEED:#x} trace:\n{}",
+                    trace.join("\n")
+                );
+                let response =
+                    Message::from_vec(&result.response.expect("blocked response")).expect("parse");
+                assert_eq!(
+                    response.metadata.response_code,
+                    ResponseCode::Refused,
+                    "seed {SEED:#x} trace:\n{}",
+                    trace.join("\n")
+                );
+            }
+        }
+
+        assert_eq!(
+            *upstream.calls.borrow(),
+            expected_upstream_calls,
+            "seed {SEED:#x} upstream call mismatch\ntrace:\n{}",
+            trace.join("\n")
+        );
     }
 }
