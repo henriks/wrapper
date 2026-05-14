@@ -1266,13 +1266,19 @@ fn tool_payload_script(tool: GuestTool, tool_args: &[String]) -> String {
     command.push(shell_quote(tool.cli()));
     command.extend(tool.auto_flags().iter().map(|flag| shell_quote(flag)));
     command.extend(tool_args.iter().map(|arg| shell_quote(arg)));
+    let npm_package = format!("{}@latest", tool.npm_package());
+    let install_message = format!(
+        "agentvm: installing {} CLI in guest HOME (first run only)...",
+        tool.cli()
+    );
     [
         r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
         r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
         format!(
-            "if ! command -v {} >/dev/null 2>&1; then npm install --global {}; fi",
+            "if ! command -v {} >/dev/null 2>&1; then printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
             shell_quote(tool.cli()),
-            shell_quote(&format!("{}@latest", tool.npm_package()))
+            shell_quote(&install_message),
+            shell_quote(&npm_package)
         ),
         "hash -r 2>/dev/null || true".to_string(),
         r#"export MISE_TRUSTED_CONFIG_PATHS="$PWD""#.to_string(),
@@ -1814,7 +1820,10 @@ mod tests {
             .expect("tool payload");
         assert!(payload
             .script
-            .contains("npm install --global @openai/codex@latest"));
+            .contains("agentvm: installing codex CLI in guest HOME"));
+        assert!(payload
+            .script
+            .contains("npm install --global --no-progress @openai/codex@latest"));
         assert!(payload
             .script
             .contains("codex --dangerously-bypass-approvals-and-sandbox --model"));
@@ -2017,7 +2026,10 @@ mod tests {
             .expect("tool payload");
         assert!(payload
             .script
-            .contains("npm install --global @github/copilot@latest"));
+            .contains("agentvm: installing github-copilot-cli CLI in guest HOME"));
+        assert!(payload
+            .script
+            .contains("npm install --global --no-progress @github/copilot@latest"));
         assert!(payload
             .script
             .contains("github-copilot-cli --allow-all --no-auto-update suggest"));
