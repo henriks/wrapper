@@ -93,6 +93,7 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     let mut tls_ca_cert = None;
     let mut tls_ca_key = None;
     let mut tls_generate_per_host_certs = false;
+    let mut pcap_path = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -131,6 +132,9 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
                 let (host_port, guest_port) =
                     parse_port_pair(&value(args, &mut index, "--publish")?)?;
                 host_listeners.push(HostListener::published_tcp(host_port, guest_port));
+            }
+            "--pcap" => {
+                pcap_path = Some(PathBuf::from(value(args, &mut index, "--pcap")?));
             }
             "--tls-ca-cert" => {
                 tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
@@ -172,6 +176,8 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     policy.tls_mitm.ca_cert_path = tls_ca_cert;
     policy.tls_mitm.ca_key_path = tls_ca_key;
     policy.tls_mitm.generate_per_host_certs = tls_generate_per_host_certs;
+    policy.capture.pcap_path = pcap_path;
+    policy.capture.capture_guest_side_frames = policy.capture.pcap_path.is_some();
 
     Ok(VmnetRuntimeConfig::new(socket_path, network, policy))
 }
@@ -188,6 +194,7 @@ struct PolicyArgs {
     tls_ca_cert: Option<PathBuf>,
     tls_ca_key: Option<PathBuf>,
     tls_generate_per_host_certs: bool,
+    pcap_path: Option<PathBuf>,
 }
 
 fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyArgs), String> {
@@ -253,6 +260,9 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
                 policy
                     .host_listeners
                     .push(HostListener::published_tcp(host_port, guest_port));
+            }
+            "--pcap" => {
+                policy.pcap_path = Some(PathBuf::from(value(args, &mut index, "--pcap")?));
             }
             "--tls-ca-cert" => {
                 policy.tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
@@ -393,6 +403,8 @@ fn policy_from_args(network: GuestNetwork, args: PolicyArgs) -> VmnetPolicy {
     policy.tls_mitm.ca_cert_path = args.tls_ca_cert;
     policy.tls_mitm.ca_key_path = args.tls_ca_key;
     policy.tls_mitm.generate_per_host_certs = args.tls_generate_per_host_certs;
+    policy.capture.pcap_path = args.pcap_path;
+    policy.capture.capture_guest_side_frames = policy.capture.pcap_path.is_some();
     policy
 }
 
@@ -428,8 +440,8 @@ fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, Strin
 fn print_usage() {
     eprintln!(
         "usage: agentvm-frontend <prepare|launch|vmnet-gateway> [options]\n\
-         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
-         vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]"
+         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
+         vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]"
     );
 }
 

@@ -156,15 +156,18 @@ impl GuestTlsSession {
     }
 
     pub fn read_guest_tls(&mut self, bytes: &[u8]) -> Result<GuestTlsRead, TlsMitmError> {
-        let mut reader = bytes;
-        self.server
-            .read_tls(&mut reader)
-            .map_err(|error| TlsMitmError::Io(error.to_string()))?;
-        self.server
-            .process_new_packets()
-            .map_err(|error| TlsMitmError::Tls(error.to_string()))?;
-        let plaintext = read_plaintext(&mut self.server)?;
-        let tls_to_guest = drain_tls_writes(&mut self.server)?;
+        let mut plaintext = Vec::new();
+        let mut tls_to_guest = Vec::new();
+        for chunk in bytes.chunks(TLS_FEED_CHUNK_SIZE) {
+            let mut reader = chunk;
+            self.server
+                .read_tls(&mut reader)
+                .map_err(|error| TlsMitmError::Io(error.to_string()))?;
+            let (chunk_plaintext, chunk_tls_to_guest) =
+                process_server_packets_until_idle(&mut self.server)?;
+            plaintext.extend_from_slice(&chunk_plaintext);
+            tls_to_guest.extend_from_slice(&chunk_tls_to_guest);
+        }
         Ok(GuestTlsRead {
             plaintext,
             tls_to_guest,
@@ -212,15 +215,18 @@ impl TlsUpstreamSession {
     }
 
     pub fn read_upstream_tls(&mut self, bytes: &[u8]) -> Result<TlsUpstreamRead, TlsMitmError> {
-        let mut reader = bytes;
-        self.client
-            .read_tls(&mut reader)
-            .map_err(|error| TlsMitmError::Io(error.to_string()))?;
-        self.client
-            .process_new_packets()
-            .map_err(|error| TlsMitmError::Tls(error.to_string()))?;
-        let plaintext = read_client_plaintext(&mut self.client)?;
-        let tls_to_upstream = drain_client_tls_writes(&mut self.client)?;
+        let mut plaintext = Vec::new();
+        let mut tls_to_upstream = Vec::new();
+        for chunk in bytes.chunks(TLS_FEED_CHUNK_SIZE) {
+            let mut reader = chunk;
+            self.client
+                .read_tls(&mut reader)
+                .map_err(|error| TlsMitmError::Io(error.to_string()))?;
+            let (chunk_plaintext, chunk_tls_to_upstream) =
+                process_client_packets_until_idle(&mut self.client)?;
+            plaintext.extend_from_slice(&chunk_plaintext);
+            tls_to_upstream.extend_from_slice(&chunk_tls_to_upstream);
+        }
         Ok(TlsUpstreamRead {
             plaintext,
             tls_to_upstream,
@@ -242,6 +248,52 @@ impl TlsUpstreamSession {
     pub fn is_handshaking(&self) -> bool {
         self.client.is_handshaking()
     }
+}
+
+const TLS_FEED_CHUNK_SIZE: usize = 1024;
+
+fn process_server_packets_until_idle(
+    server: &mut ServerConnection,
+) -> Result<(Vec<u8>, Vec<u8>), TlsMitmError> {
+    let mut plaintext = Vec::new();
+    let mut tls_to_peer = Vec::new();
+    for _ in 0..32 {
+        let state = server
+            .process_new_packets()
+            .map_err(|error| TlsMitmError::Tls(error.to_string()))?;
+        let new_plaintext = read_plaintext(server)?;
+        let new_tls = drain_tls_writes(server)?;
+        let made_progress = !new_plaintext.is_empty() || !new_tls.is_empty();
+        plaintext.extend_from_slice(&new_plaintext);
+        tls_to_peer.extend_from_slice(&new_tls);
+        if !made_progress && state.tls_bytes_to_write() == 0 && state.plaintext_bytes_to_read() == 0
+        {
+            break;
+        }
+    }
+    Ok((plaintext, tls_to_peer))
+}
+
+fn process_client_packets_until_idle(
+    client: &mut ClientConnection,
+) -> Result<(Vec<u8>, Vec<u8>), TlsMitmError> {
+    let mut plaintext = Vec::new();
+    let mut tls_to_peer = Vec::new();
+    for _ in 0..32 {
+        let state = client
+            .process_new_packets()
+            .map_err(|error| TlsMitmError::Tls(error.to_string()))?;
+        let new_plaintext = read_client_plaintext(client)?;
+        let new_tls = drain_client_tls_writes(client)?;
+        let made_progress = !new_plaintext.is_empty() || !new_tls.is_empty();
+        plaintext.extend_from_slice(&new_plaintext);
+        tls_to_peer.extend_from_slice(&new_tls);
+        if !made_progress && state.tls_bytes_to_write() == 0 && state.plaintext_bytes_to_read() == 0
+        {
+            break;
+        }
+    }
+    Ok((plaintext, tls_to_peer))
 }
 
 pub fn rustls_client_config_with_native_roots() -> Result<ClientConfig, TlsMitmError> {
@@ -523,6 +575,50 @@ mod tests {
             .read_upstream_tls(&response_tls)
             .expect("response read");
         assert_eq!(response.plaintext, b"HTTP/1.1 204 No Content\r\n\r\n");
+    }
+
+    #[test]
+    fn upstream_tls_session_emits_request_after_client_finished() {
+        let (ca_cert, ca_key) = test_ca_pem();
+        let authority = TlsMitmAuthority::from_pem(&ca_cert, &ca_key).expect("authority");
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.ca_cert()).expect("root");
+        let client_config = Arc::new(rustls_client_config_with_roots(roots).expect("client"));
+        let generated = authority
+            .generate_server_certificate("upstream.example")
+            .expect("server cert");
+        let server_config = Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(generated.cert_chain, generated.private_key)
+                .expect("server config"),
+        );
+        let mut upstream =
+            TlsUpstreamSession::new(client_config, "upstream.example").expect("upstream");
+        let mut server = ServerConnection::new(server_config).expect("server");
+
+        let client_hello = upstream.drain_tls_to_upstream().expect("client hello");
+        assert!(!client_hello.is_empty());
+        feed_server_tls(&mut server, &client_hello);
+
+        let server_flight = drain_server_tls(&mut server);
+        assert!(!server_flight.is_empty());
+        let read = upstream
+            .read_upstream_tls(&server_flight)
+            .expect("server flight");
+        assert!(read.plaintext.is_empty());
+        assert!(!read.tls_to_upstream.is_empty());
+        feed_server_tls(&mut server, &read.tls_to_upstream);
+
+        let request_tls = upstream
+            .write_upstream_plaintext(b"GET / HTTP/1.1\r\nHost: upstream.example\r\n\r\n")
+            .expect("request tls");
+        assert!(
+            !request_tls.is_empty(),
+            "rustls accepted plaintext after client Finished but emitted no TLS"
+        );
     }
 
     fn test_ca_pem() -> (String, String) {

@@ -92,7 +92,12 @@ pub struct UdpDnsUpstream {
 impl DnsUpstream for UdpDnsUpstream {
     fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
         let wire = query.to_vec().map_err(|_| DnsUpstreamError::InvalidQuery)?;
-        let socket = UdpSocket::bind("127.0.0.1:0").map_err(|_| DnsUpstreamError::Unavailable)?;
+        let bind_addr = if self.server.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr).map_err(|_| DnsUpstreamError::Unavailable)?;
         socket
             .set_read_timeout(Some(self.timeout))
             .map_err(|_| DnsUpstreamError::Unavailable)?;
@@ -108,6 +113,24 @@ impl DnsUpstream for UdpDnsUpstream {
             .map_err(|_| DnsUpstreamError::Unavailable)?;
         response.truncate(len);
         Message::from_vec(&response).map_err(|_| DnsUpstreamError::InvalidResponse)
+    }
+}
+
+impl<T> DnsUpstream for &T
+where
+    T: DnsUpstream + ?Sized,
+{
+    fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
+        (**self).exchange(query)
+    }
+}
+
+impl<T> DnsUpstream for Box<T>
+where
+    T: DnsUpstream + ?Sized,
+{
+    fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
+        (**self).exchange(query)
     }
 }
 

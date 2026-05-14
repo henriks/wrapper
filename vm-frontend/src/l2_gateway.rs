@@ -252,7 +252,7 @@ fn subnet_mask(prefix_len: u8) -> [u8; 4] {
     mask.to_be_bytes()
 }
 
-fn ipv4_checksum(header: &[u8]) -> u16 {
+pub(crate) fn ipv4_checksum(header: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for chunk in header.chunks(2) {
         let word = if chunk.len() == 2 {

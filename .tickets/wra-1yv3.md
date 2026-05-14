@@ -1,6 +1,6 @@
 ---
 id: wra-1yv3
-status: in_progress
+status: closed
 deps: [wra-pkhr]
 links: []
 created: 2026-05-13T21:33:38Z
@@ -32,3 +32,7 @@ Follow-up after appliance rebuild: boot reached guest-init but panicked before p
 **2026-05-14T07:38:04Z**
 
 After rebuilding the image again, booted HTTPS MITM validation now confirms the guest CA delivery path works: guest-init logs installed MITM CA bundle at /run/agentvm-ca-bundle.pem, payloads inherit SSL_CERT_FILE and REQUESTS_CA_BUNDLE, and a Python ssl.create_default_context() request to 104.20.23.154:443 with SNI example.com completes the guest TLS handshake without an explicit cafile. vmnet-events.log records tcp_connected action=InterceptHttps and decrypted http_request method=GET host=example.com path=/. While validating the response path, found a remaining HTTPS upstream forwarding bug: nonblocking upstream TLS writes can leave handshake/application data buffered, and the guest receives zero response bytes before timing out. Implemented buffered upstream socket writes, added https_plaintext_buffered summary logging, and added rustls drain attempts; cargo test --manifest-path vm-frontend/Cargo.toml --offline still passes. The ticket remains open because the full acceptance criterion requires guest HTTPS response success, not just guest trust and decrypted request logging.
+
+**2026-05-14T14:48:49Z**
+
+Completed HTTPS MITM validation after the rebuilt image. Guest init installs the configured CA into /run/agentvm-ca-bundle.pem and payloads inherit SSL_CERT_FILE and REQUESTS_CA_BUNDLE. Final booted guest smoke used Python ssl.create_default_context(), connected to 104.20.23.154:443 with SNI example.com, sent Host: example.com, and received HTTP/1.1 200 OK with an 837-byte response sample. Cleaned vmnet-events.log showed summary-only events: tcp_connected action=InterceptHttps, tls_handshake_payload, tls_upstream_payload, decrypted http_request method=GET host=example.com path=/, guest_payload byte count, and upstream_payload byte count. The response-path bug was fixed by buffering nonblocking upstream socket writes, keeping HTTPS plaintext queued until the upstream rustls client is no longer handshaking, and processing coalesced rustls server flights in bounded chunks until idle. Added local regression coverage in tls_mitm::tests::upstream_tls_session_emits_request_after_client_finished. Validation: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed with 66 lib tests, 1 existing ignored, and 8 bin tests. Also observed that a hostname-based urllib smoke fails at DNS resolution with EAI_AGAIN/no DNS events; documented that on wra-hd3q because it is a DNS runtime wiring/validation issue, not an HTTPS MITM blocker.

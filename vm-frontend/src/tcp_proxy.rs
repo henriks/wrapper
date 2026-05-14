@@ -197,7 +197,6 @@ where
                                 continue;
                             }
                         }
-                        session.upstream_tls_ready = true;
                     }
                     if !session.upstream_tls_ready {
                         session.upstream_tls_ready = session
@@ -314,10 +313,6 @@ where
                 session
                     .pending_upstream_plaintext
                     .extend_from_slice(&payload);
-                events.push(TcpProxyEvent::HttpsPlaintextBuffered {
-                    handle,
-                    bytes: payload.len(),
-                });
                 return;
             }
             write_https_plaintext_upstream(session, handle, &payload, events);
@@ -523,7 +518,10 @@ fn flush_pending_upstream_bytes<T: Write>(
     }
     if session.decision.action == TcpAction::InterceptHttps
         && session.pending_upstream_bytes.is_empty()
-        && session.upstream_tls.is_some()
+        && session
+            .upstream_tls
+            .as_ref()
+            .is_some_and(|upstream_tls| !upstream_tls.is_handshaking())
     {
         session.upstream_tls_ready = true;
         flush_pending_https_plaintext(session, handle, events);
@@ -573,10 +571,6 @@ pub enum TcpProxyEvent {
         guest_frames: Vec<Vec<u8>>,
     },
     TlsUpstreamPayload {
-        handle: SocketHandle,
-        bytes: usize,
-    },
-    HttpsPlaintextBuffered {
         handle: SocketHandle,
         bytes: usize,
     },

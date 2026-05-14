@@ -14,8 +14,10 @@ use crate::tcp_gateway::{
 };
 use crate::tcp_proxy::{TcpProxyBridge, TcpProxyEvent};
 use crate::tls_mitm::{TlsMitmAuthority, TlsMitmError};
-use crate::vmnet_gateway::{GuestFrameOutcome, VmnetGateway, VmnetGatewayError};
-use crate::vmnet_stream::{FrameRead, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError};
+use crate::vmnet_gateway::{GuestFrameOutcome, UdpDenial, VmnetGateway, VmnetGatewayError};
+use crate::vmnet_stream::{
+    FrameRead, PcapWriter, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError,
+};
 use crate::GuestNetwork;
 
 pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,12 +78,17 @@ pub struct VmnetRuntimeTick {
     pub eof: bool,
     pub guest_frame_read: bool,
     pub guest_frames_written: usize,
+    pub captured_frames: usize,
     pub gateway_events: Vec<VmnetGatewayEvent>,
     pub proxy_events: Vec<TcpProxyEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmnetGatewayEvent {
+    DnsQuery {
+        log: crate::dns_proxy::DnsLogEntry,
+    },
+    UdpDenied(UdpDenial),
     TcpDenied {
         destination: crate::tcp_gateway::TcpDestination,
         decision: crate::tcp_gateway::TcpDecision,
@@ -112,9 +119,9 @@ where
         if let Some(event) = gateway_event_from_outcome(&result.outcome) {
             stats.gateway_events.push(event);
         }
-        write_guest_frames(frame_io, &result.guest_frames, &mut stats)?;
+        write_guest_frames(frame_io, &result.guest_frames, &mut stats, None)?;
 
-        let pump = pump_proxy_once(frame_io, gateway, proxy, now())?;
+        let pump = pump_proxy_once(frame_io, gateway, proxy, now(), None)?;
         stats.guest_frames_written += pump.guest_frames_written;
         stats.proxy_events.extend(pump.events);
     }
@@ -126,6 +133,7 @@ pub fn run_qemu_stream_tick<T, C>(
     gateway: &mut VmnetGateway<'_>,
     proxy: &mut TcpProxyBridge<C>,
     now: Instant,
+    mut pcap: Option<&mut PcapWriter>,
 ) -> Result<VmnetRuntimeTick, VmnetRuntimeError>
 where
     T: Read + Write,
@@ -136,20 +144,29 @@ where
     match frame_io.try_read_frame()? {
         FrameRead::Frame(frame) => {
             tick.guest_frame_read = true;
+            capture_frame(pcap.as_deref_mut(), &frame)?;
+            tick.captured_frames += usize::from(pcap.is_some());
             let result = gateway.handle_guest_frame(frame, now);
             if let Some(event) = gateway_event_from_outcome(&result.outcome) {
                 tick.gateway_events.push(event);
             }
             let mut stats = VmnetRuntimeStats::default();
-            write_guest_frames(frame_io, &result.guest_frames, &mut stats)?;
+            let captured = write_guest_frames(
+                frame_io,
+                &result.guest_frames,
+                &mut stats,
+                pcap.as_deref_mut(),
+            )?;
             tick.guest_frames_written += stats.guest_frames_written;
+            tick.captured_frames += captured;
         }
         FrameRead::WouldBlock => {}
         FrameRead::Eof => tick.eof = true,
     }
 
-    let pump = pump_proxy_once(frame_io, gateway, proxy, now)?;
+    let pump = pump_proxy_once(frame_io, gateway, proxy, now, pcap.as_deref_mut())?;
     tick.guest_frames_written += pump.guest_frames_written;
+    tick.captured_frames += pump.guest_frames_written;
     tick.proxy_events = pump.events;
     Ok(tick)
 }
@@ -172,6 +189,7 @@ pub fn serve_vmnet_gateway(
     let host_listeners = HostIngressListenerSet::bind(&config.policy.host_listeners)?;
     let mut stats = VmnetRuntimeStats::default();
     let mut event_log = open_event_log(config.event_log_path.as_deref())?;
+    let mut pcap = open_pcap_capture(&config)?;
 
     loop {
         let tick = run_qemu_stream_tick(
@@ -179,6 +197,7 @@ pub fn serve_vmnet_gateway(
             &mut gateway,
             &mut proxy,
             smoltcp_now(started),
+            pcap.as_mut(),
         )?;
         if tick.eof {
             return Ok(stats);
@@ -193,6 +212,7 @@ pub fn serve_vmnet_gateway(
             &mut host_ingress,
             &host_listeners,
             smoltcp_now(started),
+            pcap.as_mut(),
         )?;
         stats.guest_frames_written += host_pump.guest_frames_written;
         let idle = !tick.guest_frame_read
@@ -237,6 +257,7 @@ pub fn pump_proxy_once<T, C>(
     gateway: &mut VmnetGateway<'_>,
     proxy: &mut TcpProxyBridge<C>,
     now: Instant,
+    mut pcap: Option<&mut PcapWriter>,
 ) -> Result<VmnetProxyPump, VmnetRuntimeError>
 where
     T: Read + Write,
@@ -249,6 +270,7 @@ where
         | TcpProxyEvent::TlsHandshakePayload { guest_frames, .. } = &event
         {
             for frame in guest_frames {
+                capture_frame(pcap.as_deref_mut(), frame)?;
                 frame_io.write_frame(frame)?;
                 pump.guest_frames_written += 1;
             }
@@ -264,6 +286,7 @@ pub fn pump_host_ingress_once<T>(
     bridge: &mut HostIngressBridge<std::net::TcpStream>,
     listeners: &HostIngressListenerSet,
     now: Instant,
+    mut pcap: Option<&mut PcapWriter>,
 ) -> Result<VmnetHostIngressPump, VmnetRuntimeError>
 where
     T: Read + Write,
@@ -274,6 +297,7 @@ where
         match bridge.open_session(gateway, accepted.guest_port, accepted.connection, now) {
             Ok(open) => {
                 for frame in &open.guest_frames {
+                    capture_frame(pcap.as_deref_mut(), frame)?;
                     frame_io.write_frame(frame)?;
                     pump.guest_frames_written += 1;
                 }
@@ -296,6 +320,7 @@ where
         | HostIngressEvent::HostClosed { guest_frames, .. } = &event
         {
             for frame in guest_frames {
+                capture_frame(pcap.as_deref_mut(), frame)?;
                 frame_io.write_frame(frame)?;
                 pump.guest_frames_written += 1;
             }
@@ -309,6 +334,26 @@ where
 fn open_event_log(path: Option<&std::path::Path>) -> io::Result<Option<File>> {
     path.map(|path| OpenOptions::new().create(true).append(true).open(path))
         .transpose()
+}
+
+fn open_pcap_capture(config: &VmnetRuntimeConfig) -> io::Result<Option<PcapWriter>> {
+    if !config.policy.capture.capture_guest_side_frames {
+        return Ok(None);
+    }
+    config
+        .policy
+        .capture
+        .pcap_path
+        .as_ref()
+        .map(|path| PcapWriter::create(path, 65_535))
+        .transpose()
+}
+
+fn capture_frame(pcap: Option<&mut PcapWriter>, frame: &[u8]) -> Result<(), VmnetRuntimeError> {
+    if let Some(pcap) = pcap {
+        pcap.write_ethernet_frame(frame)?;
+    }
+    Ok(())
 }
 
 fn write_proxy_events(log: &mut Option<File>, events: &[TcpProxyEvent]) -> io::Result<()> {
@@ -333,6 +378,20 @@ fn write_gateway_events(log: &mut Option<File>, events: &[VmnetGatewayEvent]) ->
 
 fn format_gateway_event(event: &VmnetGatewayEvent) -> String {
     match event {
+        VmnetGatewayEvent::DnsQuery { log } => format!(
+            "dns_query domain={} decision={:?} detail={}",
+            log.domain.as_deref().unwrap_or("-"),
+            log.decision,
+            log.detail
+        ),
+        VmnetGatewayEvent::UdpDenied(denial) => format!(
+            "udp_denied src={}:{} dst={}:{} reason={}",
+            std::net::Ipv4Addr::from(denial.src_ip),
+            denial.src_port,
+            std::net::Ipv4Addr::from(denial.dst_ip),
+            denial.dst_port,
+            denial.reason
+        ),
         VmnetGatewayEvent::TcpDenied {
             destination,
             decision,
@@ -352,6 +411,10 @@ fn format_gateway_event(event: &VmnetGatewayEvent) -> String {
 
 fn gateway_event_from_outcome(outcome: &GuestFrameOutcome) -> Option<VmnetGatewayEvent> {
     match outcome {
+        GuestFrameOutcome::DnsQuery { log } => {
+            Some(VmnetGatewayEvent::DnsQuery { log: log.clone() })
+        }
+        GuestFrameOutcome::UdpDenied(denial) => Some(VmnetGatewayEvent::UdpDenied(denial.clone())),
         GuestFrameOutcome::TcpDenied {
             destination,
             decision,
@@ -514,9 +577,6 @@ fn format_proxy_event(event: &TcpProxyEvent) -> String {
         TcpProxyEvent::TlsUpstreamPayload { handle, bytes } => {
             format!("tls_upstream_payload handle={handle:?} bytes={bytes}")
         }
-        TcpProxyEvent::HttpsPlaintextBuffered { handle, bytes } => {
-            format!("https_plaintext_buffered handle={handle:?} bytes={bytes}")
-        }
         TcpProxyEvent::TlsMitmUnavailable {
             handle,
             destination,
@@ -546,15 +606,19 @@ fn write_guest_frames<T>(
     frame_io: &mut QemuFrameIo<T>,
     frames: &[Vec<u8>],
     stats: &mut VmnetRuntimeStats,
-) -> Result<(), VmnetRuntimeError>
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<usize, VmnetRuntimeError>
 where
     T: Read + Write,
 {
+    let mut captured = 0;
     for frame in frames {
+        capture_frame(pcap.as_deref_mut(), frame)?;
+        captured += usize::from(pcap.is_some());
         frame_io.write_frame(frame)?;
         stats.guest_frames_written += 1;
     }
-    Ok(())
+    Ok(captured)
 }
 
 #[derive(Debug)]
@@ -688,6 +752,7 @@ mod tests {
             &mut gateway,
             &mut proxy,
             Instant::from_millis(millis),
+            None,
         )
         .expect("pump");
 

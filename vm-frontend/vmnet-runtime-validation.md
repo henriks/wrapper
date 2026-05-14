@@ -1,6 +1,6 @@
 # VMNet Runtime Validation
 
-Tickets: `wra-p7m4`, `wra-pah4`, `wra-1yv3`
+Tickets: `wra-p7m4`, `wra-pah4`, `wra-1yv3`, `wra-hd3q`
 
 Date: 2026-05-13
 
@@ -12,13 +12,10 @@ config-fs manifests, start embedded composed-fs/config-fs/vmnet tasks, and build
 QEMU with `-netdev stream`.
 
 As of 2026-05-14, a booted `microvm` has validated the Rust stream gateway for
-guest network setup, TCP/80 HTTP interception, local upstream mapping,
+guest network setup, TCP/80 HTTP interception, HTTPS MITM with a guest-trusted
+CA, DNS proxying, UDP/443 denial, pcap capture, local upstream mapping,
 deny-by-default metadata/private range blocking, explicit `--no-net` blocking,
-Docker/payload host listeners, and generic published TCP host ingress. The Rust
-stream path is viable for the tested HTTP egress and host-ingress paths, but it
-is not yet ready to replace the Python frontend wholesale because HTTPS MITM,
-DNS/UDP policy, pcap capture, and long-running lifecycle behavior still need
-booted-VM validation.
+Docker/payload host listeners, and generic published TCP host ingress.
 
 Observed local prerequisites:
 
@@ -151,23 +148,39 @@ escalation and passed.
   per-host certificate generation, guest-side TLS termination, upstream TLS
   encryption/validation using native roots, and decrypted HTTP summary logging
   are unit tested.
-- HTTPS MITM boot validation has a partial result. The frontend now exposes the
-  configured `--tls-ca-cert` as `/run/agentvm-config/mitm-ca.crt`. Because the
-  guest rootfs is mounted read-only, guest-init cannot update
-  `/usr/local/share/ca-certificates` or `/etc/ssl`; it now assembles a combined
-  CA bundle at `/run/agentvm-ca-bundle.pem` and exports `SSL_CERT_FILE` and
-  `REQUESTS_CA_BUNDLE` before starting guest payload services. With the
-  pre-hook image, a guest Python TLS request to `104.20.23.154:443` with SNI
-  `example.com` reached the MITM and failed with `CERTIFICATE_VERIFY_FAILED`;
-  vmnet logged `action=InterceptHttps`, `tls_handshake_payload`,
-  `tls_upstream_payload`, and `tls_mitm_failed ... UnknownCA`. When the guest
-  script explicitly loaded `/run/agentvm-config/mitm-ca.crt`, guest TLS
-  completed and vmnet logged the decrypted summary
-  `http_request ... method=GET host=example.com path=/`. A subsequent rebuilt
-  image still used a write-to-rootfs CA hook and panicked during init with a
-  read-only filesystem error. Full success using guest default trust requires
-  rebuilding the appliance again from the updated `docker/guest-init.sh` and
-  `docker/build-appliance.sh`.
+- HTTPS MITM boot validation succeeds with the rebuilt image. The frontend
+  exposes the configured `--tls-ca-cert` as
+  `/run/agentvm-config/mitm-ca.crt`. Because the guest rootfs is mounted
+  read-only, guest-init assembles a combined CA bundle at
+  `/run/agentvm-ca-bundle.pem` and exports `SSL_CERT_FILE` and
+  `REQUESTS_CA_BUNDLE` before starting guest payload services. A guest Python
+  TLS request to `104.20.23.154:443` with SNI `example.com` using
+  `ssl.create_default_context()` returned `HTTP/1.1 200 OK`. vmnet logged
+  summary-only events: `tcp_connected ... action=InterceptHttps`,
+  `http_request ... method=GET host=example.com path=/`,
+  `tls_upstream_payload ... bytes=80`, `guest_payload ... bytes=94`, and
+  `upstream_payload ... bytes=859`.
+- HTTPS MITM failure mode is documented: with a pre-CA-hook image, the same
+  guest request reached the MITM and failed with
+  `CERTIFICATE_VERIFY_FAILED`; vmnet logged `action=InterceptHttps`,
+  `tls_handshake_payload`, `tls_upstream_payload`, and
+  `tls_mitm_failed ... UnknownCA`.
+- DNS/UDP/pcap boot validation succeeds. `VmnetGateway` routes UDP/53 frames
+  addressed to the configured gateway DNS IP through `DnsProxy`, and
+  `UdpDnsUpstream` forwards through the host resolver. In a booted guest,
+  `/etc/resolv.conf` contained `nameserver 10.0.2.3`,
+  `socket.getaddrinfo("example.com", 443)` returned A and AAAA answers, and
+  `urllib.request.urlopen("https://example.com/")` returned status `200`.
+  `vmnet-events.log` recorded `dns_query domain=example.com decision=Allowed
+  detail=forwarded to upstream`.
+- UDP/443 denial is boot-validated. A guest UDP datagram to
+  `104.20.23.154:443` timed out as expected, and `vmnet-events.log` recorded
+  `udp_denied ... dst=104.20.23.154:443 reason=udp/443 blocked to prevent QUIC
+  bypass`.
+- Pcap capture is boot-validated via `--pcap
+  .sandbox/docker-vm/udp-pcap-final/guest-side.pcap`. The generated pcap was
+  6038 bytes, had magic `d4c3b2a1`, parsed as well-formed, and contained 67
+  captured Ethernet records.
 - Runtime frame pump from QEMU stream framing to vmnet gateway to TCP proxy
   bridge and back to guest frames.
 - Delayed upstream responses via `pump_proxy_once()` without requiring another
@@ -275,7 +288,4 @@ misleading composed-fs/config-fs/vmnet failures.
 
 Additional booted validation still needed before replacement:
 
-- HTTPS MITM with a CA installed in the guest image.
-- DNS proxy logging/policy from inside the guest.
-- UDP/443 and unsupported protocol denial from inside the guest.
-- Optional pcap capture from the QEMU stream boundary.
+- Long-running lifecycle behavior under representative interactive workloads.
