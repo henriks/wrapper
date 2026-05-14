@@ -2171,6 +2171,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
+    use std::os::unix::fs::symlink;
     use std::os::unix::fs::FileExt;
     use std::thread;
     use virtiofsd::oslib::{ReadvFlags, WritevFlags};
@@ -2365,6 +2366,439 @@ mod tests {
 
     fn stress_name(index: usize) -> String {
         format!("p{index:03}.txt")
+    }
+
+    #[derive(Clone, Debug)]
+    enum NestedFsOp {
+        Mkdir { path: usize },
+        Put { path: usize, len: usize, byte: u8 },
+        Read { path: usize },
+        Rename { from: usize, to: usize },
+        Unlink { path: usize },
+        Rmdir { path: usize },
+        HostPut { path: usize, len: usize, byte: u8 },
+        HostMkdir { path: usize },
+        Readdir { path: usize },
+        ReadonlyCreateProbe,
+        CrossMountRenameProbe,
+        HostSymlinkEscapeProbe,
+    }
+
+    fn nested_fs_ops() -> impl Strategy<Value = Vec<NestedFsOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0usize..8).prop_map(|path| NestedFsOp::Mkdir { path }),
+                (0usize..8, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
+                    NestedFsOp::Put {
+                        path,
+                        len: len + 1,
+                        byte,
+                    }
+                }),
+                (0usize..8).prop_map(|path| NestedFsOp::Read { path }),
+                (0usize..8, 0usize..8).prop_map(|(from, to)| NestedFsOp::Rename { from, to }),
+                (0usize..8).prop_map(|path| NestedFsOp::Unlink { path }),
+                (0usize..8).prop_map(|path| NestedFsOp::Rmdir { path }),
+                (0usize..8, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
+                    NestedFsOp::HostPut {
+                        path,
+                        len: len + 1,
+                        byte,
+                    }
+                }),
+                (0usize..8).prop_map(|path| NestedFsOp::HostMkdir { path }),
+                (0usize..8).prop_map(|path| NestedFsOp::Readdir { path }),
+                Just(NestedFsOp::ReadonlyCreateProbe),
+                Just(NestedFsOp::CrossMountRenameProbe),
+                Just(NestedFsOp::HostSymlinkEscapeProbe),
+            ],
+            1..96,
+        )
+    }
+
+    fn nested_path(index: usize) -> &'static str {
+        match index % 8 {
+            0 => "a.txt",
+            1 => "b.txt",
+            2 => "dir",
+            3 => "dir/a.txt",
+            4 => "dir/sub",
+            5 => "dir/sub/c.txt",
+            6 => "other",
+            _ => "other/d.txt",
+        }
+    }
+
+    fn split_nested_path(path: &str) -> (&str, &str) {
+        path.rsplit_once('/').unwrap_or(("", path))
+    }
+
+    fn lookup_relative_inode(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<u64> {
+        let mut inode = root_inode;
+        if path.is_empty() {
+            return Ok(inode);
+        }
+        for component in path.split('/') {
+            inode = lookup(fs, inode, component)?.inode;
+        }
+        Ok(inode)
+    }
+
+    fn fs_create_write_release(
+        fs: &ComposedFs,
+        root_inode: u64,
+        path: &str,
+        data: Vec<u8>,
+    ) -> io::Result<()> {
+        let (parent_path, name) = split_nested_path(path);
+        let parent = lookup_relative_inode(fs, root_inode, parent_path)?;
+        let name = CString::new(name).expect("name");
+        let (entry, handle, _options) = fs.create(
+            ctx(),
+            parent,
+            name.as_c_str(),
+            0o644,
+            false,
+            (libc::O_RDWR | libc::O_TRUNC) as u32,
+            0,
+            Extensions::default(),
+        )?;
+        let handle = handle.expect("handle");
+        fs.write(
+            ctx(),
+            entry.inode,
+            handle,
+            VecReader { data: data.clone() },
+            data.len() as u32,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )?;
+        fs.release(ctx(), entry.inode, 0, handle, true, false, None)?;
+        Ok(())
+    }
+
+    fn fs_read_path(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<Vec<u8>> {
+        let inode = lookup_relative_inode(fs, root_inode, path)?;
+        let (handle, _options) = fs.open(ctx(), inode, false, libc::O_RDONLY as u32)?;
+        let handle = handle.expect("handle");
+        let mut reader = VecWriter::default();
+        fs.read(ctx(), inode, handle, &mut reader, 4096, 0, None, 0)?;
+        fs.release(ctx(), inode, 0, handle, false, false, None)?;
+        Ok(reader.data)
+    }
+
+    fn fs_mkdir_path(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<()> {
+        let (parent_path, name) = split_nested_path(path);
+        let parent = lookup_relative_inode(fs, root_inode, parent_path)?;
+        let name = CString::new(name).expect("name");
+        fs.mkdir(
+            ctx(),
+            parent,
+            name.as_c_str(),
+            0o755,
+            0,
+            Extensions::default(),
+        )?;
+        Ok(())
+    }
+
+    fn fs_unlink_path(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<()> {
+        let (parent_path, name) = split_nested_path(path);
+        let parent = lookup_relative_inode(fs, root_inode, parent_path)?;
+        let name = CString::new(name).expect("name");
+        fs.unlink(ctx(), parent, name.as_c_str())
+    }
+
+    fn fs_rmdir_path(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<()> {
+        let (parent_path, name) = split_nested_path(path);
+        let parent = lookup_relative_inode(fs, root_inode, parent_path)?;
+        let name = CString::new(name).expect("name");
+        fs.rmdir(ctx(), parent, name.as_c_str())
+    }
+
+    fn fs_rename_path(fs: &ComposedFs, root_inode: u64, from: &str, to: &str) -> io::Result<()> {
+        let (from_parent_path, from_name) = split_nested_path(from);
+        let (to_parent_path, to_name) = split_nested_path(to);
+        let from_parent = lookup_relative_inode(fs, root_inode, from_parent_path)?;
+        let to_parent = lookup_relative_inode(fs, root_inode, to_parent_path)?;
+        let from_name = CString::new(from_name).expect("from");
+        let to_name = CString::new(to_name).expect("to");
+        fs.rename(
+            ctx(),
+            from_parent,
+            from_name.as_c_str(),
+            to_parent,
+            to_name.as_c_str(),
+            0,
+        )
+    }
+
+    fn fs_readdir_names(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<Vec<String>> {
+        let inode = lookup_relative_inode(fs, root_inode, path)?;
+        let mut names = dir_names(fs.readdir(ctx(), inode, inode, 16 * 1024, 0)?);
+        names.sort();
+        Ok(names)
+    }
+
+    fn host_put_path(root: &Path, path: &str, data: &[u8]) -> io::Result<()> {
+        let full = root.join(path);
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        std::io::Write::write_all(&mut options.open(full)?, data)
+    }
+
+    fn host_mkdir_path(root: &Path, path: &str) -> io::Result<()> {
+        fs::create_dir(root.join(path))
+    }
+
+    fn host_read_path(root: &Path, path: &str) -> io::Result<Vec<u8>> {
+        fs::read(root.join(path))
+    }
+
+    fn host_readdir_names(root: &Path, path: &str) -> io::Result<Vec<String>> {
+        let mut names = fs::read_dir(root.join(path))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        names.sort();
+        Ok(names)
+    }
+
+    fn same_result<T: PartialEq + std::fmt::Debug>(
+        fs_result: io::Result<T>,
+        host_result: io::Result<T>,
+        trace: &[String],
+        label: &str,
+    ) {
+        match (fs_result, host_result) {
+            (Ok(fs_value), Ok(host_value)) => assert_eq!(
+                fs_value,
+                host_value,
+                "{label} value mismatch\noperation trace:\n{}",
+                trace.join("\n")
+            ),
+            (Err(fs_error), Err(host_error)) => assert!(
+                equivalent_path_errno(fs_error.raw_os_error(), host_error.raw_os_error()),
+                "{label} errno mismatch: fs={fs_error}, host={host_error}\noperation trace:\n{}",
+                trace.join("\n")
+            ),
+            (Ok(value), Err(host_error)) => panic!(
+                "{label} succeeded in composed-fs with {value:?} but host failed with {host_error}\noperation trace:\n{}",
+                trace.join("\n")
+            ),
+            (Err(fs_error), Ok(value)) => panic!(
+                "{label} failed in composed-fs with {fs_error} but host succeeded with {value:?}\noperation trace:\n{}",
+                trace.join("\n")
+            ),
+        }
+    }
+
+    fn equivalent_path_errno(left: Option<i32>, right: Option<i32>) -> bool {
+        left == right
+            || matches!(
+                (left, right),
+                (Some(libc::ENOENT), Some(libc::ENOTDIR))
+                    | (Some(libc::ENOTDIR), Some(libc::ENOENT))
+            )
+    }
+
+    fn run_nested_fs_ops_case(case_name: &str, generated_ops: &[NestedFsOp]) {
+        let test_dir = TestDir::new(case_name);
+        let root = test_dir.path.join("root");
+        let oracle = test_dir.path.join("oracle");
+        let readonly = test_dir.path.join("readonly");
+        let outside = test_dir.path.join("outside-secret.txt");
+        fs::create_dir(&root).expect("create root");
+        fs::create_dir(&oracle).expect("create oracle");
+        fs::create_dir(&readonly).expect("create readonly");
+        fs::write(&outside, b"outside-secret").expect("outside secret");
+        fs::write(readonly.join("ro.txt"), b"readonly").expect("readonly file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![
+            dir_mount("workspace", "/workspace", &root, AccessMode::Rw),
+            dir_mount("readonly", "/readonly", &readonly, AccessMode::Ro),
+        ]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let readonly_entry = lookup(&fs, ROOT_ID, "readonly").expect("lookup readonly");
+        let mut trace = Vec::new();
+
+        for (step, op) in generated_ops.iter().enumerate() {
+            match op {
+                NestedFsOp::Mkdir { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: mkdir {path}"));
+                    same_result(
+                        fs_mkdir_path(&fs, workspace.inode, path),
+                        host_mkdir_path(&oracle, path),
+                        &trace,
+                        "mkdir",
+                    );
+                }
+                NestedFsOp::Put { path, len, byte } => {
+                    let path = nested_path(*path);
+                    let data = vec![*byte; *len];
+                    trace.push(format!("{step}: put {path} len={len} byte={byte}"));
+                    same_result(
+                        fs_create_write_release(&fs, workspace.inode, path, data.clone()),
+                        host_put_path(&oracle, path, &data),
+                        &trace,
+                        "put",
+                    );
+                }
+                NestedFsOp::Read { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: read {path}"));
+                    same_result(
+                        fs_read_path(&fs, workspace.inode, path),
+                        host_read_path(&oracle, path),
+                        &trace,
+                        "read",
+                    );
+                }
+                NestedFsOp::Rename { from, to } => {
+                    let from = nested_path(*from);
+                    let to = nested_path(*to);
+                    trace.push(format!("{step}: rename {from} -> {to}"));
+                    same_result(
+                        fs_rename_path(&fs, workspace.inode, from, to),
+                        fs::rename(oracle.join(from), oracle.join(to)),
+                        &trace,
+                        "rename",
+                    );
+                }
+                NestedFsOp::Unlink { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: unlink {path}"));
+                    same_result(
+                        fs_unlink_path(&fs, workspace.inode, path),
+                        fs::remove_file(oracle.join(path)),
+                        &trace,
+                        "unlink",
+                    );
+                }
+                NestedFsOp::Rmdir { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: rmdir {path}"));
+                    same_result(
+                        fs_rmdir_path(&fs, workspace.inode, path),
+                        fs::remove_dir(oracle.join(path)),
+                        &trace,
+                        "rmdir",
+                    );
+                }
+                NestedFsOp::HostPut { path, len, byte } => {
+                    let path = nested_path(*path);
+                    let data = vec![*byte; *len];
+                    trace.push(format!("{step}: host-put {path} len={len} byte={byte}"));
+                    same_result(
+                        fs::write(root.join(path), &data),
+                        fs::write(oracle.join(path), &data),
+                        &trace,
+                        "host-put",
+                    );
+                }
+                NestedFsOp::HostMkdir { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: host-mkdir {path}"));
+                    same_result(
+                        fs::create_dir(root.join(path)),
+                        fs::create_dir(oracle.join(path)),
+                        &trace,
+                        "host-mkdir",
+                    );
+                }
+                NestedFsOp::Readdir { path } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: readdir {path}"));
+                    same_result(
+                        fs_readdir_names(&fs, workspace.inode, path),
+                        host_readdir_names(&oracle, path),
+                        &trace,
+                        "readdir",
+                    );
+                }
+                NestedFsOp::ReadonlyCreateProbe => {
+                    trace.push(format!("{step}: readonly-create-probe"));
+                    let name = CString::new("blocked.txt").expect("blocked");
+                    assert_eq!(
+                        raw_error(
+                            fs.create(
+                                ctx(),
+                                readonly_entry.inode,
+                                name.as_c_str(),
+                                0o644,
+                                false,
+                                libc::O_RDWR as u32,
+                                0,
+                                Extensions::default(),
+                            ),
+                            "readonly create probe",
+                        ),
+                        Some(libc::EROFS),
+                        "operation trace:\n{}",
+                        trace.join("\n")
+                    );
+                    assert!(
+                        !readonly.join("blocked.txt").exists(),
+                        "readonly probe created host file\noperation trace:\n{}",
+                        trace.join("\n")
+                    );
+                }
+                NestedFsOp::CrossMountRenameProbe => {
+                    trace.push(format!("{step}: cross-mount-rename-probe"));
+                    fs::write(root.join("cross-source.txt"), b"cross").expect("cross source");
+                    lookup(&fs, workspace.inode, "cross-source.txt").expect("source lookup");
+                    let old = CString::new("cross-source.txt").expect("old");
+                    let new = CString::new("cross-target.txt").expect("new");
+                    assert_eq!(
+                        raw_error(
+                            fs.rename(
+                                ctx(),
+                                workspace.inode,
+                                old.as_c_str(),
+                                readonly_entry.inode,
+                                new.as_c_str(),
+                                0,
+                            ),
+                            "cross mount rename probe",
+                        ),
+                        Some(libc::EXDEV),
+                        "operation trace:\n{}",
+                        trace.join("\n")
+                    );
+                    assert!(
+                        !readonly.join("cross-target.txt").exists(),
+                        "cross-mount rename created readonly target\noperation trace:\n{}",
+                        trace.join("\n")
+                    );
+                }
+                NestedFsOp::HostSymlinkEscapeProbe => {
+                    trace.push(format!("{step}: host-symlink-escape-probe"));
+                    let link = root.join("escape-link");
+                    let _ = fs::remove_file(&link);
+                    symlink(&outside, &link).expect("create escape symlink");
+                    match fs_read_path(&fs, workspace.inode, "escape-link") {
+                        Ok(data) => assert_ne!(
+                            data,
+                            b"outside-secret",
+                            "symlink escape exposed outside file\noperation trace:\n{}",
+                            trace.join("\n")
+                        ),
+                        Err(error) => assert!(
+                            matches!(
+                                error.raw_os_error(),
+                                Some(libc::ENOENT | libc::ELOOP | libc::EXDEV | libc::ENOTDIR)
+                            ),
+                            "unexpected symlink escape error {error}\noperation trace:\n{}",
+                            trace.join("\n")
+                        ),
+                    }
+                }
+            }
+        }
     }
 
     fn run_flat_file_ops_case(case_name: &str, generated_ops: &[FsStressOp]) {
@@ -3616,6 +4050,83 @@ mod tests {
     }
 
     #[test]
+    fn host_symlink_swap_after_lookup_does_not_escape_mount_root() {
+        let test_dir = TestDir::new("symlink-swap-after-lookup");
+        let root = test_dir.path.join("root");
+        let outside = test_dir.path.join("outside");
+        fs::create_dir(&root).expect("create root");
+        fs::create_dir(&outside).expect("create outside");
+        fs::write(root.join("victim"), b"inside").expect("write victim");
+        fs::write(outside.join("secret"), b"outside-secret").expect("write secret");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let victim = lookup(&fs, workspace.inode, "victim").expect("lookup victim");
+
+        fs::remove_file(root.join("victim")).expect("remove victim");
+        symlink(outside.join("secret"), root.join("victim")).expect("replace with symlink");
+
+        match fs.open(ctx(), victim.inode, false, libc::O_RDONLY as u32) {
+            Ok((handle, _options)) => {
+                let handle = handle.expect("handle");
+                let mut reader = VecWriter::default();
+                fs.read(ctx(), victim.inode, handle, &mut reader, 64, 0, None, 0)
+                    .expect("read swapped victim");
+                assert_ne!(reader.data, b"outside-secret");
+            }
+            Err(error) => assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::EXDEV | libc::ELOOP)
+            )),
+        }
+    }
+
+    #[test]
+    fn cached_child_under_host_parent_symlink_replacement_does_not_escape() {
+        let test_dir = TestDir::new("parent-symlink-replace");
+        let root = test_dir.path.join("root");
+        let outside = test_dir.path.join("outside");
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::create_dir(&outside).expect("create outside");
+        fs::write(root.join("dir/file"), b"inside").expect("write file");
+        fs::write(outside.join("file"), b"outside-secret").expect("write secret");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let dir = lookup(&fs, workspace.inode, "dir").expect("lookup dir");
+        let file = lookup(&fs, dir.inode, "file").expect("lookup file");
+
+        fs::rename(root.join("dir"), root.join("moved")).expect("move dir");
+        symlink(&outside, root.join("dir")).expect("replace parent with symlink");
+
+        match fs.open(ctx(), file.inode, false, libc::O_RDONLY as u32) {
+            Ok((handle, _options)) => {
+                let handle = handle.expect("handle");
+                let mut reader = VecWriter::default();
+                fs.read(ctx(), file.inode, handle, &mut reader, 64, 0, None, 0)
+                    .expect("read cached child");
+                assert_ne!(reader.data, b"outside-secret");
+            }
+            Err(error) => assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::EXDEV | libc::ELOOP)
+            )),
+        }
+    }
+
+    #[test]
     fn cross_mount_rename_and_link_return_exdev() {
         let test_dir = TestDir::new("cross-mount");
         let left = test_dir.path.join("left");
@@ -3683,6 +4194,95 @@ mod tests {
         fs.read(ctx(), file.inode, handle, &mut reader, 64, 0, None, 0)
             .expect("read after unlink");
         assert_eq!(reader.data, b"still here");
+    }
+
+    #[test]
+    fn open_handle_survives_host_parent_rename_for_writes() {
+        let test_dir = TestDir::new("open-parent-rename");
+        let root = test_dir.path.join("root");
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::write(root.join("dir/file"), b"hello").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let dir = lookup(&fs, workspace.inode, "dir").expect("lookup dir");
+        let file = lookup(&fs, dir.inode, "file").expect("lookup file");
+        let (handle, _options) = fs
+            .open(ctx(), file.inode, false, libc::O_RDWR as u32)
+            .expect("open file");
+        let handle = handle.expect("handle");
+
+        fs::rename(root.join("dir"), root.join("moved")).expect("host parent rename");
+        fs.write(
+            ctx(),
+            file.inode,
+            handle,
+            VecReader {
+                data: b" after".to_vec(),
+            },
+            6,
+            5,
+            None,
+            false,
+            false,
+            0,
+        )
+        .expect("write through open handle");
+        fs.release(ctx(), file.inode, 0, handle, true, false, None)
+            .expect("release");
+
+        assert!(!root.join("dir").exists());
+        assert_eq!(
+            fs::read(root.join("moved/file")).expect("read moved file"),
+            b"hello after"
+        );
+    }
+
+    #[test]
+    fn lookup_after_host_delete_recreate_reads_replacement() {
+        let test_dir = TestDir::new("host-delete-recreate");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"old").expect("write old");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let old = lookup(&fs, workspace.inode, "file").expect("lookup old");
+        fs.forget(ctx(), old.inode, 1);
+
+        fs::remove_file(root.join("file")).expect("remove old");
+        fs::write(root.join("file"), b"replacement").expect("write replacement");
+
+        let replacement = lookup(&fs, workspace.inode, "file").expect("lookup replacement");
+        let (handle, _options) = fs
+            .open(ctx(), replacement.inode, false, libc::O_RDONLY as u32)
+            .expect("open replacement");
+        let handle = handle.expect("handle");
+        let mut reader = VecWriter::default();
+        fs.read(
+            ctx(),
+            replacement.inode,
+            handle,
+            &mut reader,
+            64,
+            0,
+            None,
+            0,
+        )
+        .expect("read replacement");
+        assert_eq!(reader.data, b"replacement");
     }
 
     #[test]
@@ -4035,6 +4635,39 @@ mod tests {
                 Ok(())
             })
             .expect("proptest flat file operation sequence");
+    }
+
+    #[test]
+    fn proptest_nested_operation_sequences_cover_mount_boundaries() {
+        let mut runner = TestRunner::new(Config {
+            cases: 48,
+            max_shrink_iters: 2048,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&nested_fs_ops(), |ops| {
+                run_nested_fs_ops_case("proptest-nested-sequence", &ops);
+                Ok(())
+            })
+            .expect("proptest nested operation sequence");
+    }
+
+    #[test]
+    #[ignore = "property stress: run explicitly with `cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_nested_operation_sequences_stress -- --ignored --nocapture`"]
+    fn proptest_nested_operation_sequences_stress() {
+        let mut runner = TestRunner::new(Config {
+            cases: 256,
+            max_shrink_iters: 4096,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&nested_fs_ops(), |ops| {
+                run_nested_fs_ops_case("proptest-nested-sequence-stress", &ops);
+                Ok(())
+            })
+            .expect("stress proptest nested operation sequence");
     }
 
     #[test]

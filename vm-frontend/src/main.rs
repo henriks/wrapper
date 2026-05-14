@@ -721,6 +721,7 @@ struct SelfTestConfig {
     image: String,
     publish_payload_port: Option<u16>,
     no_net: bool,
+    hostile: bool,
     tool: GuestTool,
 }
 
@@ -780,7 +781,7 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
 
     let (rows, cols) = terminal_size();
     let request = PayloadRequest {
-        script: self_test_payload_script(&config, &self_test.image),
+        script: self_test_payload_script(&config, &self_test.image, self_test.hostile),
         cwd: config.project.display().to_string(),
         env: guest_env,
         rows,
@@ -814,6 +815,7 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
         image: "alpine:3.22".to_string(),
         publish_payload_port: None,
         no_net: false,
+        hostile: false,
         tool: GuestTool::Codex,
     };
 
@@ -838,6 +840,7 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
                 );
             }
             "--no-net" => config.no_net = true,
+            "--hostile" => config.hostile = true,
             "--tool" => {
                 config.tool = value(args, &mut index, "--tool")?
                     .parse()
@@ -866,8 +869,8 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
     Ok(config)
 }
 
-fn self_test_payload_script(config: &FrontendConfig, image: &str) -> String {
-    [
+fn self_test_payload_script(config: &FrontendConfig, image: &str, hostile: bool) -> String {
+    let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
         format!(
@@ -898,8 +901,25 @@ fn self_test_payload_script(config: &FrontendConfig, image: &str) -> String {
         ),
         "rm -f .agentvm-self-test-workspace .agentvm-self-test-bind".to_string(),
         "echo self-test: payload-ok".to_string(),
+    ];
+    if hostile {
+        steps.splice(12..12, hostile_self_test_payload_steps());
+    }
+    steps.join("; ")
+}
+
+fn hostile_self_test_payload_steps() -> Vec<String> {
+    vec![
+        "echo self-test: hostile-start".to_string(),
+        "if cat /run/agentvm-config/mitm-ca.key >/tmp/agentvm-key-leak 2>/tmp/agentvm-key-leak.err; then echo config-key-readable-unexpected; exit 1; fi".to_string(),
+        "ln -sf /run/agentvm-config/mitm-ca.key .agentvm-self-test-key-link".to_string(),
+        "if cat .agentvm-self-test-key-link >/tmp/agentvm-workspace-link-leak 2>/tmp/agentvm-workspace-link-leak.err; then echo workspace-symlink-escape-unexpected; exit 1; fi".to_string(),
+        "rm -f .agentvm-self-test-key-link".to_string(),
+        "node -e 'const net=require(\"net\"); const s=net.connect({host:\"169.254.169.254\",port:80,timeout:750},()=>{console.error(\"metadata-connect-unexpected\"); process.exit(1);}); s.on(\"timeout\",()=>process.exit(0)); s.on(\"error\",()=>process.exit(0));'".to_string(),
+        "node -e 'const net=require(\"net\"); const s=net.connect({host:\"127.0.0.1\",port:22,timeout:750},()=>{console.error(\"loopback-connect-unexpected\"); process.exit(1);}); s.on(\"timeout\",()=>process.exit(0)); s.on(\"error\",()=>process.exit(0));'".to_string(),
+        "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = deny ]; then node -e 'const dns=require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) process.exit(0); console.error(\"dns-deny-unexpected\"); process.exit(1); });'; fi".to_string(),
+        "echo self-test: hostile-ok".to_string(),
     ]
-    .join("; ")
 }
 
 fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyArgs), String> {
@@ -1537,7 +1557,7 @@ fn print_usage() {
     eprintln!(
         "usage: agentvm-frontend <prepare|launch|self-test|vmnet-gateway|payload-client> [options]\n\
          prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--tool codex|copilot] [--tool-arg ARG] [--gh] [--aws PROFILE] [--ro PATH] [--rw PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--payload-script SCRIPT] [--payload-cwd PATH] [--payload-env KEY=VALUE] [--payload-no-stdin] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
-         self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net]\n\
+         self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net] [--hostile]\n\
          vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
          payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin]"
     );
@@ -1545,7 +1565,7 @@ fn print_usage() {
 
 fn print_self_test_usage() {
     eprintln!(
-        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net]"
+        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net] [--hostile]"
     );
 }
 
@@ -2099,6 +2119,7 @@ mod tests {
             "alpine:3.22".to_string(),
             "--publish-payload-port".to_string(),
             "12079".to_string(),
+            "--hostile".to_string(),
             "--tool".to_string(),
             "copilot".to_string(),
         ])
@@ -2108,6 +2129,7 @@ mod tests {
         assert_eq!(config.run_dir, root.join(".sandbox/docker-vm/self-test"));
         assert_eq!(config.image, "alpine:3.22");
         assert_eq!(config.publish_payload_port, Some(12079));
+        assert!(config.hostile);
         assert_eq!(config.tool, GuestTool::Copilot);
     }
 
@@ -2122,7 +2144,7 @@ mod tests {
         )
         .expect("config");
 
-        let script = self_test_payload_script(&config, "alpine:3.22");
+        let script = self_test_payload_script(&config, "alpine:3.22", false);
 
         assert!(script.contains("self-test: payload-start"));
         assert!(script.contains("/run/agentvm-config/mitm-ca.crt"));
@@ -2137,6 +2159,42 @@ mod tests {
         assert!(script.contains("docker run --rm -v \"$PWD:/work:ro\" alpine:3.22"));
         assert!(script.contains(".agentvm-self-test-bind"));
         assert!(script.contains("self-test: payload-ok"));
+    }
+
+    #[test]
+    fn hostile_self_test_payload_covers_escape_and_denied_network_probes() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(&config, "alpine:3.22", true);
+
+        assert!(script.contains("self-test: hostile-start"));
+        assert!(script.contains("mitm-ca.key"));
+        assert!(script.contains(".agentvm-self-test-key-link"));
+        assert!(script.contains("169.254.169.254"));
+        assert!(script.contains("127.0.0.1"));
+        assert!(script.contains("dns-deny-unexpected"));
+        assert!(script.contains("self-test: hostile-ok"));
+        assert!(script.contains("self-test: payload-ok"));
+    }
+
+    #[test]
+    #[ignore = "slow hostile VM smoke: run with `AGENTVM_HOSTILE_SELF_TEST_RUN=1 cargo test --manifest-path vm-frontend/Cargo.toml --offline hostile_guest_self_test_profile -- --ignored --nocapture`; requires rebuilt docker/out artifacts, QEMU, and guest payload readiness"]
+    fn hostile_guest_self_test_profile() {
+        if std::env::var("AGENTVM_HOSTILE_SELF_TEST_RUN").as_deref() != Ok("1") {
+            eprintln!(
+                "set AGENTVM_HOSTILE_SELF_TEST_RUN=1 to run `agentvm-frontend self-test --hostile --no-net` from this ignored test"
+            );
+            return;
+        }
+        run_self_test(&["--hostile".to_string(), "--no-net".to_string()])
+            .expect("hostile self-test");
     }
 
     #[test]

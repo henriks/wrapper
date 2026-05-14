@@ -589,10 +589,12 @@ fn tcp_reset_for_denied_syn(frame: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_proxy::{DnsDecision, DnsUpstreamError};
+    use crate::dns_proxy::{domain_allowed, DnsDecision, DnsUpstreamError};
     use crate::network_policy::VmnetPolicy;
+    use crate::test_support;
     use hickory_proto::op::{Message, Query};
     use hickory_proto::rr::{Name, RecordType};
+    use proptest::prelude::*;
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
@@ -823,6 +825,241 @@ mod tests {
         assert_eq!(gateway.host_ingress_sessions().len(), 1);
     }
 
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 128,
+            max_shrink_iters: 2048,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn proptest_arbitrary_guest_frames_do_not_panic_or_grow_outputs(
+            frame in prop::collection::vec(any::<u8>(), 0..=1700),
+        ) {
+            let network = GuestNetwork::default();
+            let policy = VmnetPolicy::default_sandbox(network.clone());
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+
+            let result = gateway.handle_guest_frame(frame, Instant::from_millis(1));
+
+            prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+            if !matches!(result.outcome, GuestFrameOutcome::TcpAccepted { .. }) {
+                prop_assert!(gateway.active_tcp_sessions().is_empty());
+            }
+        }
+
+        #[test]
+        fn proptest_udp_frames_fail_closed_without_forwarding(
+            src_port in any::<u16>(),
+            dst_port in any::<u16>(),
+            payload in prop::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            let network = GuestNetwork::default();
+            let mut policy = VmnetPolicy::default_sandbox(network.clone());
+            policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+
+            let result = gateway.handle_guest_frame(
+                test_support::udp_frame(
+                    src_port,
+                    dst_port,
+                    test_support::TEST_GUEST_IP,
+                    test_support::TEST_PUBLIC_IP,
+                    &payload,
+                ),
+                Instant::from_millis(1),
+            );
+
+            prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+            prop_assert!(result.guest_frames.is_empty());
+            if dst_port == 443 {
+                let GuestFrameOutcome::UdpDenied(denial) = result.outcome else {
+                    prop_assert!(false, "udp/443 should be denied, got {:?}", result.outcome);
+                    return Ok(());
+                };
+                prop_assert_eq!(denial.dst_port, 443);
+                prop_assert!(denial.reason.contains("QUIC"));
+            } else {
+                prop_assert!(matches!(
+                    result.outcome,
+                    GuestFrameOutcome::UdpDenied(_) | GuestFrameOutcome::UnsupportedProtocol(_)
+                ));
+            }
+            prop_assert!(gateway.active_tcp_sessions().is_empty());
+        }
+
+        #[test]
+        fn proptest_unknown_ethertypes_and_ipv6_are_unsupported(
+            ethertype in any::<u16>(),
+            payload in prop::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            prop_assume!(!matches!(ethertype, 0x0800 | 0x0806));
+            let network = GuestNetwork::default();
+            let policy = VmnetPolicy::default_sandbox(network.clone());
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+
+            let result = gateway.handle_guest_frame(
+                test_support::unknown_ethertype_frame(ethertype, &payload),
+                Instant::from_millis(1),
+            );
+
+            prop_assert!(matches!(result.outcome, GuestFrameOutcome::UnsupportedProtocol(_)));
+            prop_assert!(result.guest_frames.is_empty());
+            prop_assert!(gateway.active_tcp_sessions().is_empty());
+        }
+
+        #[test]
+        fn proptest_default_policy_denied_syns_do_not_create_sessions(
+            dst_port in any::<u16>(),
+        ) {
+            let network = GuestNetwork::default();
+            let policy = VmnetPolicy::default_sandbox(network.clone());
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+
+            let result = gateway.handle_guest_frame(
+                test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, dst_port),
+                Instant::from_millis(1),
+            );
+
+            if !matches!(result.outcome, GuestFrameOutcome::TcpDenied { .. }) {
+                return Err(TestCaseError::fail(format!(
+                    "default policy TCP SYN was not denied: {:?}",
+                    result.outcome
+                )));
+            }
+            prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+            prop_assert!(gateway.active_tcp_sessions().is_empty());
+        }
+
+        #[test]
+        fn proptest_malformed_ipv4_payloads_fail_closed(
+            payload in prop::collection::vec(any::<u8>(), 0..=96),
+        ) {
+            let network = GuestNetwork::default();
+            let policy = VmnetPolicy::default_sandbox(network.clone());
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+            let mut frame = Vec::with_capacity(14 + payload.len());
+            frame.extend_from_slice(GATEWAY_MAC.as_bytes());
+            frame.extend_from_slice(GUEST_MAC.as_bytes());
+            frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+            frame.extend_from_slice(&payload);
+
+            let result = gateway.handle_guest_frame(frame, Instant::from_millis(1));
+
+            prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+            if result.guest_frames.is_empty() {
+                if matches!(result.outcome, GuestFrameOutcome::TcpAccepted { .. }) {
+                    return Err(TestCaseError::fail(
+                        "malformed IPv4 payload was accepted as TCP".to_string(),
+                    ));
+                }
+            }
+            prop_assert!(gateway.active_tcp_sessions().is_empty());
+        }
+
+        #[test]
+        fn proptest_dns_gateway_outcome_matches_domain_policy(
+            label in 0_u16..=999,
+            use_subdomain in any::<bool>(),
+            allow_variant in 0_u8..=3,
+            uppercase_query in any::<bool>(),
+            trailing_dot in any::<bool>(),
+            default_public in any::<bool>(),
+        ) {
+            let network = GuestNetwork::default();
+            let base = format!("case{label}.example");
+            let query_domain = if use_subdomain {
+                format!("api.{base}")
+            } else {
+                base.clone()
+            };
+            let mut wire_domain = if uppercase_query {
+                query_domain.to_ascii_uppercase()
+            } else {
+                query_domain.clone()
+            };
+            if trailing_dot {
+                wire_domain.push('.');
+            }
+
+            let mut policy = VmnetPolicy::default_sandbox(network.clone());
+            if default_public {
+                policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+            }
+            match allow_variant {
+                0 => policy.egress.allow_domains.push(query_domain.clone()),
+                1 => policy.egress.allow_domains.push(format!("*.{base}")),
+                2 => policy.egress.allow_domains.push("unrelated.example".to_string()),
+                _ => {}
+            }
+
+            let expected_allowed = domain_allowed(&policy, &wire_domain);
+            let mut gateway = VmnetGateway::new_with_dns_upstream(
+                &policy,
+                &network,
+                Instant::from_millis(0),
+                Box::new(StaticDnsUpstream),
+            )
+            .expect("gateway");
+
+            let result = gateway.handle_guest_frame(
+                test_support::dns_query_frame(&wire_domain, test_support::TEST_DNS_IP, 53000),
+                Instant::from_millis(1),
+            );
+
+            let GuestFrameOutcome::DnsQuery { log } = result.outcome else {
+                return Err(TestCaseError::fail("gateway did not classify gateway DNS as DNS query"));
+            };
+            prop_assert_eq!(
+                log.decision,
+                if expected_allowed {
+                    DnsDecision::Allowed
+                } else {
+                    DnsDecision::Blocked
+                }
+            );
+            let normalized_query_domain = query_domain.to_ascii_lowercase();
+            prop_assert_eq!(log.domain.as_deref(), Some(normalized_query_domain.as_str()));
+            prop_assert_eq!(result.guest_frames.len(), 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "property stress: run explicitly with `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_gateway::tests::stress_seeded_generated_guest_frames -- --ignored --nocapture`"]
+    fn stress_seeded_generated_guest_frames() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut seed = 0x6761_7465_7761_795fu64;
+
+        for step in 0..2048 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let len = (seed as usize) % 1700;
+            let mut frame = Vec::with_capacity(len);
+            for byte_index in 0..len {
+                seed ^= seed.rotate_left(13).wrapping_add(byte_index as u64);
+                frame.push(seed as u8);
+            }
+
+            let mut gateway =
+                VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+            let result = gateway.handle_guest_frame(frame, Instant::from_millis(step));
+            assert_guest_frames_bounded(&result.guest_frames, &policy);
+            if !matches!(result.outcome, GuestFrameOutcome::TcpAccepted { .. }) {
+                assert!(
+                    gateway.active_tcp_sessions().is_empty(),
+                    "unexpected session at generated step {step}"
+                );
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct StaticDnsUpstream;
 
@@ -1000,5 +1237,33 @@ mod tests {
             &ChecksumCapabilities::default(),
         )
         .expect("tcp")
+    }
+
+    fn prop_assert_guest_frames_bounded(
+        frames: &[Vec<u8>],
+        policy: &VmnetPolicy,
+    ) -> Result<(), TestCaseError> {
+        let max_frame_len = usize::from(policy.mtu) + 14;
+        for frame in frames {
+            prop_assert!(
+                frame.len() <= max_frame_len,
+                "guest frame len {} exceeded {}",
+                frame.len(),
+                max_frame_len
+            );
+        }
+        Ok(())
+    }
+
+    fn assert_guest_frames_bounded(frames: &[Vec<u8>], policy: &VmnetPolicy) {
+        let max_frame_len = usize::from(policy.mtu) + 14;
+        for frame in frames {
+            assert!(
+                frame.len() <= max_frame_len,
+                "guest frame len {} exceeded {}",
+                frame.len(),
+                max_frame_len
+            );
+        }
     }
 }

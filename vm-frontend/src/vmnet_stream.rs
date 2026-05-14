@@ -257,7 +257,8 @@ fn write_pcap_global_header(writer: &mut impl Write, snaplen: u32) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
+    use crate::test_support::{ReadStep, ScriptedStream};
+    use proptest::prelude::*;
     use std::io::Cursor;
 
     fn ethernet_frame() -> Vec<u8> {
@@ -303,7 +304,7 @@ mod tests {
         let first = encoded[..6].to_vec();
         let second = encoded[6..].to_vec();
         let mut io = QemuFrameIo::new(
-            ScriptedReadWrite::new(vec![
+            ScriptedStream::new([
                 ReadStep::Bytes(first),
                 ReadStep::WouldBlock,
                 ReadStep::Bytes(second),
@@ -328,7 +329,7 @@ mod tests {
             encoded.extend_from_slice(frame);
         }
         let mut io = QemuFrameIo::new(
-            ScriptedReadWrite::new(vec![ReadStep::Bytes(encoded), ReadStep::WouldBlock]),
+            ScriptedStream::new([ReadStep::Bytes(encoded), ReadStep::WouldBlock]),
             DEFAULT_MAX_FRAME_LEN,
         );
 
@@ -400,6 +401,17 @@ mod tests {
     }
 
     #[test]
+    fn reads_max_sized_frame_without_rejecting_boundary() {
+        let frame = vec![0x5a; 64];
+        let mut input = Vec::new();
+        input.extend_from_slice(&64_u32.to_be_bytes());
+        input.extend_from_slice(&frame);
+
+        let mut io = QemuFrameIo::new(Cursor::new(input), 64);
+        assert_eq!(io.read_frame().expect("max frame"), Some(frame));
+    }
+
+    #[test]
     fn writes_standard_pcap_file() {
         let path = std::env::temp_dir().join(format!(
             "agentvm-vmnet-test-{}-{}.pcap",
@@ -428,53 +440,148 @@ mod tests {
         assert_eq!(&bytes[40..], frame.as_slice());
     }
 
-    #[derive(Debug)]
-    enum ReadStep {
-        Bytes(Vec<u8>),
-        WouldBlock,
-    }
-
-    #[derive(Debug)]
-    struct ScriptedReadWrite {
-        steps: VecDeque<ReadStep>,
-        written: Vec<u8>,
-    }
-
-    impl ScriptedReadWrite {
-        fn new(steps: Vec<ReadStep>) -> Self {
-            Self {
-                steps: steps.into(),
-                written: Vec::new(),
-            }
+    fn chunk_steps(bytes: &[u8], chunk_sizes: &[usize]) -> Vec<ReadStep> {
+        let mut steps = Vec::new();
+        let mut offset = 0;
+        let mut size_index = 0;
+        while offset < bytes.len() {
+            let remaining = bytes.len() - offset;
+            let chunk_size = chunk_sizes
+                .get(size_index)
+                .copied()
+                .unwrap_or(7)
+                .clamp(1, remaining);
+            steps.push(ReadStep::Bytes(bytes[offset..offset + chunk_size].to_vec()));
+            steps.push(ReadStep::WouldBlock);
+            offset += chunk_size;
+            size_index += 1;
         }
+        steps
     }
 
-    impl Read for ScriptedReadWrite {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            match self.steps.pop_front() {
-                Some(ReadStep::Bytes(bytes)) => {
-                    let count = bytes.len().min(buf.len());
-                    buf[..count].copy_from_slice(&bytes[..count]);
-                    if count < bytes.len() {
-                        self.steps
-                            .push_front(ReadStep::Bytes(bytes[count..].to_vec()));
-                    }
-                    Ok(count)
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 96,
+            max_shrink_iters: 1024,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn proptest_valid_chunked_frames_preserve_boundaries(
+            frames in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..=64), 1..=16),
+            chunk_sizes in prop::collection::vec(1usize..=11, 1..=96),
+        ) {
+            let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let encoded = crate::test_support::qemu_stream_bytes(&frame_refs);
+            let mut io = QemuFrameIo::new(ScriptedStream::new(chunk_steps(&encoded, &chunk_sizes)), 64);
+            let mut actual = Vec::new();
+            let mut polls = 0usize;
+
+            while actual.len() < frames.len() {
+                polls += 1;
+                prop_assert!(polls <= encoded.len() + frames.len() + 8);
+                match io.try_read_frame().expect("valid chunked frame stream") {
+                    FrameRead::Frame(frame) => actual.push(frame),
+                    FrameRead::WouldBlock => {}
+                    FrameRead::Eof => break,
                 }
-                Some(ReadStep::WouldBlock) => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-                None => Ok(0),
+            }
+
+            prop_assert_eq!(actual, frames);
+        }
+
+        #[test]
+        fn proptest_read_frame_arbitrary_bytes_stays_bounded(bytes in prop::collection::vec(any::<u8>(), 0..=200)) {
+            let mut io = QemuFrameIo::new(Cursor::new(bytes), 64);
+            match io.read_frame() {
+                Ok(Some(frame)) => prop_assert!((1..=64).contains(&frame.len())),
+                Ok(None) => {}
+                Err(VmnetStreamError::InvalidFrameLength { length, max }) => {
+                    prop_assert!(length == 0 || length > max);
+                    prop_assert_eq!(max, 64);
+                }
+                Err(VmnetStreamError::TruncatedLength { received }) => {
+                    prop_assert!((1..4).contains(&received));
+                }
+                Err(VmnetStreamError::TruncatedFrame) => {}
+                Err(VmnetStreamError::FrameTooLarge { .. }) => {
+                    prop_assert!(false, "read_frame should report invalid length, not write-side frame too large");
+                }
+                Err(VmnetStreamError::Io(error)) => {
+                    prop_assert!(false, "cursor read should not fail: {error}");
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_invalid_lengths_are_rejected_before_payload_read(
+            length in prop_oneof![Just(0_u32), 65_u32..=u32::MAX],
+        ) {
+            let mut io = QemuFrameIo::new(Cursor::new(length.to_be_bytes().to_vec()), 64);
+            match io.read_frame() {
+                Err(VmnetStreamError::InvalidFrameLength { length: actual, max }) => {
+                    prop_assert_eq!(actual, length);
+                    prop_assert_eq!(max, 64);
+                }
+                other => prop_assert!(false, "invalid length produced unexpected result: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn proptest_write_frame_round_trips_length_prefix(frame in prop::collection::vec(any::<u8>(), 1..=64)) {
+            let mut io = QemuFrameIo::new(Cursor::new(Vec::new()), 64);
+            io.write_frame(&frame).expect("write generated frame");
+
+            let bytes = io.into_inner().into_inner();
+            prop_assert_eq!(u32::from_be_bytes(bytes[0..4].try_into().unwrap()) as usize, frame.len());
+            prop_assert_eq!(&bytes[4..], frame.as_slice());
+        }
+
+        #[test]
+        fn proptest_write_frame_rejects_empty_and_oversized(
+            frame in prop_oneof![
+                Just(Vec::new()),
+                prop::collection::vec(any::<u8>(), 65..=160),
+            ],
+        ) {
+            let mut io = QemuFrameIo::new(Cursor::new(Vec::new()), 64);
+            match io.write_frame(&frame) {
+                Err(VmnetStreamError::FrameTooLarge { length, max }) => {
+                    prop_assert_eq!(length, frame.len());
+                    prop_assert_eq!(max, 64);
+                }
+                other => prop_assert!(false, "invalid generated write frame produced unexpected result: {other:?}"),
             }
         }
     }
 
-    impl Write for ScriptedReadWrite {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.written.extend_from_slice(buf);
-            Ok(buf.len())
-        }
+    #[test]
+    #[ignore = "property stress: run explicitly with `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream::tests::stress_many_chunked_frame_splits -- --ignored --nocapture`"]
+    fn stress_many_chunked_frame_splits() {
+        let frames = (1..=128)
+            .map(|len| vec![len as u8; len])
+            .collect::<Vec<_>>();
+        let frame_refs = frames.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let encoded = crate::test_support::qemu_stream_bytes(&frame_refs);
 
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        for split in 1..=31 {
+            let chunk_sizes = vec![split; encoded.len().div_ceil(split)];
+            let mut io = QemuFrameIo::new(
+                ScriptedStream::new(chunk_steps(&encoded, &chunk_sizes)),
+                128,
+            );
+            for expected in &frames {
+                loop {
+                    match io.try_read_frame().expect("stress chunked stream") {
+                        FrameRead::Frame(actual) => {
+                            assert_eq!(&actual, expected);
+                            break;
+                        }
+                        FrameRead::WouldBlock => {}
+                        FrameRead::Eof => panic!("unexpected eof for split {split}"),
+                    }
+                }
+            }
         }
     }
 }
