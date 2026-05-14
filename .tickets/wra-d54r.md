@@ -1,6 +1,6 @@
 ---
 id: wra-d54r
-status: open
+status: closed
 deps: [wra-0bmi]
 links: []
 created: 2026-05-14T20:38:47Z
@@ -49,3 +49,7 @@ This ticket can introduce a mode enum such as `WrapperUiMode::{Auto,Tui,Plain}` 
 **2026-05-14T20:40:03Z**
 
 Direction update from planning discussion: mode selection should not deepen the legacy `codex-wrap` / `copilot-wrap` argv[0] behavior. Account for the planned removal ticket and target the remaining explicit sandbox start path plus plain-stream fallback.
+
+**2026-05-14T21:04:53Z**
+
+Implemented wrapper UI mode plumbing in `vm-frontend/src/main.rs`: `--no-tui` selects plain mode, interactive stdin/stdout selects TUI by default, non-TTY selects plain mode. Current run path deliberately keeps plain streaming as backend until the TUI renderer ticket consumes `WrapperUiMode`. Added unit tests for interactive default, `--no-tui`, and non-TTY fallback. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

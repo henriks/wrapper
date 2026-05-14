@@ -1,6 +1,6 @@
 ---
 id: wra-jndb
-status: open
+status: closed
 deps: [wra-7v3w, wra-fzao]
 links: []
 created: 2026-05-14T20:39:44Z
@@ -42,3 +42,9 @@ Keep prompt state generic enough for future callers: prompt text, choices or fre
 - Status/focus indication reflects prompt mode.
 - Tests cover focus switching and input routing.
 
+
+## Notes
+
+**2026-05-14T21:20:07Z**
+
+Implemented wrapper prompt focus infrastructure in `vm-frontend/src/tui.rs`: Ctrl-\ arms wrapper control and `p` opens a freeform prompt in the status/prompt line; prompt keystrokes edit locally, Enter accepts, Esc cancels, and prompt input is not forwarded to the guest. Prompt completion stores a structured `PromptResult`; status focus changes between guest and prompt. Added tests for focus switching and accept/cancel results. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

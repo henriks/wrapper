@@ -1,6 +1,6 @@
 ---
 id: wra-zewf
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-14T20:38:19Z
@@ -58,3 +58,7 @@ Default behavior:
 **2026-05-14T20:42:06Z**
 
 Direction updates from planning discussion: TUI should be default with an explicit opt-out/plain flag. Long-term plan should remove `codex-wrap` and `copilot-wrap` argv[0] entrypoint logic completely. Enabling Codex in the TUI should add the correct Codex state/config directories as rw mounts in the sandbox config.
+
+**2026-05-14T21:25:32Z**
+
+Completed implementation tickets. Final state: interactive wrapper runs default to TUI when stdin/stdout are TTYs; `--no-tui` and non-TTY runs use plain streaming; guest output renders through `tui-term`; guest input/paste/resize/Ctrl-C route through the TUI; wrapper prompt focus is available via Ctrl-\ then p; startup dialog can enable Codex and feeds structured launch configuration; Codex state mounts are explicit; `codex-wrap`/`copilot-wrap` argv0 entrypoints and symlinks were removed; validation docs include a TUI smoke workflow. Fast validation passed with `vm-frontend/validate.sh fast`.

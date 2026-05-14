@@ -11,20 +11,18 @@ There is no supported host-side Bubblewrap execution path.
 
 ## Entry Points
 
-The Rust binary supports both explicit frontend subcommands and wrapper-style
-invocation:
+The Rust binary supports explicit frontend subcommands and explicit wrapper
+startup through `wrap`:
 
 ```text
 agentvm-frontend launch ...
 agentvm-frontend self-test ...
 agentvm-frontend wrap ...
-codex-wrap ...
-copilot-wrap ...
 ```
 
-`codex-wrap` and `copilot-wrap` should be symlinks or installed aliases for
-the Rust binary. The invoked name selects the tool unless `--tool
-codex|copilot` is supplied.
+The executable name is not part of wrapper behavior. `codex-wrap` and
+`copilot-wrap` aliases are not supported entrypoints, and the selected tool must
+come from explicit flags or the interactive TUI startup flow.
 
 Wrapper arguments after `--` are passed to the selected tool as tool arguments.
 
@@ -97,6 +95,8 @@ Required/default guest shares:
 - `/workspace` is a compatibility alias for the project path.
 - `.sandbox/home/` is used as guest `$HOME` for tool launches.
 - Selected tool state is shared deliberately, not by recreating host `$HOME`.
+- Enabling Codex in the wrapper/TUI setup exposes Codex state, currently
+  `~/.codex`, as writable tool state under the project guest home.
 - `~/.docker` is shared as writable tool state when present.
 - `--gh` shares `~/.config/gh` read-only and forwards `GH_TOKEN` when available.
 - `--ro PATH` exposes a required read-only host path at the same guest path.

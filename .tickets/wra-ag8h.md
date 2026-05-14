@@ -1,6 +1,6 @@
 ---
 id: wra-ag8h
-status: open
+status: closed
 deps: [wra-0bmi]
 links: []
 created: 2026-05-14T20:38:57Z
@@ -39,3 +39,9 @@ Prefer a small abstraction such as a `PayloadSession` owning the TCP stream and 
 - Resize and signal semantics remain compatible with `docker/guest-payload-server.py`.
 - Call sites are updated without changing user-visible behavior.
 
+
+## Notes
+
+**2026-05-14T21:09:08Z**
+
+Implemented reusable payload session APIs in `vm-frontend/src/payload_client.rs`: `PayloadSession`, `PayloadWriter`, and `PayloadEvent` expose request startup, input, resize, signal, output, exit, and failure handling without Ratatui dependencies. Reworked `run_payload_tcp_with_control` to use the new session while preserving plain streaming behavior. Added protocol tests for session control frames and failure events. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

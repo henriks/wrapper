@@ -81,6 +81,65 @@ published payload port, composed virtiofs workspace, guest config filesystem,
 MITM CA bundle exposure without private key exposure, guest DNS lookup, Docker
 CLI, and Docker bind-mounted workspace.
 
+## Interactive TUI Smoke
+
+Run this after touching wrapper TUI behavior, terminal sizing/input, prompt
+focus, startup setup, or wrapper entrypoint semantics. It is manual because it
+requires a real terminal and user interaction in addition to the live KVM
+prerequisites above.
+
+Start the default interactive wrapper path:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  wrap \
+  --project "$PWD" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64
+```
+
+Expected behavior:
+
+- A startup dialog appears because no tool was selected by argv0 or `--tool`.
+- Accepting the default initializes Codex and the generated
+  `.sandbox/docker-vm/run/composed-fs-manifest.json` contains a writable
+  `.sandbox/home/.codex` tool-state mount.
+- The guest payload renders inside the terminal viewport, with a
+  one-line wrapper status/prompt area below it.
+- Typed input in guest focus reaches the guest payload.
+- Pressing `Ctrl-\` then `p` opens the wrapper prompt; typed prompt input does
+  not appear in the guest. `Enter` accepts the prompt and `Esc` cancels it.
+- Resizing the host terminal redraws the viewport and sends the guest PTY the
+  viewport size.
+- `Ctrl-C` in guest focus is delivered to the guest payload as SIGINT.
+- Normal exit and interrupted shutdown restore raw mode and the alternate
+  screen.
+
+Verify the plain fallback path:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  wrap \
+  --no-tui \
+  --project "$PWD" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64 \
+  --tool codex \
+  -- --help
+```
+
+Expected behavior:
+
+- No startup dialog or alternate-screen TUI appears.
+- Payload output streams directly to stdout.
+- The process exits with the guest payload exit status.
+
+On failure, collect `.sandbox/docker-vm/run/state.json`,
+`.sandbox/docker-vm/run/qemu.log`, `.sandbox/docker-vm/run/vmnet-events.log`,
+and the generated composed/config manifests. Also note the host terminal size,
+terminal emulator, `$TERM`, and whether the failure happened in guest focus,
+wrapper prompt focus, resize handling, or cleanup.
+
 ## Artifacts And Triage
 
 On live failures, collect `.sandbox/docker-vm/self-test/state.json` first. It

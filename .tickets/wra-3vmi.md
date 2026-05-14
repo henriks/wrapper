@@ -1,6 +1,6 @@
 ---
 id: wra-3vmi
-status: open
+status: closed
 deps: [wra-70mh]
 links: []
 created: 2026-05-14T20:40:35Z
@@ -40,3 +40,9 @@ Prefer unit tests for pure state machines, mode selection, layout math, status f
 - Existing validation docs or scripts are updated where appropriate.
 - Any known terminal compatibility limitations are documented.
 
+
+## Notes
+
+**2026-05-14T21:25:12Z**
+
+Added interactive TUI smoke workflow to `vm-frontend/validation-workflow.md` covering default TUI startup, Codex initialization dialog, writable Codex state mount assertion, guest input/output, wrapper prompt focus isolation, resize behavior, `--no-tui` plain fallback, cleanup, and artifact collection. Added Wrapper TUI row to `vm-frontend/validation-matrix.md`. Verified non-KVM coverage with `vm-frontend/validate.sh fast`.

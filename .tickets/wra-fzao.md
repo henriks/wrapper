@@ -1,6 +1,6 @@
 ---
 id: wra-fzao
-status: open
+status: closed
 deps: [wra-njbl]
 links: []
 created: 2026-05-14T20:39:34Z
@@ -40,3 +40,9 @@ Use a one-line status bar first. Avoid reading/parsing logs in this ticket unles
 - Plain streaming output is unaffected.
 - Tests cover status formatting/truncation where practical.
 
+
+## Notes
+
+**2026-05-14T21:18:49Z**
+
+Implemented one-line TUI status model in `vm-frontend/src/tui.rs`: status now tracks session phase, focus mode, and guest viewport size, formats into the reserved status row, and truncates to narrow widths. Status updates on starting, running output, resize, exit, and failure. Added formatting/truncation tests. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

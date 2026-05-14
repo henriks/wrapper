@@ -1,6 +1,6 @@
 ---
 id: wra-0bmi
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-14T20:38:35Z
@@ -50,3 +50,7 @@ Direction update from planning discussion: do not preserve `codex-wrap` / `copil
 **2026-05-14T20:40:52Z**
 
 Superseded by later clarification: do not design `codex-wrap` / `copilot-wrap` argv[0] behavior as the long-term interface. The important setup path is Codex: enabling Codex in the TUI should add the correct Codex directories as rw mounts/config choices without depending on executable-name inference.
+
+**2026-05-14T21:03:27Z**
+
+Added `vm-frontend/tui-design.md`. Key implementation decision: introduce TUI as a new host terminal owner around a reusable payload session API; keep `payload_client.rs` free of Ratatui dependencies; use `--no-tui` as the explicit opt-out; compute guest rows/cols from the framed viewport interior; move Codex setup to structured startup config and remove argv0 tool inference only after the startup dialog exists.

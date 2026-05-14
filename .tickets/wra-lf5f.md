@@ -1,6 +1,6 @@
 ---
 id: wra-lf5f
-status: open
+status: closed
 deps: [wra-0bmi]
 links: []
 created: 2026-05-14T20:41:05Z
@@ -34,3 +34,9 @@ Represent Codex tool-state mounts as data/config choices rather than argv[0] ent
 - Runtime manifest generation can consume the selected optional mounts.
 - Requirements/docs are updated to remove misleading `codex-wrap` / `copilot-wrap` entrypoint language while preserving Codex state setup through the TUI.
 - Tests cover manifest/config generation for Codex tool-state mount choices.
+
+## Notes
+
+**2026-05-14T21:06:47Z**
+
+Implemented explicit Codex tool-state mount selection in `vm-frontend/src/runtime_manifest.rs`: added `ToolStateMounts`, `CODEX_TOOL_STATE_DIRS`, and a test proving `.codex` can be mounted without selecting a `GuestTool`. `--tool codex` remains compatible by deriving `ToolStateMounts::from_guest_tool(policy.tool)`. Documented Codex rw state setup in `requirements.md`. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

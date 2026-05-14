@@ -1,6 +1,6 @@
 ---
 id: wra-7v3w
-status: open
+status: closed
 deps: [wra-njbl]
 links: []
 created: 2026-05-14T20:39:23Z
@@ -42,3 +42,9 @@ Keep event routing explicit and testable. Model host UI events separately from p
 - Wrapper-reserved controls do not leak unintended bytes to the guest.
 - Tests cover key-event translation and viewport resize calculations where practical.
 
+
+## Notes
+
+**2026-05-14T21:17:28Z**
+
+Implemented TUI guest input routing in `vm-frontend/src/tui.rs`: payload output is read on a background thread, crossterm key events are translated into guest bytes, paste events are forwarded, Ctrl-C sends SIGINT to the guest payload, Ctrl-\ is reserved for wrapper controls and does not leak to the guest, and resize events recompute the bordered viewport interior, resize the vt100 screen, and send payload resize frames. Added tests for key translation, reserved prefix behavior, and resize math. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

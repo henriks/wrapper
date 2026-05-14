@@ -1,6 +1,6 @@
 ---
 id: wra-ukjo
-status: open
+status: closed
 deps: [wra-jndb, wra-lf5f]
 links: []
 created: 2026-05-14T20:40:14Z
@@ -50,3 +50,7 @@ Treat this as a startup flow/wizard that produces the same kind of launch config
 **2026-05-14T20:40:55Z**
 
 Superseded by later clarification: initialization UI should not present `codex-wrap` / `copilot-wrap` as argv[0]-based entrypoints. The relevant setup concern is Codex: enabling Codex in the TUI should add the correct Codex tool-state/config directories as rw mounts in the sandbox config.
+
+**2026-05-14T21:22:02Z**
+
+Implemented a TUI startup dialog in `vm-frontend/src/tui.rs` for wrapper startup when no tool is selected and TUI mode is available. `agentvm-frontend wrap` can now defer missing tool selection to the dialog; the dialog defaults to enabling Codex and returns structured `StartupSelection`, and non-TTY/plain mode still requires explicit `--tool`. Added parser and dialog tests. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

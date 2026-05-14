@@ -1,6 +1,6 @@
 ---
 id: wra-70mh
-status: open
+status: closed
 deps: [wra-ukjo, wra-lf5f]
 links: []
 created: 2026-05-14T20:40:24Z
@@ -44,3 +44,7 @@ Do this after the TUI initialization/start path exists so there is a clear repla
 **2026-05-14T20:41:50Z**
 
 Superseded by later clarification: removal should include both `codex-wrap` and `copilot-wrap` argv[0] entrypoint/tool-inference behavior. Do not replace that with executable-name inference. Codex setup should move to the TUI initialization path, where enabling Codex adds the correct Codex state/config rw mounts.
+
+**2026-05-14T21:24:27Z**
+
+Removed `codex-wrap` / `copilot-wrap` argv0 entrypoint logic from `vm-frontend/src/main.rs`: `run_cli` now only recognizes explicit subcommands, wrapper parsing no longer infers tools from executable names, and usage points at `agentvm-frontend wrap`. Deleted the tracked `codex-wrap` and `copilot-wrap` symlinks. Updated `requirements.md` and `vm-frontend/tui-design.md`. Added tests proving argv0 no longer selects wrapper/tool behavior. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

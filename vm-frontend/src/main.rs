@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
@@ -23,7 +23,7 @@ use agentvm_frontend::payload_client::{
     PayloadRequest,
 };
 use agentvm_frontend::runtime_manifest::{
-    guest_runtime_mounts, GuestShareSpec, GuestTool, RuntimeMount,
+    guest_runtime_mounts, GuestShareSpec, GuestTool, RuntimeMount, ToolStateMounts,
 };
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
@@ -31,6 +31,8 @@ use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
+
+mod tui;
 
 fn main() {
     if let Err(error) = run_cli(env::args().collect()) {
@@ -45,9 +47,6 @@ fn run_cli(argv: Vec<String>) -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| "agentvm-frontend".to_string());
     let args: Vec<String> = argv.into_iter().skip(1).collect();
-    if is_wrapper_program(&program) {
-        return run_wrapper(program, args);
-    }
     match args.first().map(String::as_str) {
         Some("prepare" | "launch" | "vmnet-gateway" | "payload-client" | "self-test")
         | Some("-h" | "--help")
@@ -105,75 +104,83 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             println!("{}", prep.qemu_command.join(" "));
             Ok(())
         }
-        Some("launch") => {
-            let (config, policy_args) = frontend_config_from_args(&args[1..])?;
-            let _lock = ProjectLock::acquire(&config)?;
-            let qemu_timeout = policy_args.qemu_timeout;
-            let local_http_smoke_upstream = policy_args.local_http_smoke_upstream;
-            let payload = launch_payload_args(&config, &policy_args)?;
-            let mounts = runtime_mounts(&config, &policy_args)?;
-            let guest_env = guest_payload_env(&config, &policy_args)?;
-            let mut policy = policy_from_args(config.network.clone(), policy_args);
-            let mut config = config;
-            if let Some(destination) = local_http_smoke_upstream {
-                config
-                    .upstream_mappings
-                    .push(start_local_http_smoke_upstream(destination)?);
+        Some("launch") => run_launch(&args[1..], WrapperUiMode::Plain),
+        Some("-h" | "--help") | None => {
+            print_usage();
+            Ok(())
+        }
+        Some(command) => Err(format!("unknown command: {command}")),
+    }
+}
+
+fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
+    let (config, policy_args) = frontend_config_from_args(args)?;
+    let _lock = ProjectLock::acquire(&config)?;
+    let qemu_timeout = policy_args.qemu_timeout;
+    let local_http_smoke_upstream = policy_args.local_http_smoke_upstream;
+    let payload = launch_payload_args(&config, &policy_args)?;
+    let mounts = runtime_mounts(&config, &policy_args)?;
+    let guest_env = guest_payload_env(&config, &policy_args)?;
+    let mut policy = policy_from_args(config.network.clone(), policy_args);
+    let mut config = config;
+    if let Some(destination) = local_http_smoke_upstream {
+        config
+            .upstream_mappings
+            .push(start_local_http_smoke_upstream(destination)?);
+    }
+    if let Some(payload) = payload {
+        let host_port = ensure_payload_listener(&mut policy);
+        let running = start_frontend_with_policy(config.clone(), mounts, policy)
+            .map_err(|error| format!("launch failed: {error}"))?;
+        let addr = socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
+        wait_for_payload_ready(addr, Duration::from_secs(120))?;
+        let request = PayloadRequest {
+            script: payload.script,
+            cwd: payload.cwd,
+            env: merged_payload_env(guest_env, payload.env),
+            rows: payload.rows,
+            cols: payload.cols,
+        };
+        let payload_result = match ui_mode {
+            WrapperUiMode::Tui => {
+                tui::run_payload_viewport(addr, &request).map_err(|error| error.to_string())
             }
-            if let Some(payload) = payload {
-                let host_port = ensure_payload_listener(&mut policy);
-                let running = start_frontend_with_policy(config.clone(), mounts, policy)
-                    .map_err(|error| format!("launch failed: {error}"))?;
-                let addr =
-                    socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
-                wait_for_payload_ready(addr, Duration::from_secs(120))?;
-                let request = PayloadRequest {
-                    script: payload.script,
-                    cwd: payload.cwd,
-                    env: merged_payload_env(guest_env, payload.env),
-                    rows: payload.rows,
-                    cols: payload.cols,
-                };
+            WrapperUiMode::Plain => {
                 let input =
                     (!payload.no_stdin).then(|| Box::new(io::stdin()) as Box<dyn io::Read + Send>);
-                let payload_result = run_payload_tcp_with_control(
+                run_payload_tcp_with_control(
                     addr,
                     &request,
                     input,
                     &mut io::stdout(),
                     PayloadControlOptions::interactive(),
                 )
-                .map_err(|error| error.to_string());
-                running
-                    .terminate()
-                    .map_err(|error| format!("launch shutdown failed: {error}"))?;
-                let exit_code = payload_result?;
-                std::process::exit(payload_exit_status(exit_code));
+                .map_err(|error| error.to_string())
             }
-            let qemu_exit = run_frontend_until_qemu_exit_with_policy_and_timeout(
-                config.clone(),
-                mounts,
-                policy,
-                qemu_timeout,
-            )
-            .map_err(|error| format!("launch failed: {error}"))?;
-            if qemu_exit.status.success() {
-                Ok(())
-            } else if qemu_exit.timed_out {
-                Err(format!(
-                    "qemu timed out after {} seconds and was terminated with status: {}",
-                    qemu_timeout.map_or(0, |timeout| timeout.as_secs()),
-                    qemu_exit.status
-                ))
-            } else {
-                Err(format!("qemu exited with status: {}", qemu_exit.status))
-            }
-        }
-        Some("-h" | "--help") | None => {
-            print_usage();
-            Ok(())
-        }
-        Some(command) => Err(format!("unknown command: {command}")),
+        };
+        running
+            .terminate()
+            .map_err(|error| format!("launch shutdown failed: {error}"))?;
+        let exit_code = payload_result?;
+        std::process::exit(payload_exit_status(exit_code));
+    }
+    let qemu_exit = run_frontend_until_qemu_exit_with_policy_and_timeout(
+        config.clone(),
+        mounts,
+        policy,
+        qemu_timeout,
+    )
+    .map_err(|error| format!("launch failed: {error}"))?;
+    if qemu_exit.status.success() {
+        Ok(())
+    } else if qemu_exit.timed_out {
+        Err(format!(
+            "qemu timed out after {} seconds and was terminated with status: {}",
+            qemu_timeout.map_or(0, |timeout| timeout.as_secs()),
+            qemu_exit.status
+        ))
+    } else {
+        Err(format!("qemu exited with status: {}", qemu_exit.status))
     }
 }
 
@@ -239,8 +246,22 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
             "--tls-generate-per-host-certs".to_string(),
         ]);
     }
+    let ui_mode = wrapper.ui_mode;
+    let needs_startup_dialog = ui_mode == WrapperUiMode::Tui && !wrapper.tool_selected;
     let mut launch_args = vec!["launch".to_string()];
     launch_args.extend(wrapper.into_launch_args());
+    if needs_startup_dialog {
+        let selection = tui::run_startup_dialog().map_err(|error| error.to_string())?;
+        if selection.enable_codex {
+            launch_args.extend(["--tool".to_string(), "codex".to_string()]);
+        } else {
+            return Err("startup dialog did not select a payload".to_string());
+        }
+    }
+    match ui_mode {
+        WrapperUiMode::Tui => return run_launch(&launch_args[1..], ui_mode),
+        WrapperUiMode::Plain => {}
+    }
     run(launch_args)
 }
 
@@ -248,9 +269,17 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
 struct WrapperArgs {
     project: PathBuf,
     launch_args: Vec<String>,
+    ui_mode: WrapperUiMode,
+    tool_selected: bool,
     tls_bootstrap: bool,
     reset: bool,
     help: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperUiMode {
+    Tui,
+    Plain,
 }
 
 #[derive(Debug)]
@@ -266,12 +295,27 @@ impl WrapperArgs {
 }
 
 fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, String> {
+    parse_wrapper_args_with_terminal(
+        program,
+        args,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    )
+}
+
+fn parse_wrapper_args_with_terminal(
+    _program: &str,
+    args: &[String],
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> Result<WrapperArgs, String> {
     let mut launch_args = Vec::new();
     let mut project = env::current_dir().map_err(|error| error.to_string())?;
-    let mut tool = wrapper_tool_from_program(program);
+    let mut tool = None;
     let mut reset = false;
     let mut help = false;
     let mut no_net = false;
+    let mut no_tui = false;
     let mut tls_bootstrap = false;
     let mut index = 0;
     while index < args.len() {
@@ -296,6 +340,7 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
                 no_net = true;
                 launch_args.push(args[index].clone());
             }
+            "--no-tui" => no_tui = true,
             "--gh" => launch_args.push(args[index].clone()),
             "--aws" | "--ro" | "--rw" | "--qemu" | "--artifact-manifest" => {
                 let flag = args[index].clone();
@@ -335,6 +380,8 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
         return Ok(WrapperArgs {
             project,
             launch_args,
+            ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
+            tool_selected: false,
             tls_bootstrap,
             reset,
             help,
@@ -343,11 +390,17 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
     if !launch_args.iter().any(|arg| arg == "--project") {
         launch_args.extend(["--project".to_string(), project.display().to_string()]);
     }
-    if !launch_args.iter().any(|arg| arg == "--tool") {
-        let tool = tool.ok_or_else(|| {
-            "cannot determine tool from invocation name; use --tool codex|copilot".to_string()
-        })?;
-        launch_args.extend(["--tool".to_string(), tool]);
+    let ui_mode = wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty);
+    let mut tool_selected = launch_args.iter().any(|arg| arg == "--tool");
+    if !tool_selected {
+        if let Some(tool) = tool {
+            launch_args.extend(["--tool".to_string(), tool]);
+            tool_selected = true;
+        } else if ui_mode == WrapperUiMode::Plain {
+            return Err(
+                "no tool selected; use --tool codex|copilot or interactive TUI setup".to_string(),
+            );
+        }
     }
     if !no_net
         && !launch_args
@@ -360,10 +413,20 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
     Ok(WrapperArgs {
         project,
         launch_args,
+        ui_mode,
+        tool_selected,
         tls_bootstrap,
         reset,
         help,
     })
+}
+
+fn wrapper_ui_mode(no_tui: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> WrapperUiMode {
+    if no_tui || !stdin_is_tty || !stdout_is_tty {
+        WrapperUiMode::Plain
+    } else {
+        WrapperUiMode::Tui
+    }
 }
 
 fn ensure_wrapper_mitm_ca(project: &PathBuf) -> Result<MitmCaPaths, String> {
@@ -434,25 +497,6 @@ fn write_private_key(path: &PathBuf, pem: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn wrapper_tool_from_program(program: &str) -> Option<String> {
-    let name = std::path::Path::new(program).file_name()?.to_string_lossy();
-    if name.contains("copilot") {
-        Some("copilot".to_string())
-    } else if name.contains("codex") {
-        Some("codex".to_string())
-    } else {
-        None
-    }
-}
-
-fn is_wrapper_program(program: &str) -> bool {
-    let Some(name) = std::path::Path::new(program).file_name() else {
-        return false;
-    };
-    let name = name.to_string_lossy();
-    name.contains("codex") || name.contains("copilot") || name == "sandbox-wrap"
-}
-
 fn reset_project(project: &PathBuf) -> Result<(), String> {
     let project = if project.is_absolute() {
         project.clone()
@@ -492,7 +536,7 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
 
 fn print_wrapper_usage() {
     eprintln!(
-        "usage: codex-wrap|copilot-wrap [--project PATH] [--tool codex|copilot] [--no-net] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- EXTRA_ARGS...]"
+        "usage: agentvm-frontend wrap [--project PATH] [--tool codex|copilot] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- EXTRA_ARGS...]"
     );
 }
 
@@ -1147,6 +1191,7 @@ fn runtime_mounts(
         config.project.clone(),
         &GuestShareSpec {
             tool: policy.tool,
+            tool_state: ToolStateMounts::from_guest_tool(policy.tool),
             host_home,
             gh: policy.gh,
             extra_ro: policy.extra_ro.clone(),
@@ -1950,8 +1995,10 @@ mod tests {
     #[test]
     fn wrapper_args_translate_to_launch_args() {
         let args = parse_wrapper_args(
-            "codex-wrap",
+            "agentvm-frontend",
             &[
+                "--tool".to_string(),
+                "codex".to_string(),
                 "--project".to_string(),
                 "/tmp/project".to_string(),
                 "--no-net".to_string(),
@@ -1986,7 +2033,11 @@ mod tests {
 
     #[test]
     fn wrapper_defaults_to_public_egress_for_tool_install() {
-        let args = parse_wrapper_args("codex-wrap", &[]).expect("wrapper args");
+        let args = parse_wrapper_args(
+            "agentvm-frontend",
+            &["--tool".to_string(), "codex".to_string()],
+        )
+        .expect("wrapper args");
 
         assert!(args
             .launch_args
@@ -1995,11 +2046,86 @@ mod tests {
     }
 
     #[test]
-    fn copilot_wrapper_defaults_to_vm_tool_install_and_public_egress() {
+    fn wrapper_selects_tui_for_interactive_terminals_by_default() {
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &["--tool".to_string(), "codex".to_string()],
+            true,
+            true,
+        )
+        .expect("wrapper args");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Tui);
+    }
+
+    #[test]
+    fn wrapper_no_tui_selects_plain_mode() {
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--tool".to_string(),
+                "codex".to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper args");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Plain);
+        assert!(!args.launch_args.contains(&"--no-tui".to_string()));
+    }
+
+    #[test]
+    fn wrapper_non_tty_selects_plain_mode() {
+        let stdin_plain = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &["--tool".to_string(), "codex".to_string()],
+            false,
+            true,
+        )
+        .expect("stdin");
+        let stdout_plain = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &["--tool".to_string(), "codex".to_string()],
+            true,
+            false,
+        )
+        .expect("stdout");
+
+        assert_eq!(stdin_plain.ui_mode, WrapperUiMode::Plain);
+        assert_eq!(stdout_plain.ui_mode, WrapperUiMode::Plain);
+    }
+
+    #[test]
+    fn interactive_wrap_without_tool_defers_to_startup_dialog() {
+        let args =
+            parse_wrapper_args_with_terminal("agentvm-frontend", &[], true, true).expect("wrapper");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Tui);
+        assert!(!args.tool_selected);
+        assert!(!args.launch_args.contains(&"--tool".to_string()));
+    }
+
+    #[test]
+    fn plain_wrap_without_tool_still_requires_explicit_tool() {
+        let error = parse_wrapper_args_with_terminal("agentvm-frontend", &[], false, true)
+            .expect_err("missing tool");
+
+        assert_eq!(
+            error,
+            "no tool selected; use --tool codex|copilot or interactive TUI setup"
+        );
+    }
+
+    #[test]
+    fn explicit_copilot_tool_defaults_to_vm_tool_install_and_public_egress() {
         let root = frontend_test_root();
         let args = parse_wrapper_args(
-            "copilot-wrap",
+            "agentvm-frontend",
             &[
+                "--tool".to_string(),
+                "copilot".to_string(),
                 "--project".to_string(),
                 root.join("repo").display().to_string(),
                 "--artifact-manifest".to_string(),
@@ -2098,17 +2224,35 @@ mod tests {
     #[test]
     fn wrapper_rejects_removed_bubblewrap_flags() {
         assert_eq!(
-            parse_wrapper_args("codex-wrap", &["--docker".to_string()]).expect_err("docker"),
+            parse_wrapper_args("agentvm-frontend", &["--docker".to_string()]).expect_err("docker"),
             "--docker has been removed; the VM is now the default execution model"
         );
         assert_eq!(
             parse_wrapper_args(
-                "codex-wrap",
+                "agentvm-frontend",
                 &["--pass-env".to_string(), "TOKEN".to_string()]
             )
             .expect_err("pass env"),
             "--pass-env has been removed; use explicit VM guest shares/auth options instead"
         );
+    }
+
+    #[test]
+    fn argv0_no_longer_selects_wrapper_or_tool_behavior() {
+        assert_eq!(
+            run_cli(vec![
+                "codex-wrap".to_string(),
+                "--tool".to_string(),
+                "codex".to_string(),
+            ])
+            .expect_err("argv0 wrapper removed"),
+            "unknown command: --tool"
+        );
+
+        let args =
+            parse_wrapper_args_with_terminal("codex-wrap", &[], true, true).expect("wrapper args");
+        assert!(!args.tool_selected);
+        assert!(!args.launch_args.contains(&"--tool".to_string()));
     }
 
     #[test]

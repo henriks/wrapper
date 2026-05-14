@@ -1,6 +1,6 @@
 ---
 id: wra-njbl
-status: open
+status: closed
 deps: [wra-ag8h, wra-d54r]
 links: []
 created: 2026-05-14T20:39:09Z
@@ -44,3 +44,9 @@ Start with a conservative layout: full-screen Ratatui terminal, bordered main gu
 - Plain streaming remains unaffected when TUI is disabled.
 - Tests or a documented manual smoke cover basic rendering and cleanup behavior.
 
+
+## Notes
+
+**2026-05-14T21:15:47Z**
+
+Implemented initial Ratatui viewport in `vm-frontend/src/tui.rs` using `tui_term::widget::PseudoTerminal` backed by vt100 parser state. TUI mode now initializes Ratatui, computes payload rows/cols from the bordered viewport interior, renders guest output inside the frame, reserves a one-line status area, and restores terminal state via `ratatui::try_restore` on exit/error. Added viewport layout/render tests. Added `ratatui`, `crossterm`, `tui-term`, and `vt100` dependencies. Verified with `cargo test --manifest-path vm-frontend/Cargo.toml --offline`.

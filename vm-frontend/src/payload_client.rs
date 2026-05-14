@@ -67,6 +67,97 @@ impl PayloadControlOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadEvent {
+    Output(Vec<u8>),
+    Exit(i32),
+    Failure(String),
+}
+
+pub struct PayloadSession<S> {
+    stream: S,
+}
+
+impl<S: Read + Write> PayloadSession<S> {
+    pub fn from_stream(
+        mut stream: S,
+        request: &PayloadRequest,
+    ) -> Result<Self, PayloadClientError> {
+        let request_json = serde_json::to_vec(request)?;
+        send_frame(&mut stream, b'R', &request_json)?;
+        Ok(Self { stream })
+    }
+
+    pub fn send_input(&mut self, input: &[u8]) -> Result<(), PayloadClientError> {
+        send_frame(&mut self.stream, b'I', input)?;
+        Ok(())
+    }
+
+    pub fn send_signal(&mut self, signal: i32) -> Result<(), PayloadClientError> {
+        send_signal_frame(&mut self.stream, signal)?;
+        Ok(())
+    }
+
+    pub fn send_resize(&mut self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        send_resize_frame(&mut self.stream, rows, cols)?;
+        Ok(())
+    }
+
+    pub fn recv_event(&mut self) -> Result<PayloadEvent, PayloadClientError> {
+        let (frame_type, payload) = recv_frame(&mut self.stream)?;
+        match frame_type {
+            b'O' => Ok(PayloadEvent::Output(payload)),
+            b'X' => exit_code_from_payload(&payload).map(PayloadEvent::Exit),
+            b'F' => Ok(PayloadEvent::Failure(
+                String::from_utf8_lossy(&payload).to_string(),
+            )),
+            other => Err(PayloadClientError::Protocol(format!(
+                "unexpected payload frame type {other:?}"
+            ))),
+        }
+    }
+}
+
+impl PayloadSession<TcpStream> {
+    pub fn connect(
+        addr: impl ToSocketAddrs,
+        request: &PayloadRequest,
+    ) -> Result<Self, PayloadClientError> {
+        let stream = connect_payload(addr, Duration::from_secs(10))?;
+        stream.set_nodelay(true)?;
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        Self::from_stream(stream, request)
+    }
+
+    pub fn try_clone_writer(&self) -> Result<PayloadWriter, PayloadClientError> {
+        Ok(PayloadWriter {
+            stream: self.stream.try_clone()?,
+        })
+    }
+}
+
+pub struct PayloadWriter {
+    stream: TcpStream,
+}
+
+impl PayloadWriter {
+    pub fn send_input(&mut self, input: &[u8]) -> Result<(), PayloadClientError> {
+        send_frame(&mut self.stream, b'I', input)?;
+        Ok(())
+    }
+
+    pub fn send_signal(&mut self, signal: i32) -> Result<(), PayloadClientError> {
+        send_signal_frame(&mut self.stream, signal)?;
+        Ok(())
+    }
+
+    pub fn send_resize(&mut self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        send_resize_frame(&mut self.stream, rows, cols)?;
+        Ok(())
+    }
+}
+
 pub fn ping_payload(addr: impl ToSocketAddrs) -> Result<(), PayloadClientError> {
     let mut stream = connect_payload(addr, Duration::from_secs(1))?;
     send_frame(&mut stream, b'P', &[])?;
@@ -102,11 +193,8 @@ pub fn run_payload_tcp_with_control(
     output: &mut impl Write,
     control: PayloadControlOptions,
 ) -> Result<i32, PayloadClientError> {
-    let mut stream = connect_payload(addr, Duration::from_secs(10))?;
-    stream.set_nodelay(true)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    run_payload_stream(&mut stream, request, input, output, control)
+    let mut session = PayloadSession::connect(addr, request)?;
+    run_payload_session(&mut session, input, output, control)
 }
 
 fn connect_payload(
@@ -136,21 +224,14 @@ pub fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, PayloadClientErr
         .ok_or_else(|| PayloadClientError::Address(format!("no socket address for {host}:{port}")))
 }
 
-fn run_payload_stream(
-    stream: &mut TcpStream,
-    request: &PayloadRequest,
+fn run_payload_session(
+    session: &mut PayloadSession<TcpStream>,
     input: Option<Box<dyn Read + Send>>,
     output: &mut impl Write,
     control: PayloadControlOptions,
 ) -> Result<i32, PayloadClientError> {
-    if input.is_none() && !control.forward_signals && !control.forward_resize {
-        return run_payload_io(stream, request, output);
-    }
-
-    let request_json = serde_json::to_vec(request)?;
-    send_frame(stream, b'R', &request_json)?;
     let done = Arc::new(AtomicBool::new(false));
-    let send_lock = Arc::new(Mutex::new(stream.try_clone()?));
+    let send_lock = Arc::new(Mutex::new(session.stream.try_clone()?));
 
     if let Some(mut input) = input {
         let done = done.clone();
@@ -180,24 +261,14 @@ fn run_payload_stream(
 
     let result = (|| -> Result<i32, PayloadClientError> {
         loop {
-            let (frame_type, payload) = recv_frame(stream)?;
-            match frame_type {
-                b'O' => {
+            match session.recv_event()? {
+                PayloadEvent::Output(payload) => {
                     output.write_all(&payload)?;
                     output.flush()?;
                 }
-                b'X' => {
-                    return exit_code_from_payload(&payload);
-                }
-                b'F' => {
-                    return Err(PayloadClientError::Protocol(
-                        String::from_utf8_lossy(&payload).to_string(),
-                    ));
-                }
-                other => {
-                    return Err(PayloadClientError::Protocol(format!(
-                        "unexpected payload frame type {other:?}"
-                    )));
+                PayloadEvent::Exit(exit_code) => return Ok(exit_code),
+                PayloadEvent::Failure(message) => {
+                    return Err(PayloadClientError::Protocol(message))
                 }
             }
         }
@@ -207,31 +278,21 @@ fn run_payload_stream(
     result
 }
 
+#[cfg(test)]
 fn run_payload_io(
     stream: &mut (impl Read + Write),
     request: &PayloadRequest,
     output: &mut impl Write,
 ) -> Result<i32, PayloadClientError> {
-    let request_json = serde_json::to_vec(request)?;
-    send_frame(stream, b'R', &request_json)?;
+    let mut session = PayloadSession::from_stream(stream, request)?;
     loop {
-        let (frame_type, payload) = recv_frame(stream)?;
-        match frame_type {
-            b'O' => {
+        match session.recv_event()? {
+            PayloadEvent::Output(payload) => {
                 output.write_all(&payload)?;
                 output.flush()?;
             }
-            b'X' => return exit_code_from_payload(&payload),
-            b'F' => {
-                return Err(PayloadClientError::Protocol(
-                    String::from_utf8_lossy(&payload).to_string(),
-                ));
-            }
-            other => {
-                return Err(PayloadClientError::Protocol(format!(
-                    "unexpected payload frame type {other:?}"
-                )));
-            }
+            PayloadEvent::Exit(exit_code) => return Ok(exit_code),
+            PayloadEvent::Failure(message) => return Err(PayloadClientError::Protocol(message)),
         }
     }
 }
@@ -528,6 +589,64 @@ mod tests {
         assert_eq!(frame_type, b'R');
         let request: serde_json::Value = serde_json::from_slice(&payload).expect("json");
         assert_eq!(request["script"], "echo hello");
+    }
+
+    #[test]
+    fn payload_session_sends_control_frames_and_receives_events() {
+        let mut server_frames = Vec::new();
+        send_frame(&mut server_frames, b'O', b"ready").expect("output");
+        send_frame(&mut server_frames, b'X', br#"{"exit_code":0}"#).expect("exit");
+        let mut stream = ScriptedIo::new(server_frames);
+
+        let request = PayloadRequest::new("agent");
+        {
+            let mut session = PayloadSession::from_stream(&mut stream, &request).expect("session");
+            session.send_input(b"hello").expect("input");
+            session.send_resize(33, 101).expect("resize");
+            session.send_signal(2).expect("signal");
+
+            assert_eq!(
+                session.recv_event().expect("output"),
+                PayloadEvent::Output(b"ready".to_vec())
+            );
+            assert_eq!(session.recv_event().expect("exit"), PayloadEvent::Exit(0));
+        }
+
+        let mut written = io::Cursor::new(stream.written);
+        let (frame_type, payload) = recv_frame(&mut written).expect("request frame");
+        assert_eq!(frame_type, b'R');
+        let request: serde_json::Value = serde_json::from_slice(&payload).expect("json");
+        assert_eq!(request["script"], "agent");
+        let (frame_type, payload) = recv_frame(&mut written).expect("input frame");
+        assert_eq!(frame_type, b'I');
+        assert_eq!(payload, b"hello");
+        let (frame_type, payload) = recv_frame(&mut written).expect("resize frame");
+        assert_eq!(frame_type, b'W');
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).expect("resize json"),
+            serde_json::json!({ "rows": 33, "cols": 101 })
+        );
+        let (frame_type, payload) = recv_frame(&mut written).expect("signal frame");
+        assert_eq!(frame_type, b'S');
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).expect("signal json"),
+            serde_json::json!({ "signal": 2 })
+        );
+    }
+
+    #[test]
+    fn payload_session_surfaces_failure_events() {
+        let mut server_frames = Vec::new();
+        send_frame(&mut server_frames, b'F', b"payload failed").expect("failure");
+        let mut stream = ScriptedIo::new(server_frames);
+
+        let mut session = PayloadSession::from_stream(&mut stream, &PayloadRequest::new("agent"))
+            .expect("session");
+
+        assert_eq!(
+            session.recv_event().expect("failure event"),
+            PayloadEvent::Failure("payload failed".to_string())
+        );
     }
 
     #[test]
