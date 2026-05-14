@@ -113,6 +113,14 @@ pub fn write_runtime_manifests(
     config: &FrontendConfig,
     mounts: &[RuntimeMount],
 ) -> io::Result<RuntimeManifestSummary> {
+    write_runtime_manifests_with_config_mounts(config, mounts, &[])
+}
+
+pub fn write_runtime_manifests_with_config_mounts(
+    config: &FrontendConfig,
+    mounts: &[RuntimeMount],
+    config_mounts: &[RuntimeMount],
+) -> io::Result<RuntimeManifestSummary> {
     fs::create_dir_all(&config.runtime.run_dir)?;
     fs::create_dir_all(&config.runtime.guest_config_dir)?;
 
@@ -156,7 +164,7 @@ pub fn write_runtime_manifests(
 
     write_json(&config.runtime.composed_fs_manifest, &host_manifest)?;
     write_json(&config.runtime.composed_bind_manifest, &bind_manifest)?;
-    write_config_fs_manifest(config)?;
+    write_config_fs_manifest(config, config_mounts)?;
 
     Ok(RuntimeManifestSummary {
         composed_fs_manifest: config.runtime.composed_fs_manifest.clone(),
@@ -220,7 +228,10 @@ fn validated_host_mounts(mounts: &[RuntimeMount]) -> io::Result<Vec<HostMount>> 
     Ok(host_mounts)
 }
 
-fn write_config_fs_manifest(config: &FrontendConfig) -> io::Result<()> {
+fn write_config_fs_manifest(
+    config: &FrontendConfig,
+    extra_mounts: &[RuntimeMount],
+) -> io::Result<()> {
     let mount = RuntimeMount {
         id: "m0001_composed_binds".to_string(),
         host_path: config.runtime.composed_bind_manifest.clone(),
@@ -230,7 +241,10 @@ fn write_config_fs_manifest(config: &FrontendConfig) -> io::Result<()> {
         required: true,
         bind: false,
     };
-    let mounts = validated_host_mounts(&[mount])?;
+    let mut config_mounts = Vec::with_capacity(1 + extra_mounts.len());
+    config_mounts.push(mount);
+    config_mounts.extend(extra_mounts.iter().cloned());
+    let mounts = validated_host_mounts(&config_mounts)?;
     let manifest = HostManifest {
         schema_version: 1,
         export_tag: crate::CONFIG_FS_TAG.to_string(),
@@ -351,6 +365,36 @@ mod tests {
             fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
         assert!(config_manifest.contains("\"guest_path\": \"/composed-binds.json\""));
         assert!(config_manifest.contains("\"host_path\": \""));
+    }
+
+    #[test]
+    fn writes_extra_config_fs_mounts() {
+        let root = unique_temp_dir();
+        fs::create_dir_all(root.join("repo")).expect("repo");
+        let ca_cert = root.join("mitm-ca.crt");
+        fs::write(&ca_cert, "test ca").expect("ca");
+        let config = config(&root);
+        let extra = RuntimeMount {
+            id: "m0002_mitm_ca_cert".to_string(),
+            host_path: ca_cert,
+            guest_path: PathBuf::from("/mitm-ca.crt"),
+            readonly: true,
+            source_class: ManifestSourceClass::SystemRo,
+            required: true,
+            bind: false,
+        };
+
+        write_runtime_manifests_with_config_mounts(
+            &config,
+            &workspace_mounts(config.project.clone()),
+            &[extra],
+        )
+        .expect("write manifests");
+
+        let config_manifest =
+            fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
+        assert!(config_manifest.contains("\"guest_path\": \"/composed-binds.json\""));
+        assert!(config_manifest.contains("\"guest_path\": \"/mitm-ca.crt\""));
     }
 
     #[test]

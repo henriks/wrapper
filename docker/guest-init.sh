@@ -49,6 +49,25 @@ load_kernel_module() {
   fi
 }
 
+install_mitm_ca() {
+  ca_path=/run/agentvm-config/mitm-ca.crt
+  [ -f "${ca_path}" ] || return 0
+
+  bundle=/run/agentvm-ca-bundle.pem
+  : >"${bundle}"
+  if [ -f /etc/ssl/cert.pem ]; then
+    cat /etc/ssl/cert.pem >>"${bundle}"
+  elif [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cat /etc/ssl/certs/ca-certificates.crt >>"${bundle}"
+  fi
+  printf '\n' >>"${bundle}"
+  cat "${ca_path}" >>"${bundle}"
+
+  export SSL_CERT_FILE="${bundle}"
+  export REQUESTS_CA_BUNDLE="${bundle}"
+  log "installed MITM CA bundle at ${bundle}"
+}
+
 bind_composed_entry() {
   kind="$1"
   source="$2"
@@ -238,6 +257,7 @@ readonly \
   exit 1
 }
 mount_composed_export
+install_mitm_ca
 if [ "${PROJECT_PATH}" != "/workspace" ]; then
   mount --bind "${PROJECT_PATH}" /workspace
 fi

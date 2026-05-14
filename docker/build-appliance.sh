@@ -149,7 +149,7 @@ EOF
   cp /etc/resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 
   run_in_chroot "apk update"
-  run_in_chroot "apk add --no-cache docker-engine=${DOCKER_ENGINE_VERSION} docker-cli=${DOCKER_CLI_VERSION} linux-virt=${LINUX_VIRT_VERSION} mkinitfs=${MKINITFS_VERSION} python3=${PYTHON3_VERSION} e2fsprogs=${E2FSPROGS_VERSION} iproute2=${IPROUTE2_VERSION} util-linux=${UTIL_LINUX_VERSION} bubblewrap=${BUBBLEWRAP_VERSION} nodejs=${NODEJS_VERSION} npm=${NPM_VERSION}"
+  run_in_chroot "apk add --no-cache docker-engine=${DOCKER_ENGINE_VERSION} docker-cli=${DOCKER_CLI_VERSION} linux-virt=${LINUX_VIRT_VERSION} mkinitfs=${MKINITFS_VERSION} python3=${PYTHON3_VERSION} e2fsprogs=${E2FSPROGS_VERSION} iproute2=${IPROUTE2_VERSION} util-linux=${UTIL_LINUX_VERSION} bubblewrap=${BUBBLEWRAP_VERSION} nodejs=${NODEJS_VERSION} npm=${NPM_VERSION} ca-certificates"
   run_in_chroot "kernel_version=\$(basename /lib/modules/*) && mkinitfs -b / \"\${kernel_version}\""
   run_in_chroot "rm -rf /var/cache/apk/* /usr/share/man/* /usr/share/doc/* /usr/share/locale/*"
   rm -f "${ROOTFS_DIR}/etc/resolv.conf"

@@ -514,6 +514,9 @@ fn format_proxy_event(event: &TcpProxyEvent) -> String {
         TcpProxyEvent::TlsUpstreamPayload { handle, bytes } => {
             format!("tls_upstream_payload handle={handle:?} bytes={bytes}")
         }
+        TcpProxyEvent::HttpsPlaintextBuffered { handle, bytes } => {
+            format!("https_plaintext_buffered handle={handle:?} bytes={bytes}")
+        }
         TcpProxyEvent::TlsMitmUnavailable {
             handle,
             destination,

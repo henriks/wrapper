@@ -118,6 +118,8 @@ where
                                 http_buffer: Vec::new(),
                                 guest_tls,
                                 upstream_tls: None,
+                                upstream_tls_ready: false,
+                                pending_upstream_bytes: Vec::new(),
                                 pending_upstream_plaintext: Vec::new(),
                             },
                         );
@@ -150,6 +152,8 @@ where
             let Some(session) = self.sessions.get_mut(&active.handle) else {
                 continue;
             };
+            drain_upstream_tls_writes(session, active.handle, &mut events);
+            flush_pending_upstream_bytes(session, active.handle, &mut events);
             if let Some(upstream_bytes) =
                 read_available(&mut session.connection, &mut events, active.handle)
             {
@@ -172,14 +176,19 @@ where
                         }
                     };
                     if !upstream_read.tls_to_upstream.is_empty() {
-                        match write_all_best_effort(
+                        match write_buffered_best_effort(
                             &mut session.connection,
+                            &mut session.pending_upstream_bytes,
                             &upstream_read.tls_to_upstream,
                         ) {
-                            Ok(bytes) => events.push(TcpProxyEvent::TlsUpstreamPayload {
-                                handle: active.handle,
-                                bytes,
-                            }),
+                            Ok(bytes) => {
+                                if bytes > 0 {
+                                    events.push(TcpProxyEvent::TlsUpstreamPayload {
+                                        handle: active.handle,
+                                        bytes,
+                                    });
+                                }
+                            }
                             Err(error) => {
                                 events.push(TcpProxyEvent::UpstreamWriteFailed {
                                     handle: active.handle,
@@ -188,8 +197,16 @@ where
                                 continue;
                             }
                         }
+                        session.upstream_tls_ready = true;
+                    }
+                    if !session.upstream_tls_ready {
+                        session.upstream_tls_ready = session
+                            .upstream_tls
+                            .as_ref()
+                            .is_some_and(|upstream_tls| !upstream_tls.is_handshaking());
                     }
                     flush_pending_https_plaintext(session, active.handle, &mut events);
+                    drain_upstream_tls_writes(session, active.handle, &mut events);
                     if upstream_read.plaintext.is_empty() {
                         continue;
                     }
@@ -293,17 +310,23 @@ where
         }
 
         if session.decision.action == TcpAction::InterceptHttps {
-            if let Some(upstream_tls) = session.upstream_tls.as_ref() {
-                if upstream_tls.is_handshaking() {
-                    session
-                        .pending_upstream_plaintext
-                        .extend_from_slice(&payload);
-                    return;
-                }
+            if !session.upstream_tls_ready {
+                session
+                    .pending_upstream_plaintext
+                    .extend_from_slice(&payload);
+                events.push(TcpProxyEvent::HttpsPlaintextBuffered {
+                    handle,
+                    bytes: payload.len(),
+                });
+                return;
             }
             write_https_plaintext_upstream(session, handle, &payload, events);
         } else {
-            match write_all_best_effort(&mut session.connection, &payload) {
+            match write_buffered_best_effort(
+                &mut session.connection,
+                &mut session.pending_upstream_bytes,
+                &payload,
+            ) {
                 Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
                 Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
             }
@@ -318,6 +341,8 @@ struct UpstreamSession<T> {
     http_buffer: Vec<u8>,
     guest_tls: Option<GuestTlsSession>,
     upstream_tls: Option<TlsUpstreamSession>,
+    upstream_tls_ready: bool,
+    pending_upstream_bytes: Vec<u8>,
     pending_upstream_plaintext: Vec<u8>,
 }
 
@@ -371,8 +396,16 @@ fn ensure_https_upstream_tls<T: Write>(
         }
     };
     if !client_hello.is_empty() {
-        match write_all_best_effort(&mut session.connection, &client_hello) {
-            Ok(bytes) => events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes }),
+        match write_buffered_best_effort(
+            &mut session.connection,
+            &mut session.pending_upstream_bytes,
+            &client_hello,
+        ) {
+            Ok(bytes) => {
+                if bytes > 0 {
+                    events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+                }
+            }
             Err(error) => {
                 events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
                 return false;
@@ -391,11 +424,7 @@ fn flush_pending_https_plaintext<T: Write>(
     if session.pending_upstream_plaintext.is_empty() {
         return;
     }
-    if session
-        .upstream_tls
-        .as_ref()
-        .is_none_or(TlsUpstreamSession::is_handshaking)
-    {
+    if !session.upstream_tls_ready {
         return;
     }
     let pending = std::mem::take(&mut session.pending_upstream_plaintext);
@@ -414,12 +443,6 @@ fn write_https_plaintext_upstream<T: Write>(
             .extend_from_slice(plaintext);
         return;
     };
-    if upstream_tls.is_handshaking() {
-        session
-            .pending_upstream_plaintext
-            .extend_from_slice(plaintext);
-        return;
-    }
     let tls_bytes = match upstream_tls.write_upstream_plaintext(plaintext) {
         Ok(tls_bytes) => tls_bytes,
         Err(error) => {
@@ -427,15 +450,83 @@ fn write_https_plaintext_upstream<T: Write>(
             return;
         }
     };
-    match write_all_best_effort(&mut session.connection, &tls_bytes) {
+    match write_buffered_best_effort(
+        &mut session.connection,
+        &mut session.pending_upstream_bytes,
+        &tls_bytes,
+    ) {
         Ok(bytes) => {
             events.push(TcpProxyEvent::GuestPayload {
                 handle,
                 bytes: plaintext.len(),
             });
-            events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+            if bytes > 0 {
+                events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+            }
         }
         Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+    }
+}
+
+fn drain_upstream_tls_writes<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    if session.decision.action != TcpAction::InterceptHttps {
+        return;
+    }
+    let Some(upstream_tls) = session.upstream_tls.as_mut() else {
+        return;
+    };
+    let tls_bytes = match upstream_tls.drain_tls_to_upstream() {
+        Ok(tls_bytes) => tls_bytes,
+        Err(error) => {
+            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            return;
+        }
+    };
+    if tls_bytes.is_empty() {
+        return;
+    }
+    match write_buffered_best_effort(
+        &mut session.connection,
+        &mut session.pending_upstream_bytes,
+        &tls_bytes,
+    ) {
+        Ok(bytes) if bytes > 0 => {
+            events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+        }
+        Ok(_) => {}
+        Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+    }
+}
+
+fn flush_pending_upstream_bytes<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    if session.pending_upstream_bytes.is_empty() {
+        return;
+    }
+    match write_buffered_best_effort(
+        &mut session.connection,
+        &mut session.pending_upstream_bytes,
+        &[],
+    ) {
+        Ok(bytes) if bytes > 0 && session.decision.action == TcpAction::InterceptHttps => {
+            events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+        }
+        Ok(_) => {}
+        Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+    }
+    if session.decision.action == TcpAction::InterceptHttps
+        && session.pending_upstream_bytes.is_empty()
+        && session.upstream_tls.is_some()
+    {
+        session.upstream_tls_ready = true;
+        flush_pending_https_plaintext(session, handle, events);
     }
 }
 
@@ -482,6 +573,10 @@ pub enum TcpProxyEvent {
         guest_frames: Vec<Vec<u8>>,
     },
     TlsUpstreamPayload {
+        handle: SocketHandle,
+        bytes: usize,
+    },
+    HttpsPlaintextBuffered {
         handle: SocketHandle,
         bytes: usize,
     },
@@ -544,14 +639,19 @@ fn destination_from_session(session: &GuestTcpSession) -> Option<TcpDestination>
     })
 }
 
-fn write_all_best_effort(connection: &mut impl Write, mut bytes: &[u8]) -> Result<usize, String> {
+fn write_buffered_best_effort(
+    connection: &mut impl Write,
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+) -> Result<usize, String> {
+    pending.extend_from_slice(bytes);
     let mut written = 0;
-    while !bytes.is_empty() {
-        match connection.write(bytes) {
+    while !pending.is_empty() {
+        match connection.write(pending) {
             Ok(0) => break,
             Ok(count) => {
                 written += count;
-                bytes = &bytes[count..];
+                pending.drain(..count);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => break,
             Err(error) => return Err(error.to_string()),

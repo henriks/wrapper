@@ -1,6 +1,6 @@
 # VMNet Runtime Validation
 
-Tickets: `wra-p7m4`, `wra-pah4`
+Tickets: `wra-p7m4`, `wra-pah4`, `wra-1yv3`
 
 Date: 2026-05-13
 
@@ -54,12 +54,14 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --no-net --host-payload-listener 12076:1076 --qemu-timeout-seconds 60
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --no-net --host-docker-listener 12375:1075 --qemu-timeout-seconds 75
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- launch --project /home/hsaksela/ai/wrapper --run-dir /home/hsaksela/ai/wrapper/.sandbox/docker-vm/run --artifact-manifest /home/hsaksela/ai/wrapper/docker/out/artifact-manifest.json --qemu /usr/bin/qemu-system-x86_64 --publish 12077:1076 --qemu-timeout-seconds 60
+sh -n docker/guest-init.sh
 ```
 
 Results:
 
-- `vm-frontend`: 64 library tests passed, 8 binary tests passed, 1 ignored.
+- `vm-frontend`: 65 library tests passed, 8 binary tests passed, 1 ignored.
 - `composed-fs`: 17 passed.
+- `docker/guest-init.sh` passed shell syntax validation.
 - QEMU command shape: `qemu-command-shape-ok`.
 - `agentvm-frontend prepare` wrote
   `.sandbox/docker-vm/run/composed-fs-manifest.json`,
@@ -148,8 +150,24 @@ escalation and passed.
 - HTTPS MITM primitives: configured CA loading, fail-closed missing-CA policy,
   per-host certificate generation, guest-side TLS termination, upstream TLS
   encryption/validation using native roots, and decrypted HTTP summary logging
-  are unit tested. A booted HTTPS guest smoke is still pending because the guest
-  image needs the MITM CA installed.
+  are unit tested.
+- HTTPS MITM boot validation has a partial result. The frontend now exposes the
+  configured `--tls-ca-cert` as `/run/agentvm-config/mitm-ca.crt`. Because the
+  guest rootfs is mounted read-only, guest-init cannot update
+  `/usr/local/share/ca-certificates` or `/etc/ssl`; it now assembles a combined
+  CA bundle at `/run/agentvm-ca-bundle.pem` and exports `SSL_CERT_FILE` and
+  `REQUESTS_CA_BUNDLE` before starting guest payload services. With the
+  pre-hook image, a guest Python TLS request to `104.20.23.154:443` with SNI
+  `example.com` reached the MITM and failed with `CERTIFICATE_VERIFY_FAILED`;
+  vmnet logged `action=InterceptHttps`, `tls_handshake_payload`,
+  `tls_upstream_payload`, and `tls_mitm_failed ... UnknownCA`. When the guest
+  script explicitly loaded `/run/agentvm-config/mitm-ca.crt`, guest TLS
+  completed and vmnet logged the decrypted summary
+  `http_request ... method=GET host=example.com path=/`. A subsequent rebuilt
+  image still used a write-to-rootfs CA hook and panicked during init with a
+  read-only filesystem error. Full success using guest default trust requires
+  rebuilding the appliance again from the updated `docker/guest-init.sh` and
+  `docker/build-appliance.sh`.
 - Runtime frame pump from QEMU stream framing to vmnet gateway to TCP proxy
   bridge and back to guest frames.
 - Delayed upstream responses via `pump_proxy_once()` without requiring another

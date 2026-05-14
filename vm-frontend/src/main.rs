@@ -6,7 +6,7 @@ use std::thread;
 use std::time::Duration;
 
 use agentvm_frontend::launch::{
-    prepare_frontend_launch, run_frontend_until_qemu_exit_with_policy_and_timeout,
+    prepare_frontend_launch_with_policy, run_frontend_until_qemu_exit_with_policy_and_timeout,
 };
 use agentvm_frontend::network_policy::{
     EgressAction, EgressReason, HostListener, HostListenerPurpose, VmnetPolicy,
@@ -33,9 +33,14 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             Ok(())
         }
         Some("prepare") => {
-            let (config, _) = frontend_config_from_args(&args[1..])?;
-            let prep = prepare_frontend_launch(&config, &workspace_mounts(config.project.clone()))
-                .map_err(|error| format!("prepare failed: {error}"))?;
+            let (config, policy_args) = frontend_config_from_args(&args[1..])?;
+            let policy = policy_from_args(config.network.clone(), policy_args);
+            let prep = prepare_frontend_launch_with_policy(
+                &config,
+                &workspace_mounts(config.project.clone()),
+                &policy,
+            )
+            .map_err(|error| format!("prepare failed: {error}"))?;
             println!("{}", prep.qemu_command.join(" "));
             Ok(())
         }

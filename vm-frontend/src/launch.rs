@@ -14,7 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::docker_proxy::{start_docker_unix_proxy, DockerUnixProxyConfig};
 use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
-use crate::runtime_manifest::{write_runtime_manifests, RuntimeManifestSummary, RuntimeMount};
+use crate::runtime_manifest::{
+    write_runtime_manifests, write_runtime_manifests_with_config_mounts, ManifestSourceClass,
+    RuntimeManifestSummary, RuntimeMount,
+};
 use crate::vmnet_runtime::serve_vmnet_gateway;
 use crate::{FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, VmShape};
 
@@ -117,6 +120,19 @@ pub fn prepare_frontend_launch(
     })
 }
 
+pub fn prepare_frontend_launch_with_policy(
+    config: &FrontendConfig,
+    mounts: &[RuntimeMount],
+    policy: &VmnetPolicy,
+) -> Result<LaunchPreparation, LaunchError> {
+    let config_mounts = policy_config_mounts(policy);
+    let manifests = write_runtime_manifests_with_config_mounts(config, mounts, &config_mounts)?;
+    Ok(LaunchPreparation {
+        manifests,
+        qemu_command: config.build_microvm_qemu_command(),
+    })
+}
+
 pub fn run_frontend_until_qemu_exit(
     config: FrontendConfig,
     mounts: Vec<RuntimeMount>,
@@ -141,7 +157,7 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
 ) -> Result<QemuExit, LaunchError> {
     validate_launch_inputs(&config)?;
     write_launch_state(&config, "starting", None, None, Some(&policy))?;
-    prepare_frontend_launch(&config, &mounts)?;
+    prepare_frontend_launch_with_policy(&config, &mounts, &policy)?;
     remove_stale_socket(&config.runtime.composed_fs_sock)?;
     remove_stale_socket(&config.runtime.config_fs_sock)?;
     remove_stale_socket(&config.runtime.vmnet_sock)?;
@@ -359,6 +375,21 @@ fn docker_listener_tcp_port(policy: &VmnetPolicy) -> Option<u16> {
         .iter()
         .find(|listener| listener.purpose == HostListenerPurpose::DockerApi)
         .map(|listener| listener.host_port)
+}
+
+fn policy_config_mounts(policy: &VmnetPolicy) -> Vec<RuntimeMount> {
+    let Some(ca_cert_path) = policy.tls_mitm.ca_cert_path.as_ref() else {
+        return Vec::new();
+    };
+    vec![RuntimeMount {
+        id: "m0002_mitm_ca_cert".to_string(),
+        host_path: ca_cert_path.clone(),
+        guest_path: PathBuf::from("/mitm-ca.crt"),
+        readonly: true,
+        source_class: ManifestSourceClass::SystemRo,
+        required: true,
+        bind: false,
+    }]
 }
 
 fn remove_stale_socket(path: &Path) -> io::Result<()> {
