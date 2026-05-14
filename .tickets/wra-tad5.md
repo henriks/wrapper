@@ -1,6 +1,6 @@
 ---
 id: wra-tad5
-status: open
+status: closed
 deps: [wra-k3di]
 links: []
 created: 2026-05-14T18:40:47Z
@@ -17,3 +17,9 @@ Create an exhaustive validation program for the VM frontend, covering both major
 
 An implementation plan exists as child tickets with correct dependencies. The eventual suite covers network, filesystem, wrapper/runtime, and live VM contracts. Each child ticket requires documenting outcomes, coverage gaps, and any new known limitations before close.
 
+
+## Notes
+
+**2026-05-14T20:05:30Z**
+
+Validation epic completed. Child tickets added the validation matrix, shared harnesses, fast packet/policy/manifest/path tests, TCP/HTTP/HTTPS proxy integration coverage, composed-fs operation model tests, DNS/host-ingress/published-port coverage, virtiofs lifecycle/concurrency coverage, wrapper/runtime contract tests, live KVM self-test expansion, stress/property suites, observability/artifact assertions, and workflow documentation. Verified local fast and stress tiers through vm-frontend/validate.sh fast and vm-frontend/validate.sh stress. User reported the expanded live KVM self-test appeared to pass. Dependency cycle check passed with tk dep cycle.

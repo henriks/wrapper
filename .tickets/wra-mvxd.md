@@ -1,6 +1,6 @@
 ---
 id: wra-mvxd
-status: in_progress
+status: closed
 deps: [wra-y325, wra-s8nn]
 links: []
 created: 2026-05-14T18:43:15Z

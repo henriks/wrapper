@@ -1,6 +1,6 @@
 ---
 id: wra-k3di
-status: open
+status: closed
 deps: [wra-9udq, wra-96uv, wra-mvxd]
 links: []
 created: 2026-05-14T18:43:26Z
@@ -18,3 +18,9 @@ Document how to run each validation tier and wire practical commands into the de
 
 README/operations or validation docs include exact commands, expected runtimes, prerequisites, artifact paths, and triage guidance. The dependency graph has no cycles. The epic can be closed only after child tickets document their outcomes and remaining gaps.
 
+
+## Notes
+
+**2026-05-14T20:05:10Z**
+
+Added vm-frontend/validate.sh with fast, stress, all-local, and live tiers. Added vm-frontend/validation-workflow.md documenting exact commands, prerequisites, expected use, seeds, artifact paths, CI policy, and ticket outcome requirements. Linked it from README and validation-matrix. Verified vm-frontend/validate.sh fast and vm-frontend/validate.sh stress both pass locally; live remains host/KVM-only and was already reported passing under wra-9udq.

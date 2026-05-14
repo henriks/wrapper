@@ -57,7 +57,8 @@ Real VM validation status and the KVM-host smoke procedure are documented in
 `vmnet-runtime-validation.md`.
 
 The broader network and filesystem validation taxonomy is documented in
-`validation-matrix.md`.
+`validation-matrix.md`. Exact tier commands and triage guidance are in
+`validation-workflow.md`; the shortcut runner is `vm-frontend/validate.sh`.
 
 Run the KVM-required VM-only self-test:
 

@@ -45,6 +45,11 @@ The existing result documents are `vm-frontend/vmnet-runtime-validation.md`,
 Future work may append to those or create focused result documents when a test
 tier becomes large enough to deserve its own file.
 
+Exact day-to-day commands are maintained in `validation-workflow.md`. Use
+`vm-frontend/validate.sh fast` for the default offline gate,
+`vm-frontend/validate.sh stress` for ignored property/stress tests, and
+`vm-frontend/validate.sh live` for the KVM/QEMU self-test.
+
 ## Network Matrix
 
 | Area | Required coverage | Primary tier | Follow-up ticket |
