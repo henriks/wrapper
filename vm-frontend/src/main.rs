@@ -4,6 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
@@ -26,6 +28,9 @@ use agentvm_frontend::runtime_manifest::{
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
 use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
 
 fn main() {
     if let Err(error) = run_cli(env::args().collect()) {
@@ -216,13 +221,23 @@ impl Drop for ProjectLock {
 }
 
 fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
-    let wrapper = parse_wrapper_args(&program, &args)?;
+    let mut wrapper = parse_wrapper_args(&program, &args)?;
     if wrapper.help {
         return Ok(());
     }
     if wrapper.reset {
         reset_project(&wrapper.project)?;
         return Ok(());
+    }
+    if wrapper.tls_bootstrap {
+        let ca = ensure_wrapper_mitm_ca(&wrapper.project)?;
+        wrapper.launch_args.extend([
+            "--tls-ca-cert".to_string(),
+            ca.cert.display().to_string(),
+            "--tls-ca-key".to_string(),
+            ca.key.display().to_string(),
+            "--tls-generate-per-host-certs".to_string(),
+        ]);
     }
     let mut launch_args = vec!["launch".to_string()];
     launch_args.extend(wrapper.into_launch_args());
@@ -233,8 +248,15 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
 struct WrapperArgs {
     project: PathBuf,
     launch_args: Vec<String>,
+    tls_bootstrap: bool,
     reset: bool,
     help: bool,
+}
+
+#[derive(Debug)]
+struct MitmCaPaths {
+    cert: PathBuf,
+    key: PathBuf,
 }
 
 impl WrapperArgs {
@@ -249,6 +271,8 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
     let mut tool = wrapper_tool_from_program(program);
     let mut reset = false;
     let mut help = false;
+    let mut no_net = false;
+    let mut tls_bootstrap = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -268,7 +292,11 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
                 tool = Some(selected.clone());
                 launch_args.extend(["--tool".to_string(), selected]);
             }
-            "--no-net" | "--gh" => launch_args.push(args[index].clone()),
+            "--no-net" => {
+                no_net = true;
+                launch_args.push(args[index].clone());
+            }
+            "--gh" => launch_args.push(args[index].clone()),
             "--aws" | "--ro" | "--rw" | "--qemu" | "--artifact-manifest" => {
                 let flag = args[index].clone();
                 let val = value(args, &mut index, &flag)?;
@@ -307,6 +335,7 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
         return Ok(WrapperArgs {
             project,
             launch_args,
+            tls_bootstrap,
             reset,
             help,
         });
@@ -320,12 +349,89 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
         })?;
         launch_args.extend(["--tool".to_string(), tool]);
     }
+    if !no_net
+        && !launch_args
+            .iter()
+            .any(|arg| arg == "--allow-public-internet")
+    {
+        launch_args.push("--allow-public-internet".to_string());
+        tls_bootstrap = true;
+    }
     Ok(WrapperArgs {
         project,
         launch_args,
+        tls_bootstrap,
         reset,
         help,
     })
+}
+
+fn ensure_wrapper_mitm_ca(project: &PathBuf) -> Result<MitmCaPaths, String> {
+    let dir = project.join(".sandbox/docker-vm/ca");
+    let cert = dir.join("mitm-ca.crt");
+    let key = dir.join("mitm-ca.key");
+    if cert.exists() && key.exists() {
+        return Ok(MitmCaPaths { cert, key });
+    }
+
+    fs::create_dir_all(&dir).map_err(|error| {
+        format!(
+            "failed to create wrapper MITM CA directory {}: {error}",
+            dir.display()
+        )
+    })?;
+
+    let key_pair =
+        KeyPair::generate().map_err(|error| format!("failed to generate MITM CA key: {error}"))?;
+    let mut params = CertificateParams::new(Vec::<String>::new())
+        .map_err(|error| format!("failed to create MITM CA params: {error}"))?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "agentvm project MITM CA");
+    params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(KeyUsagePurpose::CrlSign);
+
+    let ca_cert = params
+        .self_signed(&key_pair)
+        .map_err(|error| format!("failed to generate MITM CA certificate: {error}"))?;
+    fs::write(&cert, ca_cert.pem()).map_err(|error| {
+        format!(
+            "failed to write wrapper MITM CA certificate {}: {error}",
+            cert.display()
+        )
+    })?;
+    write_private_key(&key, &key_pair.serialize_pem())?;
+    Ok(MitmCaPaths { cert, key })
+}
+
+fn write_private_key(path: &PathBuf, pem: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|error| format!("failed to write private key {}: {error}", path.display()))?;
+        file.write_all(pem.as_bytes())
+            .map_err(|error| format!("failed to write private key {}: {error}", path.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
+            format!(
+                "failed to restrict private key permissions {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, pem)
+            .map_err(|error| format!("failed to write private key {}: {error}", path.display()))?;
+    }
+    Ok(())
 }
 
 fn wrapper_tool_from_program(program: &str) -> Option<String> {
@@ -923,6 +1029,13 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         index += 1;
     }
 
+    if !project.is_absolute() {
+        project = absolute_cli_path(&project.display().to_string())?;
+    }
+    if !run_dir.is_absolute() {
+        run_dir = project.join(&run_dir);
+    }
+
     let mut config =
         FrontendConfig::from_artifact_manifest_file(project, run_dir, qemu, &artifact_manifest)
             .map_err(|error| format!("failed to load frontend config: {error}"))?;
@@ -1008,12 +1121,30 @@ fn guest_payload_env(
     config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<BTreeMap<String, String>, String> {
+    let mut env_vars = BTreeMap::new();
+    if policy.tls_ca_cert.is_some() {
+        env_vars.insert(
+            "SSL_CERT_FILE".to_string(),
+            "/run/agentvm-ca-bundle.pem".to_string(),
+        );
+        env_vars.insert(
+            "REQUESTS_CA_BUNDLE".to_string(),
+            "/run/agentvm-ca-bundle.pem".to_string(),
+        );
+        env_vars.insert(
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            "/run/agentvm-ca-bundle.pem".to_string(),
+        );
+        env_vars.insert(
+            "NPM_CONFIG_CAFILE".to_string(),
+            "/run/agentvm-ca-bundle.pem".to_string(),
+        );
+    }
     if policy.tool.is_none() && !policy.gh && policy.aws_profile.is_none() {
-        return Ok(BTreeMap::new());
+        return Ok(env_vars);
     }
     let user = env::var("USER").unwrap_or_else(|_| "sandbox".to_string());
     let guest_home = config.project.join(".sandbox/home").display().to_string();
-    let mut env_vars = BTreeMap::new();
     env_vars.insert("HOME".to_string(), guest_home.clone());
     env_vars.insert("USER".to_string(), user.clone());
     env_vars.insert("LOGNAME".to_string(), user);
@@ -1673,6 +1804,47 @@ mod tests {
     }
 
     #[test]
+    fn payload_env_sets_guest_ca_bundle_for_node_and_npm() {
+        let root = frontend_test_root();
+        let (config, policy) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/run").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--tool".to_string(),
+            "codex".to_string(),
+            "--tls-ca-cert".to_string(),
+            root.join("repo/.sandbox/docker-vm/ca/mitm-ca.crt")
+                .display()
+                .to_string(),
+        ])
+        .expect("config");
+
+        let env = guest_payload_env(&config, &policy).expect("env");
+
+        assert_eq!(
+            env.get("SSL_CERT_FILE").map(String::as_str),
+            Some("/run/agentvm-ca-bundle.pem")
+        );
+        assert_eq!(
+            env.get("REQUESTS_CA_BUNDLE").map(String::as_str),
+            Some("/run/agentvm-ca-bundle.pem")
+        );
+        assert_eq!(
+            env.get("NODE_EXTRA_CA_CERTS").map(String::as_str),
+            Some("/run/agentvm-ca-bundle.pem")
+        );
+        assert_eq!(
+            env.get("NPM_CONFIG_CAFILE").map(String::as_str),
+            Some("/run/agentvm-ca-bundle.pem")
+        );
+    }
+
+    #[test]
     fn wrapper_args_translate_to_launch_args() {
         let args = parse_wrapper_args(
             "codex-wrap",
@@ -1693,6 +1865,10 @@ mod tests {
         assert!(args.launch_args.contains(&"--tool".to_string()));
         assert!(args.launch_args.contains(&"codex".to_string()));
         assert!(args.launch_args.contains(&"--no-net".to_string()));
+        assert!(!args
+            .launch_args
+            .contains(&"--allow-public-internet".to_string()));
+        assert!(!args.tls_bootstrap);
         assert!(args.launch_args.contains(&"--publish".to_string()));
         assert!(args.launch_args.contains(&"18080:8080".to_string()));
         assert_eq!(
@@ -1703,6 +1879,58 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["--model".to_string(), "gpt-5".to_string()]
         );
+    }
+
+    #[test]
+    fn wrapper_defaults_to_public_egress_for_tool_install() {
+        let args = parse_wrapper_args("codex-wrap", &[]).expect("wrapper args");
+
+        assert!(args
+            .launch_args
+            .contains(&"--allow-public-internet".to_string()));
+        assert!(args.tls_bootstrap);
+    }
+
+    #[test]
+    fn wrapper_mitm_ca_is_generated_and_loadable() {
+        let root = frontend_test_root();
+        let paths = ensure_wrapper_mitm_ca(&root.join("repo")).expect("ca");
+
+        assert!(paths.cert.is_file());
+        assert!(paths.key.is_file());
+        agentvm_frontend::tls_mitm::TlsMitmAuthority::from_files(&paths.cert, &paths.key)
+            .expect("load ca");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&paths.key)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn frontend_defaults_runtime_under_absolute_project() {
+        let root = frontend_test_root();
+        let (config, _) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--tool".to_string(),
+            "codex".to_string(),
+        ])
+        .expect("config");
+
+        assert_eq!(
+            config.runtime.composed_bind_manifest,
+            root.join("repo/.sandbox/docker-vm/run/guest-config/composed-binds.json")
+        );
+        assert!(config.runtime.composed_bind_manifest.is_absolute());
     }
 
     #[test]
