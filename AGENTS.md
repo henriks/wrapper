@@ -11,6 +11,8 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 
 Only care about compatability for the config file. Never keep things like command line argument "for compatability", or do excessively defensive coding.
 
+The `.sandbox/config.json` format is documented in `vm-frontend/config-json.md`. Whenever changing config parsing, serialization, defaults, migration behavior, or any field semantics, update that document and the relevant tests in the same change.
+
 # More code is a liability
 
 Always consider carefully whether a problem can be solved by removing and combining code, and introducing abstractions. We can't keep on tacking on more code ad infinitum.

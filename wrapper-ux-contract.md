@@ -37,8 +37,9 @@ All durable project state lives under `.sandbox/`.
 
 `.sandbox/config.json` is the durable source of truth for configurable sandbox
 behavior: default command, setup recipe, tool state, network mode, network
-allowlists, auth sharing, extra shares, and published guest ports. Normal launch
-flags are one-run overrides and do not persist.
+allowlists, auth sharing, extra shares, and published guest ports. Its full file
+format is documented in `vm-frontend/config-json.md`. Normal launch flags are
+one-run overrides and do not persist.
 
 The TUI may write `config.json` only after an explicit user action such as
 accepting setup or saving edits. A configured project must not ask setup
@@ -124,9 +125,12 @@ Configured allowlists live in `config.json`. `--no-net`, `--allow-domain`, and
 Auth sharing is explicit. GitHub and AWS support are named config fields and
 one-run flags, not arbitrary host environment passthrough.
 
-Extra shares are structured records with host path, guest path, access mode, and
-whether the source is required. CLI `--ro PATH` and `--rw PATH` expose the path
-at the same absolute guest path for one launch.
+Extra shares are structured records with host path, guest path, access mode,
+whether the source is required, and optional child `shadows`. A shadow names a
+relative path inside a read-write share that should be backed by project-local
+`.sandbox/share-shadows/` state instead of the corresponding host child path.
+CLI `--ro PATH` and `--rw PATH` expose the path at the same absolute guest path
+for one launch.
 
 The default guest home is project-local `.sandbox/home/` mounted at the host
 user's natural home path inside the guest. Tool state is shared deliberately by

@@ -2,7 +2,7 @@
 id: wra-brsl
 status: closed
 deps: [wra-jek5]
-links: []
+links: [wra-u05c, wra-wrv7]
 created: 2026-05-14T21:45:41Z
 type: bug
 priority: 0

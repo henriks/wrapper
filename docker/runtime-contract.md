@@ -147,7 +147,8 @@ Rules:
   the guest at `/var/lib/docker`.
 - `.sandbox/config.json` is the durable project sandbox configuration for setup
   recipe, default command, network mode/allowlists, auth sharing, extra shares,
-  and published ports.
+  and published ports. Its schema and compatibility rules are documented in
+  `vm-frontend/config-json.md`.
 - `.sandbox/docker-vm/run/` is per-launch runtime and diagnostic state.
 - `--reset` removes the entire `.sandbox/` tree, including guest home, Docker
   data, config, and all runtime logs, unless an active lock is held.
@@ -174,6 +175,10 @@ The VM-only contract assumes a deliberately small set of host inputs:
     absolute path
   - `--rw PATH` exposes a host path read-write inside the guest at the same
     absolute path
+  - configured read-write shares may shadow selected guest-relative child paths
+    with project-local `.sandbox/share-shadows/` backing directories; the more
+    specific child mount wins while the parent host share remains visible
+    elsewhere
   - these are supported because arbitrary path mounts are a real requirement,
     but they should be implemented as a small explicit guest-share mechanism
     rather than as a full host-session recreation

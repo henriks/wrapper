@@ -110,9 +110,11 @@ diagnostic logs.
 `--reset` removes `.sandbox/` unless the project VM lock is held.
 `.sandbox/config.json` records project-level wrapper setup: setup recipe,
 default command, tool state, network mode, allowed hosts/domains/IPs, auth
-sharing, extra directory shares, and published ports. A configured project is
-not prompted again on subsequent wrapper starts. CLI switches are one-run
-overrides and do not persist unless a setup/config-editing flow writes them.
+sharing, extra directory shares, and published ports. The complete schema and
+compatibility rules are documented in `vm-frontend/config-json.md`. A configured
+project is not prompted again on subsequent wrapper starts. CLI switches are
+one-run overrides and do not persist unless a setup/config-editing flow writes
+them.
 
 ## Guest Filesystem Contract
 
@@ -134,6 +136,11 @@ Required/default guest shares:
 - `--gh` shares `~/.config/gh` read-only and forwards `GH_TOKEN` when available.
 - `--ro PATH` exposes a required read-only host path at the same guest path.
 - `--rw PATH` exposes a required read-write host path at the same guest path.
+- Configured read-write shares may declare `shadows`: guest-relative child
+  paths that are backed by project-local `.sandbox/share-shadows/` state
+  instead of the corresponding child path under the host share. This is a
+  generic mount composition feature for volatile subtrees; it is not tied to a
+  specific tool.
 
 The VM-only design does not mount broad host system directories into the guest.
 The guest root filesystem is the appliance image.

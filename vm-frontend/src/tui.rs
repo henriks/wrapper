@@ -262,6 +262,7 @@ impl ConfigEditor {
                 guest_path: None,
                 access: ConfigShareAccess::Rw,
                 required: false,
+                shadows: Vec::new(),
             });
         }
     }

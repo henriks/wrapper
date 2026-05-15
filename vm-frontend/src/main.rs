@@ -6,7 +6,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::thread;
@@ -307,7 +307,7 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
         if selection.enable_codex {
             let config = WrapperSandboxConfig::codex_default();
             write_wrapper_sandbox_config(&project, &config)?;
-            apply_configured_launch_defaults(&mut launch_args, &config, false, false)?;
+            apply_configured_launch_defaults(&mut launch_args, &config, &project, false, false)?;
             apply_configured_default_command(&mut launch_args, &config);
         } else {
             return Err("startup dialog did not select a payload".to_string());
@@ -536,10 +536,44 @@ struct ConfigShare {
     access: ConfigShareAccess,
     #[serde(default = "default_required_share")]
     required: bool,
+    #[serde(default)]
+    shadows: Vec<ConfigShareShadow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigShareShadow {
+    path: String,
 }
 
 fn default_required_share() -> bool {
     true
+}
+
+fn validate_share_shadow_path(path: &str) -> Result<PathBuf, String> {
+    if path.trim().is_empty() {
+        return Err("share shadow path must not be empty".to_string());
+    }
+    if path.contains('=') {
+        return Err("share shadow path must not contain '='".to_string());
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err("share shadow path must be relative to the parent share".to_string());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err("share shadow path must stay under the parent share".to_string());
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err("share shadow path must not be empty".to_string());
+    }
+    Ok(normalized)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -616,6 +650,19 @@ impl WrapperSandboxConfig {
             }
             if share.guest_path.as_deref().is_some_and(str::is_empty) {
                 return Err("sandbox config share guest_path must not be empty".to_string());
+            }
+            if !share.shadows.is_empty() && share.access != ConfigShareAccess::Rw {
+                return Err("sandbox config share shadows require rw access".to_string());
+            }
+            let mut shadow_paths = BTreeSet::new();
+            for shadow in &share.shadows {
+                let path = validate_share_shadow_path(&shadow.path)?;
+                if !shadow_paths.insert(path) {
+                    return Err(format!(
+                        "duplicate sandbox config share shadow path: {}",
+                        shadow.path
+                    ));
+                }
             }
         }
         Ok(())
@@ -895,7 +942,13 @@ fn parse_wrapper_args_with_terminal(
         read_wrapper_sandbox_config(&project)?
     };
     if let Some(config) = sandbox_config.as_ref() {
-        apply_configured_launch_defaults(&mut launch_args, config, saw_network_override, no_net)?;
+        apply_configured_launch_defaults(
+            &mut launch_args,
+            config,
+            &project,
+            saw_network_override,
+            no_net,
+        )?;
     }
     let mut tool_selected = sandbox_config.is_some();
     if ui_mode == WrapperUiMode::Plain && command_override.is_none() && sandbox_config.is_none() {
@@ -1033,6 +1086,7 @@ fn append_many(matches: &ArgMatches, id: &str) -> Vec<String> {
 fn apply_configured_launch_defaults(
     launch_args: &mut Vec<String>,
     config: &WrapperSandboxConfig,
+    project: &Path,
     saw_network_override: bool,
     cli_no_net: bool,
 ) -> Result<(), String> {
@@ -1073,7 +1127,7 @@ fn apply_configured_launch_defaults(
             launch_args.extend(["--aws".to_string(), profile.clone()]);
         }
     }
-    for share in &config.shares {
+    for (share_index, share) in config.shares.iter().enumerate() {
         let host = absolute_cli_path(&share.host_path)?;
         let guest = share
             .guest_path
@@ -1094,6 +1148,19 @@ fn apply_configured_launch_defaults(
             flag.to_string(),
             format!("{}={}={required}", host.display(), guest.display()),
         ]);
+        for shadow in &share.shadows {
+            let relative_path = validate_share_shadow_path(&shadow.path)?;
+            let backing = config_share_shadow_backing_path(project, share_index, &relative_path);
+            launch_args.extend([
+                "--share-shadow".to_string(),
+                format!(
+                    "{}={}={}",
+                    guest.display(),
+                    relative_path.display(),
+                    backing.display()
+                ),
+            ]);
+        }
     }
     let config_no_net = !saw_network_override && config.network.mode == ConfigNetworkMode::None;
     if !cli_no_net && !config_no_net {
@@ -1105,6 +1172,17 @@ fn apply_configured_launch_defaults(
         }
     }
     Ok(())
+}
+
+fn config_share_shadow_backing_path(
+    project: &Path,
+    share_index: usize,
+    relative_path: &Path,
+) -> PathBuf {
+    project
+        .join(".sandbox/share-shadows")
+        .join(format!("share-{share_index:04}"))
+        .join(relative_path)
 }
 
 fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
@@ -1534,6 +1612,7 @@ struct PolicyArgs {
     extra_ro: Vec<PathBuf>,
     extra_rw: Vec<PathBuf>,
     extra_shares: Vec<GuestPathShare>,
+    extra_share_shadows: Vec<GuestPathShareShadow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1552,6 +1631,13 @@ struct GuestPathShare {
     guest_path: PathBuf,
     readonly: bool,
     required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestPathShareShadow {
+    parent_guest_path: PathBuf,
+    relative_path: PathBuf,
+    backing_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2347,6 +2433,11 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
             .extra_shares
             .push(parse_guest_path_share(&share, false)?);
     }
+    for shadow in append_many(&matches, "share_shadow") {
+        policy
+            .extra_share_shadows
+            .push(parse_guest_path_share_shadow(&shadow)?);
+    }
     let guest_http_smoke_url = matches.get_one::<String>("guest_http_smoke_url").cloned();
     policy.allow_ips = append_many(&matches, "allow_ip");
     policy.allow_domains = append_many(&matches, "allow_domain");
@@ -2486,6 +2577,13 @@ fn frontend_clap_command() -> ClapCommand {
             Arg::new("share_rw")
                 .long("share-rw")
                 .value_name("HOST=GUEST[=required|optional]")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("share_shadow")
+                .long("share-shadow")
+                .value_name("PARENT_GUEST=RELATIVE_PATH=BACKING_PATH")
+                .hide(true)
                 .action(ArgAction::Append),
         )
         .arg(
@@ -2637,7 +2735,47 @@ fn runtime_mounts(
         });
         next_id += 1;
     }
+    for shadow in &policy.extra_share_shadows {
+        let parent = policy
+            .extra_shares
+            .iter()
+            .find(|share| !share.readonly && share.guest_path == shadow.parent_guest_path)
+            .ok_or_else(|| {
+                format!(
+                    "share shadow parent must match a configured rw share: {}",
+                    shadow.parent_guest_path.display()
+                )
+            })?;
+        if !shadow_backing_is_project_local(config, &shadow.backing_path) {
+            return Err(format!(
+                "share shadow backing path must stay under project .sandbox: {}",
+                shadow.backing_path.display()
+            ));
+        }
+        let guest_path = parent.guest_path.join(&shadow.relative_path);
+        std::fs::create_dir_all(&shadow.backing_path).map_err(|error| {
+            format!(
+                "failed to create share shadow backing dir {}: {error}",
+                shadow.backing_path.display()
+            )
+        })?;
+        mounts.push(RuntimeMount {
+            id: format!("m{next_id:04}_share_shadow"),
+            host_path: shadow.backing_path.clone(),
+            guest_path,
+            readonly: false,
+            source_class: agentvm_frontend::runtime_manifest::ManifestSourceClass::UserRw,
+            required: true,
+            bind: true,
+        });
+        next_id += 1;
+    }
     Ok(mounts)
+}
+
+fn shadow_backing_is_project_local(config: &FrontendConfig, backing_path: &Path) -> bool {
+    let sandbox = config.project.join(".sandbox");
+    backing_path == sandbox || backing_path.starts_with(&sandbox)
 }
 
 fn guest_payload_env(
@@ -2924,6 +3062,31 @@ fn parse_guest_path_share(value: &str, readonly: bool) -> Result<GuestPathShare,
         guest_path: absolute_cli_path(guest)?,
         readonly,
         required,
+    })
+}
+
+fn parse_guest_path_share_shadow(value: &str) -> Result<GuestPathShareShadow, String> {
+    let mut parts = value.splitn(3, '=');
+    let parent_guest = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| "share shadow parent guest path must not be empty".to_string())?;
+    let relative_path = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| {
+            "share shadow must be PARENT_GUEST=RELATIVE_PATH=BACKING_PATH".to_string()
+        })?;
+    let backing_path = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| {
+            "share shadow must be PARENT_GUEST=RELATIVE_PATH=BACKING_PATH".to_string()
+        })?;
+    Ok(GuestPathShareShadow {
+        parent_guest_path: absolute_cli_path(parent_guest)?,
+        relative_path: validate_share_shadow_path(relative_path)?,
+        backing_path: absolute_cli_path(backing_path)?,
     })
 }
 
@@ -3881,6 +4044,7 @@ mod tests {
                     guest_path: Some("/opt/share".to_string()),
                     access: ConfigShareAccess::Ro,
                     required: false,
+                    shadows: Vec::new(),
                 }],
                 published_ports: vec![ConfigPort {
                     host: 18080,
@@ -3930,6 +4094,118 @@ mod tests {
             .launch_args
             .windows(2)
             .any(|window| window[0] == "--publish" && window[1] == "18080:8080"));
+    }
+
+    #[test]
+    fn config_share_shadow_generates_nested_project_local_mount() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let share = root.join("host-codex");
+        std::fs::create_dir_all(&share).expect("share");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig {
+                schema_version: 2,
+                setup_tool: None,
+                default_command: ConfigCommand::new("bash"),
+                tool_state: ConfigToolState::default(),
+                network: ConfigNetwork::default(),
+                auth: ConfigAuth::default(),
+                shares: vec![ConfigShare {
+                    host_path: share.display().to_string(),
+                    guest_path: Some("/home/test/.codex".to_string()),
+                    access: ConfigShareAccess::Rw,
+                    required: true,
+                    shadows: vec![ConfigShareShadow {
+                        path: "tmp/arg0".to_string(),
+                    }],
+                }],
+                published_ports: Vec::new(),
+            },
+        )
+        .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--artifact-manifest".to_string(),
+                root.join("docker/out/artifact-manifest.json")
+                    .display()
+                    .to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-rw" && window[1].ends_with("=/home/test/.codex=required")
+        }));
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-shadow"
+                && window[1].contains("/home/test/.codex=tmp/arg0=")
+                && window[1].contains(".sandbox/share-shadows/share-0000/tmp/arg0")
+        }));
+
+        let (frontend, policy) = frontend_config_from_args(&args.launch_args).expect("frontend");
+        let mounts = runtime_mounts(&frontend, &policy).expect("mounts");
+        let shadow_backing = project.join(".sandbox/share-shadows/share-0000/tmp/arg0");
+        assert!(shadow_backing.is_dir());
+        let parent_index = mounts
+            .iter()
+            .position(|mount| mount.guest_path == PathBuf::from("/home/test/.codex"))
+            .expect("parent mount");
+        let shadow_index = mounts
+            .iter()
+            .position(|mount| mount.guest_path == PathBuf::from("/home/test/.codex/tmp/arg0"))
+            .expect("shadow mount");
+        assert!(parent_index < shadow_index);
+        assert_eq!(mounts[shadow_index].host_path, shadow_backing);
+        assert!(!mounts[shadow_index].readonly);
+    }
+
+    #[test]
+    fn config_share_shadow_validation_rejects_readonly_and_escaping_paths() {
+        let readonly_shadow = WrapperSandboxConfig {
+            schema_version: 2,
+            setup_tool: None,
+            default_command: ConfigCommand::new("bash"),
+            tool_state: ConfigToolState::default(),
+            network: ConfigNetwork::default(),
+            auth: ConfigAuth::default(),
+            shares: vec![ConfigShare {
+                host_path: "/tmp/host".to_string(),
+                guest_path: Some("/tmp/guest".to_string()),
+                access: ConfigShareAccess::Ro,
+                required: true,
+                shadows: vec![ConfigShareShadow {
+                    path: "tmp".to_string(),
+                }],
+            }],
+            published_ports: Vec::new(),
+        };
+        assert_eq!(
+            readonly_shadow.validate().expect_err("readonly shadow"),
+            "sandbox config share shadows require rw access"
+        );
+
+        let escaping_shadow = WrapperSandboxConfig {
+            shares: vec![ConfigShare {
+                access: ConfigShareAccess::Rw,
+                shadows: vec![ConfigShareShadow {
+                    path: "../tmp".to_string(),
+                }],
+                ..readonly_shadow.shares[0].clone()
+            }],
+            ..readonly_shadow
+        };
+        assert_eq!(
+            escaping_shadow.validate().expect_err("escaping shadow"),
+            "share shadow path must stay under the parent share"
+        );
     }
 
     #[test]
