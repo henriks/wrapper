@@ -3,13 +3,15 @@ use std::ffi::{CStr, CString};
 use std::fs::{self, File};
 use std::io;
 use std::mem;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use clap::Parser;
+use rustix::fs::{Mode, OFlags, ResolveFlags};
 use serde::Deserialize;
 use vhost::vhost_user::Listener;
 use vhost_user_backend::VhostUserDaemon;
@@ -1549,48 +1551,20 @@ impl DirectoryIterator for VecDirIter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Parser)]
+#[command(
+    name = "agentvm-composed-fs",
+    about = "Serve an AgentVM composed filesystem over vhost-user"
+)]
 struct Args {
+    #[arg(long, value_name = "PATH")]
     manifest: PathBuf,
+    #[arg(long, value_name = "PATH")]
     socket_path: PathBuf,
+    #[arg(long, default_value = DEFAULT_TAG)]
     tag: String,
+    #[arg(long, default_value_t = DEFAULT_THREAD_POOL_SIZE)]
     thread_pool_size: usize,
-}
-
-impl Args {
-    fn parse() -> io::Result<Self> {
-        let mut manifest = None;
-        let mut socket_path = None;
-        let mut tag = String::from(DEFAULT_TAG);
-        let mut thread_pool_size = DEFAULT_THREAD_POOL_SIZE;
-
-        let mut args = std::env::args().skip(1);
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--manifest" => manifest = Some(next_arg(&mut args, "--manifest")?.into()),
-                "--socket-path" => socket_path = Some(next_arg(&mut args, "--socket-path")?.into()),
-                "--tag" => tag = next_arg(&mut args, "--tag")?,
-                "--thread-pool-size" => {
-                    let value = next_arg(&mut args, "--thread-pool-size")?;
-                    thread_pool_size = value.parse::<usize>().map_err(|error| {
-                        invalid_input(format!("invalid --thread-pool-size {value:?}: {error}"))
-                    })?;
-                }
-                "--help" | "-h" => {
-                    print_usage();
-                    std::process::exit(0);
-                }
-                _ => return Err(invalid_input(format!("unknown argument {arg:?}"))),
-            }
-        }
-
-        Ok(Self {
-            manifest: manifest.ok_or_else(|| invalid_input("--manifest is required"))?,
-            socket_path: socket_path.ok_or_else(|| invalid_input("--socket-path is required"))?,
-            tag,
-            thread_pool_size,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1613,7 +1587,7 @@ impl ServeConfig {
 }
 
 pub fn run_cli() -> io::Result<()> {
-    let args = Args::parse()?;
+    let args = Args::parse();
     serve_vhost_user_fs(ServeConfig {
         manifest: args.manifest,
         socket_path: args.socket_path,
@@ -1703,17 +1677,6 @@ pub fn serve_vhost_user_fs(config: ServeConfig) -> io::Result<()> {
         .wait()
         .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
     Ok(())
-}
-
-fn next_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> io::Result<String> {
-    args.next()
-        .ok_or_else(|| invalid_input(format!("{flag} requires a value")))
-}
-
-fn print_usage() {
-    println!(
-        "usage: agentvm-composed-fs --manifest PATH --socket-path PATH [--tag TAG] [--thread-pool-size N]"
-    );
 }
 
 fn parse_octal_mode(value: &str) -> io::Result<u32> {
@@ -1955,36 +1918,26 @@ fn open_beneath_with_mode(
     } else {
         CString::new(relative_path.as_os_str().as_bytes())?
     };
-    let mut how = unsafe { mem::zeroed::<libc::open_how>() };
-    how.flags = (flags | libc::O_CLOEXEC) as u64;
-    how.mode = mode as u64;
-    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root_fd,
-            path.as_ptr(),
-            &how,
-            mem::size_of::<libc::open_how>(),
-        )
-    } as RawFd;
-    if fd >= 0 {
-        return Ok(unsafe { File::from_raw_fd(fd) });
-    }
-
-    let error = io::Error::last_os_error();
-    if !matches!(
-        error.raw_os_error(),
-        Some(libc::ENOSYS) | Some(libc::EINVAL)
+    let root = unsafe { BorrowedFd::borrow_raw(root_fd) };
+    let open_flags = OFlags::from_bits_retain((flags | libc::O_CLOEXEC) as _);
+    let create_mode = Mode::from_bits_retain(mode);
+    match rustix::fs::openat2(
+        root,
+        path.as_c_str(),
+        open_flags,
+        create_mode,
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS,
     ) {
-        return Err(error);
+        Ok(fd) => return Ok(File::from(fd)),
+        Err(error) if !matches!(error.raw_os_error(), libc::ENOSYS | libc::EINVAL) => {
+            return Err(io::Error::from_raw_os_error(error.raw_os_error()));
+        }
+        Err(_) => {}
     }
 
-    let fd = unsafe { libc::openat(root_fd, path.as_ptr(), flags | libc::O_CLOEXEC, mode) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+    rustix::fs::openat(root, path.as_c_str(), open_flags, create_mode)
+        .map(File::from)
+        .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))
 }
 
 fn open_flags_want_write(flags: u32) -> bool {
@@ -2427,33 +2380,24 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::FileExt;
     use std::os::unix::fs::PermissionsExt;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use tempfile::TempDir;
     use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 
-    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
-
     struct TestDir {
+        _dir: TempDir,
         path: PathBuf,
     }
 
     impl TestDir {
         fn new(name: &str) -> Self {
-            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "agentvm-composed-fs-{name}-{}-{}-{counter}",
-                std::process::id(),
-                now_secs()
-            ));
-            fs::create_dir_all(&path).expect("create test dir");
-            Self { path }
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("agentvm-composed-fs-{name}-"))
+                .tempdir()
+                .expect("create test dir");
+            let path = dir.path().to_path_buf();
+            Self { _dir: dir, path }
         }
     }
 

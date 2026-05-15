@@ -11,7 +11,10 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Style};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use tui_input::backend::crossterm::EventHandler;
+use tui_input::Input;
 use tui_term::widget::PseudoTerminal;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     ConfigCommand, ConfigNetworkMode, ConfigPort, ConfigShare, ConfigShareAccess, ConfigToolState,
@@ -415,7 +418,7 @@ impl GuestTerminalView {
         match key.code {
             KeyCode::Enter => {
                 let result = PromptResult::Accepted {
-                    value: prompt.input.clone(),
+                    value: prompt.input.value().to_string(),
                 };
                 self.prompt = None;
                 self.status.focus = FocusMode::Guest;
@@ -428,15 +431,14 @@ impl GuestTerminalView {
                 self.last_prompt_result = Some(PromptResult::Cancelled);
                 WrapperKeyOutcome::PromptFinished
             }
-            KeyCode::Backspace => {
-                prompt.input.pop();
-                WrapperKeyOutcome::Redraw
+            _ => {
+                let event = Event::Key(key);
+                if prompt.input.handle_event(&event).is_some() {
+                    WrapperKeyOutcome::Redraw
+                } else {
+                    WrapperKeyOutcome::Ignored
+                }
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                prompt.input.push(ch);
-                WrapperKeyOutcome::Redraw
-            }
-            _ => WrapperKeyOutcome::Ignored,
         }
     }
 
@@ -454,22 +456,25 @@ impl GuestTerminalView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct PromptState {
     question: String,
-    input: String,
+    input: Input,
 }
 
 impl PromptState {
     fn new(question: impl Into<String>) -> Self {
         Self {
             question: question.into(),
-            input: String::new(),
+            input: Input::default(),
         }
     }
 
     fn text(&self, width: u16) -> String {
-        truncate_status(format!("prompt | {}: {}", self.question, self.input), width)
+        truncate_status(
+            format!("prompt | {}: {}", self.question, self.input.value()),
+            width,
+        )
     }
 }
 
@@ -543,21 +548,35 @@ impl StatusBar {
     }
 }
 
-fn truncate_status(mut text: String, width: u16) -> String {
+fn truncate_status(text: String, width: u16) -> String {
     let width = usize::from(width);
-    if text.chars().count() <= width {
+    if UnicodeWidthStr::width(text.as_str()) <= width {
         return text;
     }
     if width == 0 {
         return String::new();
     }
     if width <= 3 {
-        return text.chars().take(width).collect();
+        return take_display_width(&text, width);
     }
     let keep = width - 3;
-    text = text.chars().take(keep).collect();
-    text.push_str("...");
-    text
+    let mut truncated = take_display_width(&text, keep);
+    truncated.push_str("...");
+    truncated
+}
+
+fn take_display_width(text: &str, width: usize) -> String {
+    let mut used = 0;
+    let mut output = String::new();
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > width {
+            break;
+        }
+        output.push(ch);
+        used += ch_width;
+    }
+    output
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -788,6 +807,14 @@ mod tests {
 
         status.phase = SessionPhase::Exited(7);
         assert_eq!(status.text(80), "exited 7 | focus guest | 78x21");
+    }
+
+    #[test]
+    fn status_truncation_uses_display_width() {
+        assert_eq!(truncate_status("øøøø".to_string(), 4), "øøøø");
+        assert_eq!(truncate_status("界界xy".to_string(), 6), "界界xy");
+        assert_eq!(truncate_status("界界xy".to_string(), 5), "界...");
+        assert_eq!(truncate_status("界界xy".to_string(), 4), "...");
     }
 
     #[test]

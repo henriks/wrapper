@@ -581,6 +581,31 @@ mod tests {
         FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, VmShape,
         COMPOSED_FS_TAG,
     };
+    use std::ops::Deref;
+
+    struct TestTempDir {
+        dir: tempfile::TempDir,
+    }
+
+    impl TestTempDir {
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.dir.path().join(path)
+        }
+    }
+
+    impl Deref for TestTempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.dir.path()
+        }
+    }
+
+    impl AsRef<Path> for TestTempDir {
+        fn as_ref(&self) -> &Path {
+            self.dir.path()
+        }
+    }
 
     fn config(root: &Path) -> FrontendConfig {
         FrontendConfig {
@@ -956,16 +981,12 @@ mod tests {
         assert!(error.to_string().contains("protected guest path"));
     }
 
-    fn unique_temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agentvm-frontend-manifest-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn unique_temp_dir() -> TestTempDir {
+        TestTempDir {
+            dir: tempfile::Builder::new()
+                .prefix("agentvm-frontend-manifest-test-")
+                .tempdir()
+                .expect("temp dir"),
+        }
     }
 }

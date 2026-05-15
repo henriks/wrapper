@@ -724,7 +724,8 @@ mod tests {
             .proxy_events
             .iter()
             .any(|event| matches!(event, TcpProxyEvent::UpstreamPayload { .. })));
-        let log_path = unique_temp_file("vmnet-events.log");
+        let log_file = temp_file("vmnet-events.log");
+        let log_path = log_file.path().to_path_buf();
         let mut event_log = open_event_log(Some(&log_path)).expect("event log");
         write_proxy_events(&mut event_log, &stats.proxy_events).expect("write event log");
         let event_log = std::fs::read_to_string(log_path).expect("read event log");
@@ -806,7 +807,8 @@ mod tests {
             action: TcpAction::Deny,
             reason: "metadata range denied".to_string(),
         };
-        let log_path = unique_temp_file("vmnet-failures.log");
+        let log_file = temp_file("vmnet-failures.log");
+        let log_path = log_file.path().to_path_buf();
         let mut event_log = open_event_log(Some(&log_path)).expect("event log");
 
         write_gateway_events(
@@ -1133,15 +1135,11 @@ mod tests {
             && u16::from_be_bytes([frame[20], frame[21]]) == 1
     }
 
-    fn unique_temp_file(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "agentvm-frontend-{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ))
+    fn temp_file(name: &str) -> tempfile::NamedTempFile {
+        tempfile::Builder::new()
+            .prefix(&format!("agentvm-frontend-{name}-"))
+            .tempfile()
+            .expect("temp file")
     }
 
     fn parse_tcp_reply(frame: &[u8]) -> Option<TcpRepr<'_>> {

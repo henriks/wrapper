@@ -1,9 +1,6 @@
 use super::*;
 use std::os::unix::fs::{FileExt, PermissionsExt};
-use std::sync::atomic::{AtomicU64, Ordering};
 use virtiofsd::oslib::{ReadvFlags, WritevFlags};
-
-static FUZZ_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 const OP_LIMIT: usize = 96;
 const LOCK_OP_LIMIT: usize = 160;
@@ -432,25 +429,18 @@ impl<'a> Input<'a> {
 }
 
 struct TestDir {
+    _dir: tempfile::TempDir,
     path: PathBuf,
 }
 
 impl TestDir {
     fn new(name: &str) -> Self {
-        let counter = FUZZ_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "agentvm-composed-fs-{name}-{}-{}-{counter}",
-            std::process::id(),
-            now_secs()
-        ));
-        fs::create_dir_all(&path).expect("create fuzz dir");
-        Self { path }
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("agentvm-composed-fs-{name}-"))
+            .tempdir()
+            .expect("create fuzz dir");
+        let path = dir.path().to_path_buf();
+        Self { _dir: dir, path }
     }
 }
 

@@ -6,10 +6,13 @@ version = 4
 name = "agentvm-composed-fs"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "libc",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "vhost",
  "vhost-user-backend",
  "virtiofsd",

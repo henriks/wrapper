@@ -4,7 +4,7 @@ use std::time::Duration;
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol, Ipv4Packet, Ipv4Repr,
-    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
+    TcpControl, TcpPacket, TcpRepr, TcpSeqNumber, UdpPacket,
 };
 
 use crate::dns_proxy::{
@@ -300,45 +300,18 @@ struct DnsQueryFrame<'a> {
 }
 
 fn parse_dns_query_frame<'a>(policy: &VmnetPolicy, frame: &'a [u8]) -> Option<DnsQueryFrame<'a>> {
-    if frame.len() < 14 {
-        return None;
-    }
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != 0x0800 {
-        return None;
-    }
-    let src_mac: [u8; 6] = frame[6..12].try_into().ok()?;
-    let dst_mac: [u8; 6] = frame[0..6].try_into().ok()?;
-
-    let ip = &frame[14..];
-    if ip.len() < 28 || ip[0] >> 4 != 4 || ip[9] != 17 {
-        return None;
-    }
-    let ihl = usize::from(ip[0] & 0x0f) * 4;
-    let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-    if ihl < 20 || total_len < ihl + 8 || ip.len() < total_len {
-        return None;
-    }
-    let src_ip: [u8; 4] = ip[12..16].try_into().ok()?;
-    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
-    let udp = &ip[ihl..total_len];
-    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
-    if udp_len < 8 || udp.len() < udp_len {
-        return None;
-    }
-    if !dns_allowed_to_destination(policy, dst_ip, dst_port) {
+    let udp = parse_udp_frame(frame)?;
+    if !dns_allowed_to_destination(policy, udp.dst_ip, udp.dst_port) {
         return None;
     }
     Some(DnsQueryFrame {
-        src_mac,
-        dst_mac,
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
-        payload: &udp[8..udp_len],
+        src_mac: udp.src_mac,
+        dst_mac: udp.dst_mac,
+        src_ip: udp.src_ip,
+        dst_ip: udp.dst_ip,
+        src_port: udp.src_port,
+        dst_port: udp.dst_port,
+        payload: udp.payload,
     })
 }
 
@@ -397,19 +370,16 @@ fn unsupported_protocol_from_frame(
     policy: &VmnetPolicy,
     frame: &[u8],
 ) -> Option<UnsupportedProtocol> {
-    if frame.len() < 14 {
-        return None;
-    }
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    match ethertype {
-        0x0806 => None,
-        0x86dd => Some(UnsupportedProtocol {
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    match ethernet.ethertype() {
+        EthernetProtocol::Arp => None,
+        EthernetProtocol::Ipv6 => Some(UnsupportedProtocol {
             reason: format!("IPv6 {:?} by policy", policy.protocols.ipv6),
         }),
-        0x0800 => unsupported_ipv4_protocol_from_frame(policy, frame),
+        EthernetProtocol::Ipv4 => unsupported_ipv4_protocol_from_frame(policy, ethernet.payload()),
         other => Some(UnsupportedProtocol {
             reason: format!(
-                "ethertype 0x{other:04x} {:?} by policy",
+                "ethertype {other} {:?} by policy",
                 policy.protocols.ethernet.unknown_ethertypes
             ),
         }),
@@ -418,25 +388,20 @@ fn unsupported_protocol_from_frame(
 
 fn unsupported_ipv4_protocol_from_frame(
     policy: &VmnetPolicy,
-    frame: &[u8],
+    ip_payload: &[u8],
 ) -> Option<UnsupportedProtocol> {
-    let ip = &frame[14..];
-    if ip.len() < 20 || ip[0] >> 4 != 4 {
-        return Some(UnsupportedProtocol {
-            reason: "malformed IPv4 denied by policy".to_string(),
-        });
-    }
-    let ihl = usize::from(ip[0] & 0x0f) * 4;
-    let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-    if ihl < 20 || total_len < ihl || ip.len() < total_len {
-        return Some(UnsupportedProtocol {
-            reason: "malformed IPv4 denied by policy".to_string(),
-        });
-    }
-    match ip[9] {
-        6 => None,
-        17 => {
-            if parse_udp_frame(frame).is_some() {
+    let ip = match Ipv4Packet::new_checked(ip_payload) {
+        Ok(ip) => ip,
+        Err(_) => {
+            return Some(UnsupportedProtocol {
+                reason: "malformed IPv4 denied by policy".to_string(),
+            })
+        }
+    };
+    match ip.next_header() {
+        IpProtocol::Tcp => None,
+        IpProtocol::Udp => {
+            if UdpPacket::new_checked(ip.payload()).is_ok() {
                 Some(UnsupportedProtocol {
                     reason: "UDP forwarding is not implemented".to_string(),
                 })
@@ -455,44 +420,34 @@ fn unsupported_ipv4_protocol_from_frame(
     }
 }
 
-struct UdpFrame {
+struct UdpFrame<'a> {
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
     src_ip: [u8; 4],
     dst_ip: [u8; 4],
     src_port: u16,
     dst_port: u16,
+    payload: &'a [u8],
 }
 
-fn parse_udp_frame(frame: &[u8]) -> Option<UdpFrame> {
-    if frame.len() < 14 {
+fn parse_udp_frame(frame: &[u8]) -> Option<UdpFrame<'_>> {
+    let ethernet = EthernetFrame::new_checked(frame).ok()?;
+    if ethernet.ethertype() != EthernetProtocol::Ipv4 {
         return None;
     }
-    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype != 0x0800 {
+    let ip = Ipv4Packet::new_checked(ethernet.payload()).ok()?;
+    if ip.next_header() != IpProtocol::Udp {
         return None;
     }
-    let ip = &frame[14..];
-    if ip.len() < 28 || ip[0] >> 4 != 4 || ip[9] != 17 {
-        return None;
-    }
-    let ihl = usize::from(ip[0] & 0x0f) * 4;
-    let total_len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
-    if ihl < 20 || total_len < ihl + 8 || ip.len() < total_len {
-        return None;
-    }
-    let src_ip: [u8; 4] = ip[12..16].try_into().ok()?;
-    let dst_ip: [u8; 4] = ip[16..20].try_into().ok()?;
-    let udp = &ip[ihl..total_len];
-    let src_port = u16::from_be_bytes([udp[0], udp[1]]);
-    let dst_port = u16::from_be_bytes([udp[2], udp[3]]);
-    let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
-    if udp_len < 8 || udp.len() < udp_len {
-        return None;
-    }
+    let udp = UdpPacket::new_checked(ip.payload()).ok()?;
     Some(UdpFrame {
-        src_ip,
-        dst_ip,
-        src_port,
-        dst_port,
+        src_mac: ethernet.src_addr().0,
+        dst_mac: ethernet.dst_addr().0,
+        src_ip: ip.src_addr().octets(),
+        dst_ip: ip.dst_addr().octets(),
+        src_port: udp.src_port(),
+        dst_port: udp.dst_port(),
+        payload: udp.payload(),
     })
 }
 

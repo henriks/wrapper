@@ -4,8 +4,8 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use tempfile::TempDir;
 use virtiofsd::filesystem::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter, ROOT_ID};
 use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 use virtiofsd::soft_idmap::{GuestGid, GuestUid};
@@ -16,35 +16,24 @@ use crate::{
 };
 
 pub(crate) struct TestDir {
-    path: PathBuf,
+    dir: TempDir,
 }
 
 impl TestDir {
     pub(crate) fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "agentvm-composed-fs-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create test dir");
-        Self { path }
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("agentvm-composed-fs-{name}-"))
+            .tempdir()
+            .expect("create test dir");
+        Self { dir }
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.dir.path()
     }
 
     pub(crate) fn join(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.path.join(path)
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        self.dir.path().join(path)
     }
 }
 

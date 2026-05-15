@@ -4,8 +4,10 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter as RawPcapWriter};
+use pcap_file::{DataLink, Endianness};
+
 pub const DEFAULT_MAX_FRAME_LEN: u32 = 65_535;
-const ETHERNET_LINKTYPE: u32 = 1;
 
 #[derive(Debug)]
 pub struct VmnetStreamEndpoint {
@@ -211,7 +213,7 @@ fn read_payload_exact(reader: &mut impl Read, frame: &mut [u8]) -> Result<(), Vm
 
 #[derive(Debug)]
 pub struct PcapWriter {
-    file: File,
+    writer: RawPcapWriter<File>,
     snaplen: u32,
 }
 
@@ -220,9 +222,18 @@ impl PcapWriter {
         if let Some(parent) = path.as_ref().parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = File::create(path)?;
-        write_pcap_global_header(&mut file, snaplen)?;
-        Ok(Self { file, snaplen })
+        let file = File::create(path)?;
+        let writer = RawPcapWriter::with_header(
+            file,
+            PcapHeader {
+                snaplen,
+                datalink: DataLink::ETHERNET,
+                endianness: Endianness::native(),
+                ..Default::default()
+            },
+        )
+        .map_err(pcap_error)?;
+        Ok(Self { writer, snaplen })
     }
 
     pub fn write_ethernet_frame(&mut self, frame: &[u8]) -> io::Result<()> {
@@ -230,28 +241,18 @@ impl PcapWriter {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
-        self.file.write_all(&(now.as_secs() as u32).to_le_bytes())?;
-        self.file.write_all(&now.subsec_micros().to_le_bytes())?;
-        self.file.write_all(&(captured_len as u32).to_le_bytes())?;
-        self.file.write_all(&(frame.len() as u32).to_le_bytes())?;
-        self.file.write_all(&frame[..captured_len])?;
+        let packet = PcapPacket::new(now, frame.len() as u32, &frame[..captured_len]);
+        self.writer.write_packet(&packet).map_err(pcap_error)?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        Ok(())
     }
 }
 
-fn write_pcap_global_header(writer: &mut impl Write, snaplen: u32) -> io::Result<()> {
-    writer.write_all(&0xa1b2c3d4_u32.to_le_bytes())?;
-    writer.write_all(&2_u16.to_le_bytes())?;
-    writer.write_all(&4_u16.to_le_bytes())?;
-    writer.write_all(&0_i32.to_le_bytes())?;
-    writer.write_all(&0_u32.to_le_bytes())?;
-    writer.write_all(&snaplen.to_le_bytes())?;
-    writer.write_all(&ETHERNET_LINKTYPE.to_le_bytes())?;
-    Ok(())
+fn pcap_error(error: pcap_file::PcapError) -> io::Error {
+    io::Error::new(ErrorKind::Other, error.to_string())
 }
 
 #[cfg(test)]
@@ -413,14 +414,12 @@ mod tests {
 
     #[test]
     fn writes_standard_pcap_file() {
-        let path = std::env::temp_dir().join(format!(
-            "agentvm-vmnet-test-{}-{}.pcap",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let file = tempfile::Builder::new()
+            .prefix("agentvm-vmnet-test-")
+            .suffix(".pcap")
+            .tempfile()
+            .expect("pcap temp file");
+        let path = file.path().to_path_buf();
         let frame = ethernet_frame();
 
         let mut writer = PcapWriter::create(&path, 65_535).expect("create pcap");
@@ -430,7 +429,6 @@ mod tests {
         writer.flush().expect("flush");
 
         let bytes = fs::read(&path).expect("read pcap");
-        let _ = fs::remove_file(&path);
         assert_eq!(&bytes[..4], &0xa1b2c3d4_u32.to_le_bytes());
         assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 1);
         assert_eq!(

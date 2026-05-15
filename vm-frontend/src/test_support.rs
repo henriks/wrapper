@@ -6,7 +6,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use hickory_proto::op::{Message, Query};
 use hickory_proto::rr::{Name, RecordType};
@@ -19,6 +19,7 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
     Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
 };
+use tempfile::TempDir;
 
 use crate::l2_gateway::ipv4_checksum;
 use crate::launch::LaunchError;
@@ -36,35 +37,24 @@ pub(crate) const TEST_DNS_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 3);
 pub(crate) const TEST_PUBLIC_IP: Ipv4Address = Ipv4Address::new(93, 184, 216, 34);
 
 pub(crate) struct TestTempDir {
-    path: PathBuf,
+    dir: TempDir,
 }
 
 impl TestTempDir {
     pub(crate) fn new(name: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time before unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "agentvm-frontend-{name}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create test temp dir");
-        Self { path }
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("agentvm-frontend-{name}-"))
+            .tempdir()
+            .expect("create test temp dir");
+        Self { dir }
     }
 
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        self.dir.path()
     }
 
     pub(crate) fn join(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.path.join(path)
-    }
-}
-
-impl Drop for TestTempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        self.dir.path().join(path)
     }
 }
 

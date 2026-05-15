@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use agentvm_composed_fs::serve_vhost_user_fs;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use wait_timeout::ChildExt;
 
 use crate::docker_proxy::{start_docker_unix_proxy, DockerUnixProxyConfig};
 use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
@@ -25,24 +27,15 @@ const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_WAIT_STEP: Duration = Duration::from_millis(20);
 const DATA_DISK_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum LaunchError {
+    #[error("{0}")]
     Io(io::Error),
+    #[error("{0}")]
     Json(serde_json::Error),
+    #[error("{0}")]
     Artifact(String),
 }
-
-impl std::fmt::Display for LaunchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LaunchError::Io(error) => write!(f, "{error}"),
-            LaunchError::Json(error) => write!(f, "{error}"),
-            LaunchError::Artifact(error) => write!(f, "{error}"),
-        }
-    }
-}
-
-impl std::error::Error for LaunchError {}
 
 impl From<io::Error> for LaunchError {
     fn from(error: io::Error) -> Self {
@@ -319,25 +312,21 @@ fn wait_for_qemu(
             .map_err(LaunchError::Io);
     };
 
-    let started = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(QemuExit {
-                status,
-                timed_out: false,
-            });
-        }
-        if started.elapsed() >= timeout {
-            child.kill()?;
-            return child
+    match child.wait_timeout(timeout).map_err(LaunchError::Io)? {
+        Some(status) => Ok(QemuExit {
+            status,
+            timed_out: false,
+        }),
+        None => {
+            child.kill().map_err(LaunchError::Io)?;
+            child
                 .wait()
                 .map(|status| QemuExit {
                     status,
                     timed_out: true,
                 })
-                .map_err(LaunchError::Io);
+                .map_err(LaunchError::Io)
         }
-        thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -550,6 +539,31 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
+
+    struct TestTempDir {
+        dir: tempfile::TempDir,
+    }
+
+    impl TestTempDir {
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.dir.path().join(path)
+        }
+    }
+
+    impl Deref for TestTempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.dir.path()
+        }
+    }
+
+    impl AsRef<Path> for TestTempDir {
+        fn as_ref(&self) -> &Path {
+            self.dir.path()
+        }
+    }
     use crate::runtime_manifest::workspace_mounts;
     use crate::test_support::FrontendFixture;
 
@@ -668,16 +682,12 @@ mod tests {
         assert!(state.contains("composed-binds.json"));
     }
 
-    fn unique_temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agentvm-frontend-launch-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn unique_temp_dir() -> TestTempDir {
+        TestTempDir {
+            dir: tempfile::Builder::new()
+                .prefix("agentvm-frontend-launch-test-")
+                .tempdir()
+                .expect("temp dir"),
+        }
     }
 }

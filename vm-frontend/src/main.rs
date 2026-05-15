@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::net::{Ipv4Addr, TcpListener};
-use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -224,24 +224,20 @@ impl ProjectLock {
                     config.runtime.lock.display()
                 )
             })?;
-        // SAFETY: flock operates on a valid fd owned by file.
-        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if result != 0 {
-            return Err(format!(
+        acquire_project_file_lock(
+            &file,
+            format!(
                 "another VM sandbox is already active for this project ({})",
                 config.runtime.lock.display()
-            ));
-        }
+            ),
+        )?;
         Ok(Self { file })
     }
 }
 
 impl Drop for ProjectLock {
     fn drop(&mut self) {
-        // SAFETY: flock operates on a valid fd owned by file.
-        unsafe {
-            let _ = libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+        let _ = fs4::FileExt::unlock(&self.file);
     }
 }
 
@@ -361,6 +357,31 @@ impl WrapperArgs {
 enum SetupTool {
     Codex,
     Pi,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct CliParseError(String);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PortPair {
+    host: u16,
+    guest: u16,
+}
+
+impl fmt::Display for PortPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.guest)
+    }
+}
+
+impl std::str::FromStr for PortPair {
+    type Err = CliParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (host, guest) = parse_port_pair(value).map_err(CliParseError)?;
+        Ok(Self { host, guest })
+    }
 }
 
 impl SetupTool {
@@ -753,8 +774,8 @@ fn parse_wrapper_args_with_terminal(
 
     let mut launch_args = Vec::new();
     let mut project = matches
-        .get_one::<String>("project")
-        .map(|path| absolute_cli_path(path))
+        .get_one::<PathBuf>("project")
+        .map(|path| absolute_cli_path(&path.display().to_string()))
         .transpose()?
         .unwrap_or(env::current_dir().map_err(|error| error.to_string())?);
     let tool = matches.get_one::<String>("tool").cloned();
@@ -804,8 +825,8 @@ fn parse_wrapper_args_with_terminal(
         }
     }
 
-    if let Some(path) = matches.get_one::<String>("project") {
-        project = absolute_cli_path(path)?;
+    if let Some(path) = matches.get_one::<PathBuf>("project") {
+        project = absolute_cli_path(&path.display().to_string())?;
         launch_args.extend(["--project".to_string(), project.display().to_string()]);
     }
     if no_net {
@@ -837,9 +858,9 @@ fn parse_wrapper_args_with_terminal(
             }
         }
     }
-    if let Some(values) = matches.get_many::<String>("docker_publish") {
+    if let Some(values) = matches.get_many::<PortPair>("docker_publish") {
         for value in values {
-            launch_args.extend(["--publish".to_string(), value.clone()]);
+            launch_args.extend(["--publish".to_string(), value.to_string()]);
         }
     }
     if help {
@@ -951,6 +972,7 @@ fn wrapper_clap_command() -> ClapCommand {
             Arg::new("project")
                 .long("project")
                 .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
                 .value_hint(ValueHint::DirPath),
         )
         .arg(
@@ -1025,6 +1047,7 @@ fn wrapper_clap_command() -> ClapCommand {
             Arg::new("docker_publish")
                 .long("docker-publish")
                 .value_name("HOST:GUEST")
+                .value_parser(clap::value_parser!(PortPair))
                 .action(ArgAction::Append),
         )
         .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue))
@@ -1309,14 +1332,13 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
         .truncate(false)
         .open(&runtime.lock)
         .map_err(|error| format!("failed to open project VM lock: {error}"))?;
-    // SAFETY: flock operates on a valid fd owned by file.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
-        return Err(format!(
+    acquire_project_file_lock(
+        &file,
+        format!(
             "--reset refused because a VM sandbox is active for this project ({})",
             runtime.lock.display()
-        ));
-    }
+        ),
+    )?;
     if sandbox.exists() {
         fs::remove_dir_all(&sandbox)
             .map_err(|error| format!("failed to remove .sandbox: {error}"))?;
@@ -1327,11 +1349,21 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+fn acquire_project_file_lock(file: &File, busy_message: String) -> Result<(), String> {
+    match fs4::FileExt::try_lock(file) {
+        Ok(()) => Ok(()),
+        Err(fs4::TryLockError::WouldBlock) => Err(busy_message),
+        Err(fs4::TryLockError::Error(error)) => {
+            Err(format!("failed to lock project VM state: {error}"))
+        }
+    }
+}
+
 fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig, String> {
     let matches = parse_clap_matches(vmnet_gateway_clap_command(), args)?;
     let socket_path = matches
-        .get_one::<String>("socket")
-        .map(PathBuf::from)
+        .get_one::<PathBuf>("socket")
+        .cloned()
         .ok_or_else(|| "--socket is required".to_string())?;
     let mut network = GuestNetwork::default();
     if let Some(value) = matches.get_one::<String>("guest_ip") {
@@ -1346,27 +1378,28 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     if let Some(value) = matches.get_one::<String>("guest_mac") {
         network.guest_mac = value.clone();
     }
-    if let Some(value) = matches.get_one::<String>("prefix_len") {
-        network.prefix_len = value
-            .parse()
-            .map_err(|_| "invalid --prefix-len".to_string())?;
+    if let Some(value) = matches.get_one::<u8>("prefix_len") {
+        network.prefix_len = *value;
     }
     let allow_ips = append_many(&matches, "allow_ip");
     let allow_domains = append_many(&matches, "allow_domain");
     let allow_public = matches.get_flag("allow_public_internet");
     let no_net = matches.get_flag("no_net");
     let mut host_listeners = Vec::new();
-    for value in append_many(&matches, "host_docker_listener") {
-        let (host_port, guest_port) = parse_port_pair(&value)?;
-        host_listeners.push(HostListener::docker_api(host_port, guest_port));
+    if let Some(values) = matches.get_many::<PortPair>("host_docker_listener") {
+        for value in values {
+            host_listeners.push(HostListener::docker_api(value.host, value.guest));
+        }
     }
-    for value in append_many(&matches, "host_payload_listener") {
-        let (host_port, guest_port) = parse_port_pair(&value)?;
-        host_listeners.push(HostListener::payload_control(host_port, guest_port));
+    if let Some(values) = matches.get_many::<PortPair>("host_payload_listener") {
+        for value in values {
+            host_listeners.push(HostListener::payload_control(value.host, value.guest));
+        }
     }
-    for value in append_many(&matches, "publish") {
-        let (host_port, guest_port) = parse_port_pair(&value)?;
-        host_listeners.push(HostListener::published_tcp(host_port, guest_port));
+    if let Some(values) = matches.get_many::<PortPair>("publish") {
+        for value in values {
+            host_listeners.push(HostListener::published_tcp(value.host, value.guest));
+        }
     }
     let pcap_path = matches.get_one::<String>("pcap").map(PathBuf::from);
     let tls_ca_cert = matches.get_one::<String>("tls_ca_cert").map(PathBuf::from);
@@ -1401,12 +1434,22 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
 
 fn vmnet_gateway_clap_command() -> ClapCommand {
     ClapCommand::new("vmnet-gateway")
-        .arg(Arg::new("socket").long("socket").value_name("PATH"))
+        .arg(
+            Arg::new("socket")
+                .long("socket")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
         .arg(Arg::new("guest_ip").long("guest-ip").value_name("IP"))
         .arg(Arg::new("gateway_ip").long("gateway-ip").value_name("IP"))
         .arg(Arg::new("dns_ip").long("dns-ip").value_name("IP"))
         .arg(Arg::new("guest_mac").long("guest-mac").value_name("MAC"))
-        .arg(Arg::new("prefix_len").long("prefix-len").value_name("N"))
+        .arg(
+            Arg::new("prefix_len")
+                .long("prefix-len")
+                .value_name("N")
+                .value_parser(clap::value_parser!(u8)),
+        )
         .arg(
             Arg::new("allow_ip")
                 .long("allow-ip")
@@ -1429,18 +1472,21 @@ fn vmnet_gateway_clap_command() -> ClapCommand {
             Arg::new("host_docker_listener")
                 .long("host-docker-listener")
                 .value_name("HOST:GUEST")
+                .value_parser(clap::value_parser!(PortPair))
                 .action(ArgAction::Append),
         )
         .arg(
             Arg::new("host_payload_listener")
                 .long("host-payload-listener")
                 .value_name("HOST:GUEST")
+                .value_parser(clap::value_parser!(PortPair))
                 .action(ArgAction::Append),
         )
         .arg(
             Arg::new("publish")
                 .long("publish")
                 .value_name("HOST:GUEST")
+                .value_parser(clap::value_parser!(PortPair))
                 .action(ArgAction::Append),
         )
         .arg(Arg::new("pcap").long("pcap").value_name("PATH"))
@@ -2483,16 +2529,9 @@ fn tool_bootstrap_payload_script(
 }
 
 fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&byte))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', r#"'"'"'"#))
+    shlex::try_quote(value)
+        .expect("shell argument contains an embedded NUL byte")
+        .into_owned()
 }
 
 fn host_home_dir() -> Result<PathBuf, String> {
@@ -2789,6 +2828,31 @@ fn print_self_test_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Deref;
+
+    struct TestTempDir {
+        dir: tempfile::TempDir,
+    }
+
+    impl TestTempDir {
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.dir.path().join(path)
+        }
+    }
+
+    impl Deref for TestTempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.dir.path()
+        }
+    }
+
+    impl AsRef<Path> for TestTempDir {
+        fn as_ref(&self) -> &Path {
+            self.dir.path()
+        }
+    }
 
     #[test]
     fn parses_vmnet_gateway_runtime_config() {
@@ -3893,20 +3957,16 @@ mod tests {
         assert!(parse_port_pair("localhost:8080").is_err());
     }
 
-    fn unique_temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agentvm-frontend-main-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+    fn unique_temp_dir() -> TestTempDir {
+        TestTempDir {
+            dir: tempfile::Builder::new()
+                .prefix("agentvm-frontend-main-test-")
+                .tempdir()
+                .expect("temp dir"),
+        }
     }
 
-    fn frontend_test_root() -> PathBuf {
+    fn frontend_test_root() -> TestTempDir {
         let root = unique_temp_dir();
         std::fs::create_dir_all(root.join("docker/out")).expect("out");
         std::fs::create_dir_all(root.join("repo")).expect("repo");
