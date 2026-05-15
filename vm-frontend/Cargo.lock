@@ -20,6 +20,7 @@ name = "agentvm-frontend"
 version = "0.1.0"
 dependencies = [
  "agentvm-composed-fs",
+ "clap",
  "crossterm",
  "hickory-proto",
  "httparse",

@@ -28,6 +28,7 @@ use agentvm_frontend::runtime_manifest::{
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
 use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
+use clap::{Arg, ArgAction, ArgMatches, Command as ClapCommand, ValueHint};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
@@ -693,120 +694,153 @@ fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, Str
 }
 
 fn parse_wrapper_args_with_terminal(
-    _program: &str,
+    program: &str,
     args: &[String],
     stdin_is_tty: bool,
     stdout_is_tty: bool,
 ) -> Result<WrapperArgs, String> {
-    let mut launch_args = Vec::new();
-    let mut project = env::current_dir().map_err(|error| error.to_string())?;
-    let mut tool = None;
-    let mut command_override: Option<WrapperCommandOverride> = None;
-    let mut setup_tool = None;
-    let mut reset = false;
-    let mut help = false;
-    let mut no_net = false;
-    let mut no_tui = false;
-    let mut tls_bootstrap = false;
-    let mut edit_config = false;
-    let mut saw_network_override = false;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--" => {
-                if let Some((command, command_args)) = args[index + 1..].split_first() {
-                    if let Some(existing) = command_override.as_mut() {
-                        let mut all_args = Vec::with_capacity(1 + command_args.len());
-                        all_args.push(command.clone());
-                        all_args.extend(command_args.iter().cloned());
-                        existing.append_args(&all_args);
-                    } else {
-                        command_override = Some(WrapperCommandOverride::Argv(ConfigCommand {
-                            command: command.clone(),
-                            args: command_args.to_vec(),
-                        }));
-                    }
-                }
-                break;
-            }
-            "--project" => {
-                project = absolute_cli_path(&value(args, &mut index, "--project")?)?;
-                launch_args.extend(["--project".to_string(), project.display().to_string()]);
-            }
-            "--tool" => {
-                let selected = value(args, &mut index, "--tool")?;
-                selected.parse::<GuestTool>()?;
-                tool = Some(selected.clone());
-                launch_args.extend(["--tool".to_string(), selected]);
-            }
-            "--tool-arg" => {
-                let arg = value(args, &mut index, "--tool-arg")?;
-                launch_args.extend(["--tool-arg".to_string(), arg]);
-            }
-            "--setup-tool" => {
-                setup_tool = Some(SetupTool::parse(&value(args, &mut index, "--setup-tool")?)?);
-            }
-            "--command" => {
-                let command = value(args, &mut index, "--command")?;
-                if command.trim().is_empty() {
-                    return Err("--command must not be empty".to_string());
-                }
-                command_override = Some(WrapperCommandOverride::Shell {
-                    command,
-                    args: Vec::new(),
-                });
-            }
-            "--no-net" => {
-                no_net = true;
-                saw_network_override = true;
-                launch_args.push(args[index].clone());
-            }
-            "--allow-ip" | "--allow-domain" => {
-                saw_network_override = true;
-                let flag = args[index].clone();
-                let val = value(args, &mut index, &flag)?;
-                launch_args.extend([flag, val]);
-            }
-            "--no-tui" => no_tui = true,
-            "--config" => edit_config = true,
-            "--gh" => launch_args.push(args[index].clone()),
-            "--aws" | "--ro" | "--rw" | "--qemu" | "--artifact-manifest" => {
-                let flag = args[index].clone();
-                let val = value(args, &mut index, &flag)?;
-                launch_args.extend([flag, val]);
-            }
-            "--docker-publish" => {
-                let val = value(args, &mut index, "--docker-publish")?;
-                launch_args.extend(["--publish".to_string(), val]);
-            }
-            "--reset" => reset = true,
+    for arg in args {
+        match arg.as_str() {
             "--docker" => {
                 return Err(
                     "--docker has been removed; the VM is now the default execution model"
                         .to_string(),
-                )
+                );
             }
             "--docker-machine" => {
                 return Err(
                     "--docker-machine has been removed with the legacy QEMU path".to_string(),
-                )
+                );
             }
-            "--pass-env" => return Err(
-                "--pass-env has been removed; use explicit VM guest shares/auth options instead"
-                    .to_string(),
-            ),
-            "-h" | "--help" => {
-                print_wrapper_usage();
-                help = true;
+            "--pass-env" => {
+                return Err(
+                    "--pass-env has been removed; use explicit VM guest shares/auth options instead"
+                        .to_string(),
+                );
             }
-            arg if arg.starts_with('-') => return Err(format!("unknown wrapper option: {arg}")),
-            arg => {
-                return Err(format!(
-                    "unexpected argument '{arg}'; use '-- {arg} ...' to override the configured command"
-                ));
+            _ => {}
+        }
+    }
+    let separator_index = args.iter().position(|arg| arg == "--");
+    let (parse_args, payload_command_values) = if let Some(index) = separator_index {
+        (&args[..index], args[index + 1..].to_vec())
+    } else {
+        (args, Vec::new())
+    };
+
+    let mut argv = vec![wrapper_program_name(program).to_string()];
+    argv.extend(parse_args.iter().cloned());
+    let matches = match wrapper_clap_command().try_get_matches_from(argv) {
+        Ok(matches) => matches,
+        Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
+            error.print().map_err(|error| error.to_string())?;
+            let project = env::current_dir().map_err(|error| error.to_string())?;
+            return Ok(WrapperArgs {
+                project,
+                launch_args: Vec::new(),
+                ui_mode: wrapper_ui_mode(false, stdin_is_tty, stdout_is_tty),
+                tool_selected: false,
+                command_override: None,
+                setup_tool: None,
+                tls_bootstrap: false,
+                reset: false,
+                edit_config: false,
+                help: true,
+            });
+        }
+        Err(error) => return Err(error.to_string().trim().to_string()),
+    };
+
+    let mut launch_args = Vec::new();
+    let mut project = matches
+        .get_one::<String>("project")
+        .map(|path| absolute_cli_path(path))
+        .transpose()?
+        .unwrap_or(env::current_dir().map_err(|error| error.to_string())?);
+    let tool = matches.get_one::<String>("tool").cloned();
+    if let Some(selected) = tool.as_ref() {
+        selected.parse::<GuestTool>()?;
+        launch_args.extend(["--tool".to_string(), selected.clone()]);
+    }
+    if let Some(args) = matches.get_many::<String>("tool_arg") {
+        for arg in args {
+            launch_args.extend(["--tool-arg".to_string(), arg.clone()]);
+        }
+    }
+    let mut command_override: Option<WrapperCommandOverride> = None;
+    let setup_tool = matches
+        .get_one::<String>("setup_tool")
+        .map(|tool| SetupTool::parse(tool))
+        .transpose()?;
+    let reset = matches.get_flag("reset");
+    let help = false;
+    let no_net = matches.get_flag("no_net");
+    let no_tui = matches.get_flag("no_tui");
+    let mut tls_bootstrap = false;
+    let edit_config = matches.get_flag("config");
+    let saw_network_override =
+        no_net || matches.contains_id("allow_ip") || matches.contains_id("allow_domain");
+
+    if let Some(command) = matches.get_one::<String>("command") {
+        if command.trim().is_empty() {
+            return Err("--command must not be empty".to_string());
+        }
+        command_override = Some(WrapperCommandOverride::Shell {
+            command: command.clone(),
+            args: Vec::new(),
+        });
+    }
+    if let Some((command, command_args)) = payload_command_values.split_first() {
+        if let Some(existing) = command_override.as_mut() {
+            let mut all_args = Vec::with_capacity(1 + command_args.len());
+            all_args.push(command.clone());
+            all_args.extend(command_args.iter().cloned());
+            existing.append_args(&all_args);
+        } else {
+            command_override = Some(WrapperCommandOverride::Argv(ConfigCommand {
+                command: command.clone(),
+                args: command_args.to_vec(),
+            }));
+        }
+    }
+
+    if let Some(path) = matches.get_one::<String>("project") {
+        project = absolute_cli_path(path)?;
+        launch_args.extend(["--project".to_string(), project.display().to_string()]);
+    }
+    if no_net {
+        launch_args.push("--no-net".to_string());
+    }
+    if let Some(values) = matches.get_many::<String>("allow_ip") {
+        for value in values {
+            launch_args.extend(["--allow-ip".to_string(), value.clone()]);
+        }
+    }
+    if let Some(values) = matches.get_many::<String>("allow_domain") {
+        for value in values {
+            launch_args.extend(["--allow-domain".to_string(), value.clone()]);
+        }
+    }
+    if matches.get_flag("gh") {
+        launch_args.push("--gh".to_string());
+    }
+    for (id, flag) in [
+        ("aws", "--aws"),
+        ("ro", "--ro"),
+        ("rw", "--rw"),
+        ("qemu", "--qemu"),
+        ("artifact_manifest", "--artifact-manifest"),
+    ] {
+        if let Some(values) = matches.get_many::<String>(id) {
+            for value in values {
+                launch_args.extend([flag.to_string(), value.clone()]);
             }
         }
-        index += 1;
+    }
+    if let Some(values) = matches.get_many::<String>("docker_publish") {
+        for value in values {
+            launch_args.extend(["--publish".to_string(), value.clone()]);
+        }
     }
     if help {
         return Ok(WrapperArgs {
@@ -900,6 +934,116 @@ fn parse_wrapper_args_with_terminal(
         edit_config,
         help,
     })
+}
+
+fn wrapper_program_name(program: &str) -> &'static str {
+    if is_agentvm_program(program) {
+        "agentvm"
+    } else {
+        "agentvm-frontend wrap"
+    }
+}
+
+fn wrapper_clap_command() -> ClapCommand {
+    ClapCommand::new("agentvm")
+        .after_help("Command override: agentvm -- COMMAND [ARG...]\nCompatibility: agentvm-frontend wrap [same options]")
+        .arg(
+            Arg::new("project")
+                .long("project")
+                .value_name("PATH")
+                .value_hint(ValueHint::DirPath),
+        )
+        .arg(
+            Arg::new("setup_tool")
+                .long("setup-tool")
+                .value_name("codex|pi"),
+        )
+        .arg(Arg::new("config").long("config").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("tool")
+                .long("tool")
+                .value_name("codex|copilot")
+                .help("Compatibility: select a launch-time tool without persisting config"),
+        )
+        .arg(
+            Arg::new("tool_arg")
+                .long("tool-arg")
+                .value_name("ARG")
+                .action(ArgAction::Append)
+                .allow_hyphen_values(true)
+                .help("Compatibility: pass one argument to --tool"),
+        )
+        .arg(
+            Arg::new("command")
+                .long("command")
+                .value_name("CMD")
+                .help("Compatibility: one-run shell command override"),
+        )
+        .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("allow_ip")
+                .long("allow-ip")
+                .value_name("IP_OR_CIDR")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("allow_domain")
+                .long("allow-domain")
+                .value_name("DOMAIN")
+                .action(ArgAction::Append),
+        )
+        .arg(Arg::new("no_tui").long("no-tui").action(ArgAction::SetTrue))
+        .arg(Arg::new("gh").long("gh").action(ArgAction::SetTrue))
+        .arg(Arg::new("aws").long("aws").value_name("PROFILE"))
+        .arg(
+            Arg::new("ro")
+                .long("ro")
+                .value_name("PATH")
+                .action(ArgAction::Append)
+                .value_hint(ValueHint::AnyPath),
+        )
+        .arg(
+            Arg::new("rw")
+                .long("rw")
+                .value_name("PATH")
+                .action(ArgAction::Append)
+                .value_hint(ValueHint::AnyPath),
+        )
+        .arg(
+            Arg::new("qemu")
+                .long("qemu")
+                .value_name("PATH")
+                .value_hint(ValueHint::AnyPath),
+        )
+        .arg(
+            Arg::new("artifact_manifest")
+                .long("artifact-manifest")
+                .value_name("PATH")
+                .value_hint(ValueHint::FilePath),
+        )
+        .arg(
+            Arg::new("docker_publish")
+                .long("docker-publish")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(Arg::new("reset").long("reset").action(ArgAction::SetTrue))
+}
+
+fn parse_clap_matches(command: ClapCommand, args: &[String]) -> Result<ArgMatches, String> {
+    let name = command.get_name().to_string();
+    let mut argv = vec![name];
+    argv.extend(args.iter().cloned());
+    command
+        .try_get_matches_from(argv)
+        .map_err(|error| error.to_string().trim().to_string())
+}
+
+fn append_many(matches: &ArgMatches, id: &str) -> Vec<String> {
+    matches
+        .get_many::<String>(id)
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default()
 }
 
 fn config_uses_codex_tool(config: &WrapperSandboxConfig) -> bool {
@@ -1183,86 +1327,51 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn print_wrapper_usage() {
-    eprintln!(
-        "usage: agentvm [--project PATH] [--setup-tool codex|pi] [--config] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- COMMAND [ARG...]]\n\
-         compatibility: agentvm-frontend wrap [same options] [--tool codex|copilot] [--command CMD]"
-    );
-}
-
 fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig, String> {
-    let mut socket_path = None;
+    let matches = parse_clap_matches(vmnet_gateway_clap_command(), args)?;
+    let socket_path = matches
+        .get_one::<String>("socket")
+        .map(PathBuf::from)
+        .ok_or_else(|| "--socket is required".to_string())?;
     let mut network = GuestNetwork::default();
-    let mut allow_ips = Vec::new();
-    let mut allow_domains = Vec::new();
-    let mut allow_public = false;
-    let mut no_net = false;
-    let mut host_listeners = Vec::new();
-    let mut tls_ca_cert = None;
-    let mut tls_ca_key = None;
-    let mut tls_generate_per_host_certs = false;
-    let mut pcap_path = None;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--socket" => {
-                socket_path = Some(PathBuf::from(value(args, &mut index, "--socket")?));
-            }
-            "--guest-ip" => network.guest_ip = value(args, &mut index, "--guest-ip")?,
-            "--gateway-ip" => network.gateway_ip = value(args, &mut index, "--gateway-ip")?,
-            "--dns-ip" => network.dns_ip = value(args, &mut index, "--dns-ip")?,
-            "--guest-mac" => network.guest_mac = value(args, &mut index, "--guest-mac")?,
-            "--prefix-len" => {
-                network.prefix_len = value(args, &mut index, "--prefix-len")?
-                    .parse()
-                    .map_err(|_| "invalid --prefix-len".to_string())?;
-            }
-            "--allow-ip" => allow_ips.push(value(args, &mut index, "--allow-ip")?),
-            "--allow-domain" => allow_domains.push(value(args, &mut index, "--allow-domain")?),
-            "--allow-public-internet" => {
-                allow_public = true;
-            }
-            "--no-net" => {
-                no_net = true;
-            }
-            "--host-docker-listener" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--host-docker-listener")?)?;
-                host_listeners.push(HostListener::docker_api(host_port, guest_port));
-            }
-            "--host-payload-listener" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--host-payload-listener")?)?;
-                host_listeners.push(HostListener::payload_control(host_port, guest_port));
-            }
-            "--publish" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--publish")?)?;
-                host_listeners.push(HostListener::published_tcp(host_port, guest_port));
-            }
-            "--pcap" => {
-                pcap_path = Some(PathBuf::from(value(args, &mut index, "--pcap")?));
-            }
-            "--tls-ca-cert" => {
-                tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
-            }
-            "--tls-ca-key" => {
-                tls_ca_key = Some(PathBuf::from(value(args, &mut index, "--tls-ca-key")?));
-            }
-            "--tls-generate-per-host-certs" => {
-                tls_generate_per_host_certs = true;
-            }
-            "-h" | "--help" => {
-                print_usage();
-                return Err("help requested".to_string());
-            }
-            unknown => return Err(format!("unknown vmnet-gateway option: {unknown}")),
-        }
-        index += 1;
+    if let Some(value) = matches.get_one::<String>("guest_ip") {
+        network.guest_ip = value.clone();
     }
-
-    let socket_path = socket_path.ok_or_else(|| "--socket is required".to_string())?;
+    if let Some(value) = matches.get_one::<String>("gateway_ip") {
+        network.gateway_ip = value.clone();
+    }
+    if let Some(value) = matches.get_one::<String>("dns_ip") {
+        network.dns_ip = value.clone();
+    }
+    if let Some(value) = matches.get_one::<String>("guest_mac") {
+        network.guest_mac = value.clone();
+    }
+    if let Some(value) = matches.get_one::<String>("prefix_len") {
+        network.prefix_len = value
+            .parse()
+            .map_err(|_| "invalid --prefix-len".to_string())?;
+    }
+    let allow_ips = append_many(&matches, "allow_ip");
+    let allow_domains = append_many(&matches, "allow_domain");
+    let allow_public = matches.get_flag("allow_public_internet");
+    let no_net = matches.get_flag("no_net");
+    let mut host_listeners = Vec::new();
+    for value in append_many(&matches, "host_docker_listener") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        host_listeners.push(HostListener::docker_api(host_port, guest_port));
+    }
+    for value in append_many(&matches, "host_payload_listener") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        host_listeners.push(HostListener::payload_control(host_port, guest_port));
+    }
+    for value in append_many(&matches, "publish") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        host_listeners.push(HostListener::published_tcp(host_port, guest_port));
+    }
+    let pcap_path = matches.get_one::<String>("pcap").map(PathBuf::from);
+    let tls_ca_cert = matches.get_one::<String>("tls_ca_cert").map(PathBuf::from);
+    let tls_ca_key = matches.get_one::<String>("tls_ca_key").map(PathBuf::from);
+    let tls_generate_per_host_certs = matches.get_flag("tls_generate_per_host_certs");
     validate_no_net_args(
         no_net,
         allow_public,
@@ -1290,6 +1399,64 @@ fn vmnet_gateway_config_from_args(args: &[String]) -> Result<VmnetRuntimeConfig,
     Ok(VmnetRuntimeConfig::new(socket_path, network, policy))
 }
 
+fn vmnet_gateway_clap_command() -> ClapCommand {
+    ClapCommand::new("vmnet-gateway")
+        .arg(Arg::new("socket").long("socket").value_name("PATH"))
+        .arg(Arg::new("guest_ip").long("guest-ip").value_name("IP"))
+        .arg(Arg::new("gateway_ip").long("gateway-ip").value_name("IP"))
+        .arg(Arg::new("dns_ip").long("dns-ip").value_name("IP"))
+        .arg(Arg::new("guest_mac").long("guest-mac").value_name("MAC"))
+        .arg(Arg::new("prefix_len").long("prefix-len").value_name("N"))
+        .arg(
+            Arg::new("allow_ip")
+                .long("allow-ip")
+                .value_name("IP_OR_CIDR")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("allow_domain")
+                .long("allow-domain")
+                .value_name("DOMAIN")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("allow_public_internet")
+                .long("allow-public-internet")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("host_docker_listener")
+                .long("host-docker-listener")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("host_payload_listener")
+                .long("host-payload-listener")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("publish")
+                .long("publish")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(Arg::new("pcap").long("pcap").value_name("PATH"))
+        .arg(
+            Arg::new("tls_ca_cert")
+                .long("tls-ca-cert")
+                .value_name("PATH"),
+        )
+        .arg(Arg::new("tls_ca_key").long("tls-ca-key").value_name("PATH"))
+        .arg(
+            Arg::new("tls_generate_per_host_certs")
+                .long("tls-generate-per-host-certs")
+                .action(ArgAction::SetTrue),
+        )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PayloadClientConfig {
     host: String,
@@ -1305,58 +1472,46 @@ struct PayloadClientConfig {
 
 fn payload_client_config_from_args(args: &[String]) -> Result<PayloadClientConfig, String> {
     let (rows, cols) = terminal_size();
+    let matches = parse_clap_matches(payload_client_clap_command(), args)?;
     let mut config = PayloadClientConfig {
-        host: "127.0.0.1".to_string(),
-        port: 12076,
-        ping: false,
-        script: None,
-        cwd: "/".to_string(),
+        host: matches
+            .get_one::<String>("host")
+            .cloned()
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: matches
+            .get_one::<String>("port")
+            .map(|value| value.parse().map_err(|_| "invalid --port".to_string()))
+            .transpose()?
+            .unwrap_or(12076),
+        ping: matches.get_flag("ping"),
+        script: matches.get_one::<String>("script").cloned(),
+        cwd: matches
+            .get_one::<String>("cwd")
+            .cloned()
+            .unwrap_or_else(|| "/".to_string()),
         env: BTreeMap::new(),
-        rows,
-        cols,
-        no_stdin: false,
+        rows: matches
+            .get_one::<String>("rows")
+            .map(|value| value.parse().map_err(|_| "invalid --rows".to_string()))
+            .transpose()?
+            .unwrap_or(rows),
+        cols: matches
+            .get_one::<String>("cols")
+            .map(|value| value.parse().map_err(|_| "invalid --cols".to_string()))
+            .transpose()?
+            .unwrap_or(cols),
+        no_stdin: matches.get_flag("no_stdin"),
     };
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--host" => config.host = value(args, &mut index, "--host")?,
-            "--port" => {
-                config.port = value(args, &mut index, "--port")?
-                    .parse()
-                    .map_err(|_| "invalid --port".to_string())?;
+    if let Some(values) = matches.get_many::<String>("env") {
+        for env in values {
+            let (key, val) = env
+                .split_once('=')
+                .ok_or_else(|| "--env must be KEY=VALUE".to_string())?;
+            if key.is_empty() {
+                return Err("--env key must not be empty".to_string());
             }
-            "--ping" => config.ping = true,
-            "--script" => config.script = Some(value(args, &mut index, "--script")?),
-            "--cwd" => config.cwd = value(args, &mut index, "--cwd")?,
-            "--env" => {
-                let env = value(args, &mut index, "--env")?;
-                let (key, val) = env
-                    .split_once('=')
-                    .ok_or_else(|| "--env must be KEY=VALUE".to_string())?;
-                if key.is_empty() {
-                    return Err("--env key must not be empty".to_string());
-                }
-                config.env.insert(key.to_string(), val.to_string());
-            }
-            "--rows" => {
-                config.rows = value(args, &mut index, "--rows")?
-                    .parse()
-                    .map_err(|_| "invalid --rows".to_string())?;
-            }
-            "--cols" => {
-                config.cols = value(args, &mut index, "--cols")?
-                    .parse()
-                    .map_err(|_| "invalid --cols".to_string())?;
-            }
-            "--no-stdin" => config.no_stdin = true,
-            "-h" | "--help" => {
-                print_usage();
-                return Err("help requested".to_string());
-            }
-            unknown => return Err(format!("unknown payload-client option: {unknown}")),
+            config.env.insert(key.to_string(), val.to_string());
         }
-        index += 1;
     }
 
     if !config.ping && config.script.is_none() {
@@ -1364,6 +1519,28 @@ fn payload_client_config_from_args(args: &[String]) -> Result<PayloadClientConfi
     }
 
     Ok(config)
+}
+
+fn payload_client_clap_command() -> ClapCommand {
+    ClapCommand::new("payload-client")
+        .arg(Arg::new("host").long("host").value_name("HOST"))
+        .arg(Arg::new("port").long("port").value_name("PORT"))
+        .arg(Arg::new("ping").long("ping").action(ArgAction::SetTrue))
+        .arg(Arg::new("script").long("script").value_name("SCRIPT"))
+        .arg(Arg::new("cwd").long("cwd").value_name("PATH"))
+        .arg(
+            Arg::new("env")
+                .long("env")
+                .value_name("KEY=VALUE")
+                .action(ArgAction::Append),
+        )
+        .arg(Arg::new("rows").long("rows").value_name("N"))
+        .arg(Arg::new("cols").long("cols").value_name("N"))
+        .arg(
+            Arg::new("no_stdin")
+                .long("no-stdin")
+                .action(ArgAction::SetTrue),
+        )
 }
 
 fn payload_exit_status(exit_code: i32) -> i32 {
@@ -1529,53 +1706,45 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
 }
 
 fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String> {
+    let matches = parse_clap_matches(self_test_clap_command(), args)?;
     let mut config = SelfTestConfig {
-        project: env::current_dir().map_err(|error| error.to_string())?,
-        run_dir: PathBuf::from(".sandbox/docker-vm/self-test"),
-        artifact_manifest: PathBuf::from("docker/out/artifact-manifest.json"),
-        qemu: PathBuf::from("qemu-system-x86_64"),
-        image: "alpine:3.22".to_string(),
-        publish_payload_port: None,
-        no_net: false,
-        hostile: false,
-        tool: GuestTool::Codex,
-    };
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--project" => {
-                config.project = absolute_cli_path(&value(args, &mut index, "--project")?)?
-            }
-            "--run-dir" => config.run_dir = PathBuf::from(value(args, &mut index, "--run-dir")?),
-            "--artifact-manifest" => {
-                config.artifact_manifest =
-                    PathBuf::from(value(args, &mut index, "--artifact-manifest")?)
-            }
-            "--qemu" => config.qemu = PathBuf::from(value(args, &mut index, "--qemu")?),
-            "--image" => config.image = value(args, &mut index, "--image")?,
-            "--publish-payload-port" => {
-                config.publish_payload_port = Some(
-                    value(args, &mut index, "--publish-payload-port")?
-                        .parse()
-                        .map_err(|_| "invalid --publish-payload-port".to_string())?,
-                );
-            }
-            "--no-net" => config.no_net = true,
-            "--hostile" => config.hostile = true,
-            "--tool" => {
-                config.tool = value(args, &mut index, "--tool")?
+        project: matches
+            .get_one::<String>("project")
+            .map(|value| absolute_cli_path(value))
+            .transpose()?
+            .unwrap_or(env::current_dir().map_err(|error| error.to_string())?),
+        run_dir: matches
+            .get_one::<String>("run_dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(".sandbox/docker-vm/self-test")),
+        artifact_manifest: matches
+            .get_one::<String>("artifact_manifest")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("docker/out/artifact-manifest.json")),
+        qemu: matches
+            .get_one::<String>("qemu")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64")),
+        image: matches
+            .get_one::<String>("image")
+            .cloned()
+            .unwrap_or_else(|| "alpine:3.22".to_string()),
+        publish_payload_port: matches
+            .get_one::<String>("publish_payload_port")
+            .map(|value| {
+                value
                     .parse()
-                    .map_err(|error: String| error)?;
-            }
-            "-h" | "--help" => {
-                print_self_test_usage();
-                return Err("help requested".to_string());
-            }
-            unknown => return Err(format!("unknown self-test option: {unknown}")),
-        }
-        index += 1;
-    }
+                    .map_err(|_| "invalid --publish-payload-port".to_string())
+            })
+            .transpose()?,
+        no_net: matches.get_flag("no_net"),
+        hostile: matches.get_flag("hostile"),
+        tool: matches
+            .get_one::<String>("tool")
+            .map(|value| value.parse().map_err(|error: String| error))
+            .transpose()?
+            .unwrap_or(GuestTool::Codex),
+    };
 
     if !config.project.is_absolute() {
         config.project = absolute_cli_path(&config.project.display().to_string())?;
@@ -1589,6 +1758,31 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
             .join(&config.artifact_manifest);
     }
     Ok(config)
+}
+
+fn self_test_clap_command() -> ClapCommand {
+    ClapCommand::new("self-test")
+        .arg(Arg::new("project").long("project").value_name("PATH"))
+        .arg(Arg::new("run_dir").long("run-dir").value_name("PATH"))
+        .arg(
+            Arg::new("artifact_manifest")
+                .long("artifact-manifest")
+                .value_name("PATH"),
+        )
+        .arg(Arg::new("qemu").long("qemu").value_name("PATH"))
+        .arg(Arg::new("image").long("image").value_name("IMAGE"))
+        .arg(
+            Arg::new("publish_payload_port")
+                .long("publish-payload-port")
+                .value_name("PORT"),
+        )
+        .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("hostile")
+                .long("hostile")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::new("tool").long("tool").value_name("codex|copilot"))
 }
 
 fn self_test_payload_script(_config: &FrontendConfig, image: &str, hostile: bool) -> String {
@@ -1749,162 +1943,120 @@ fn hostile_self_test_payload_steps() -> Vec<String> {
 }
 
 fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyArgs), String> {
-    let mut project = PathBuf::from(".");
-    let mut run_dir = PathBuf::from(".sandbox/docker-vm/run");
-    let mut artifact_manifest = PathBuf::from("docker/out/artifact-manifest.json");
-    let mut qemu = PathBuf::from("qemu-system-x86_64");
+    let matches = parse_clap_matches(frontend_clap_command(), args)?;
+    let mut project = matches
+        .get_one::<String>("project")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut run_dir = matches
+        .get_one::<String>("run_dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".sandbox/docker-vm/run"));
+    let artifact_manifest = matches
+        .get_one::<String>("artifact_manifest")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("docker/out/artifact-manifest.json"));
+    let qemu = matches
+        .get_one::<String>("qemu")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64"));
     let mut policy = PolicyArgs::default();
-    let mut guest_http_smoke_url = None;
-
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--project" => project = PathBuf::from(value(args, &mut index, "--project")?),
-            "--run-dir" => run_dir = PathBuf::from(value(args, &mut index, "--run-dir")?),
-            "--artifact-manifest" => {
-                artifact_manifest = PathBuf::from(value(args, &mut index, "--artifact-manifest")?);
-            }
-            "--qemu" => qemu = PathBuf::from(value(args, &mut index, "--qemu")?),
-            "--tool" => {
-                policy.tool = Some(
-                    value(args, &mut index, "--tool")?
-                        .parse()
-                        .map_err(|error: String| error)?,
-                );
-            }
-            "--tool-state" => match value(args, &mut index, "--tool-state")?.as_str() {
-                "codex" => policy.tool_state.codex = true,
-                "pi" => policy.tool_state.pi = true,
-                value => return Err(format!("unknown --tool-state: {value}")),
-            },
-            "--tool-arg" => {
-                policy
-                    .tool_args
-                    .push(value(args, &mut index, "--tool-arg")?);
-            }
-            "--gh" => {
-                policy.gh = true;
-            }
-            "--aws" => {
-                policy.aws_profile = Some(value(args, &mut index, "--aws")?);
-            }
-            "--ro" => {
-                policy
-                    .extra_ro
-                    .push(absolute_cli_path(&value(args, &mut index, "--ro")?)?);
-            }
-            "--rw" => {
-                policy
-                    .extra_rw
-                    .push(absolute_cli_path(&value(args, &mut index, "--rw")?)?);
-            }
-            "--share-ro" | "--share-rw" => {
-                let flag = args[index].clone();
-                let readonly = flag == "--share-ro";
-                policy.extra_shares.push(parse_guest_path_share(
-                    &value(args, &mut index, &flag)?,
-                    readonly,
-                )?);
-            }
-            "--guest-http-smoke-url" => {
-                guest_http_smoke_url = Some(value(args, &mut index, "--guest-http-smoke-url")?);
-            }
-            "--allow-ip" => policy
-                .allow_ips
-                .push(value(args, &mut index, "--allow-ip")?),
-            "--allow-domain" => {
-                policy
-                    .allow_domains
-                    .push(value(args, &mut index, "--allow-domain")?)
-            }
-            "--allow-public-internet" => policy.allow_public = true,
-            "--no-net" => policy.no_net = true,
-            "--qemu-timeout-seconds" => {
-                let seconds = value(args, &mut index, "--qemu-timeout-seconds")?
-                    .parse::<u64>()
-                    .map_err(|_| "invalid --qemu-timeout-seconds".to_string())?;
-                policy.qemu_timeout = Some(Duration::from_secs(seconds));
-            }
-            "--local-http-smoke-upstream" => {
-                policy.local_http_smoke_upstream = Some(parse_ip_port(&value(
-                    args,
-                    &mut index,
-                    "--local-http-smoke-upstream",
-                )?)?);
-            }
-            "--host-docker-listener" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--host-docker-listener")?)?;
-                policy
-                    .host_listeners
-                    .push(HostListener::docker_api(host_port, guest_port));
-            }
-            "--host-payload-listener" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--host-payload-listener")?)?;
-                policy
-                    .host_listeners
-                    .push(HostListener::payload_control(host_port, guest_port));
-            }
-            "--publish" => {
-                let (host_port, guest_port) =
-                    parse_port_pair(&value(args, &mut index, "--publish")?)?;
-                policy
-                    .host_listeners
-                    .push(HostListener::published_tcp(host_port, guest_port));
-            }
-            "--pcap" => {
-                policy.pcap_path = Some(PathBuf::from(value(args, &mut index, "--pcap")?));
-            }
-            "--payload-script" => {
-                payload_launch_args(&mut policy).script =
-                    value(args, &mut index, "--payload-script")?;
-            }
-            "--payload-cwd" => {
-                payload_launch_args(&mut policy).cwd = value(args, &mut index, "--payload-cwd")?;
-            }
-            "--payload-env" => {
-                let env = value(args, &mut index, "--payload-env")?;
-                let (key, val) = env
-                    .split_once('=')
-                    .ok_or_else(|| "--payload-env must be KEY=VALUE".to_string())?;
-                if key.is_empty() {
-                    return Err("--payload-env key must not be empty".to_string());
-                }
-                payload_launch_args(&mut policy)
-                    .env
-                    .insert(key.to_string(), val.to_string());
-            }
-            "--payload-rows" => {
-                payload_launch_args(&mut policy).rows = value(args, &mut index, "--payload-rows")?
-                    .parse()
-                    .map_err(|_| "invalid --payload-rows".to_string())?;
-            }
-            "--payload-cols" => {
-                payload_launch_args(&mut policy).cols = value(args, &mut index, "--payload-cols")?
-                    .parse()
-                    .map_err(|_| "invalid --payload-cols".to_string())?;
-            }
-            "--payload-no-stdin" => {
-                payload_launch_args(&mut policy).no_stdin = true;
-            }
-            "--tls-ca-cert" => {
-                policy.tls_ca_cert = Some(PathBuf::from(value(args, &mut index, "--tls-ca-cert")?));
-            }
-            "--tls-ca-key" => {
-                policy.tls_ca_key = Some(PathBuf::from(value(args, &mut index, "--tls-ca-key")?));
-            }
-            "--tls-generate-per-host-certs" => {
-                policy.tls_generate_per_host_certs = true;
-            }
-            "-h" | "--help" => {
-                print_usage();
-                return Err("help requested".to_string());
-            }
-            unknown => return Err(format!("unknown frontend option: {unknown}")),
-        }
-        index += 1;
+    if let Some(tool) = matches.get_one::<String>("tool") {
+        policy.tool = Some(tool.parse().map_err(|error: String| error)?);
     }
+    for tool_state in append_many(&matches, "tool_state") {
+        match tool_state.as_str() {
+            "codex" => policy.tool_state.codex = true,
+            "pi" => policy.tool_state.pi = true,
+            value => return Err(format!("unknown --tool-state: {value}")),
+        }
+    }
+    policy.tool_args = append_many(&matches, "tool_arg");
+    policy.gh = matches.get_flag("gh");
+    policy.aws_profile = matches.get_one::<String>("aws").cloned();
+    for path in append_many(&matches, "ro") {
+        policy.extra_ro.push(absolute_cli_path(&path)?);
+    }
+    for path in append_many(&matches, "rw") {
+        policy.extra_rw.push(absolute_cli_path(&path)?);
+    }
+    for share in append_many(&matches, "share_ro") {
+        policy
+            .extra_shares
+            .push(parse_guest_path_share(&share, true)?);
+    }
+    for share in append_many(&matches, "share_rw") {
+        policy
+            .extra_shares
+            .push(parse_guest_path_share(&share, false)?);
+    }
+    let guest_http_smoke_url = matches.get_one::<String>("guest_http_smoke_url").cloned();
+    policy.allow_ips = append_many(&matches, "allow_ip");
+    policy.allow_domains = append_many(&matches, "allow_domain");
+    policy.allow_public = matches.get_flag("allow_public_internet");
+    policy.no_net = matches.get_flag("no_net");
+    if let Some(seconds) = matches.get_one::<String>("qemu_timeout_seconds") {
+        policy.qemu_timeout = Some(Duration::from_secs(
+            seconds
+                .parse::<u64>()
+                .map_err(|_| "invalid --qemu-timeout-seconds".to_string())?,
+        ));
+    }
+    if let Some(value) = matches.get_one::<String>("local_http_smoke_upstream") {
+        policy.local_http_smoke_upstream = Some(parse_ip_port(value)?);
+    }
+    for value in append_many(&matches, "host_docker_listener") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        policy
+            .host_listeners
+            .push(HostListener::docker_api(host_port, guest_port));
+    }
+    for value in append_many(&matches, "host_payload_listener") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        policy
+            .host_listeners
+            .push(HostListener::payload_control(host_port, guest_port));
+    }
+    for value in append_many(&matches, "publish") {
+        let (host_port, guest_port) = parse_port_pair(&value)?;
+        policy
+            .host_listeners
+            .push(HostListener::published_tcp(host_port, guest_port));
+    }
+    policy.pcap_path = matches.get_one::<String>("pcap").map(PathBuf::from);
+    if let Some(script) = matches.get_one::<String>("payload_script") {
+        payload_launch_args(&mut policy).script = script.clone();
+    }
+    if let Some(cwd) = matches.get_one::<String>("payload_cwd") {
+        payload_launch_args(&mut policy).cwd = cwd.clone();
+    }
+    for env in append_many(&matches, "payload_env") {
+        let (key, val) = env
+            .split_once('=')
+            .ok_or_else(|| "--payload-env must be KEY=VALUE".to_string())?;
+        if key.is_empty() {
+            return Err("--payload-env key must not be empty".to_string());
+        }
+        payload_launch_args(&mut policy)
+            .env
+            .insert(key.to_string(), val.to_string());
+    }
+    if let Some(rows) = matches.get_one::<String>("payload_rows") {
+        payload_launch_args(&mut policy).rows = rows
+            .parse()
+            .map_err(|_| "invalid --payload-rows".to_string())?;
+    }
+    if let Some(cols) = matches.get_one::<String>("payload_cols") {
+        payload_launch_args(&mut policy).cols = cols
+            .parse()
+            .map_err(|_| "invalid --payload-cols".to_string())?;
+    }
+    if matches.get_flag("payload_no_stdin") {
+        payload_launch_args(&mut policy).no_stdin = true;
+    }
+    policy.tls_ca_cert = matches.get_one::<String>("tls_ca_cert").map(PathBuf::from);
+    policy.tls_ca_key = matches.get_one::<String>("tls_ca_key").map(PathBuf::from);
+    policy.tls_generate_per_host_certs = matches.get_flag("tls_generate_per_host_certs");
 
     if !project.is_absolute() {
         project = absolute_cli_path(&project.display().to_string())?;
@@ -1938,6 +2090,152 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         return Err("--tool-arg requires --tool".to_string());
     }
     Ok((config, policy))
+}
+
+fn frontend_clap_command() -> ClapCommand {
+    ClapCommand::new("launch")
+        .arg(Arg::new("project").long("project").value_name("PATH"))
+        .arg(Arg::new("run_dir").long("run-dir").value_name("PATH"))
+        .arg(
+            Arg::new("artifact_manifest")
+                .long("artifact-manifest")
+                .value_name("PATH"),
+        )
+        .arg(Arg::new("qemu").long("qemu").value_name("PATH"))
+        .arg(Arg::new("tool").long("tool").value_name("codex|copilot"))
+        .arg(
+            Arg::new("tool_state")
+                .long("tool-state")
+                .value_name("codex|pi")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("tool_arg")
+                .long("tool-arg")
+                .value_name("ARG")
+                .action(ArgAction::Append)
+                .allow_hyphen_values(true),
+        )
+        .arg(Arg::new("gh").long("gh").action(ArgAction::SetTrue))
+        .arg(Arg::new("aws").long("aws").value_name("PROFILE"))
+        .arg(
+            Arg::new("ro")
+                .long("ro")
+                .value_name("PATH")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("rw")
+                .long("rw")
+                .value_name("PATH")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("share_ro")
+                .long("share-ro")
+                .value_name("HOST=GUEST[=required|optional]")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("share_rw")
+                .long("share-rw")
+                .value_name("HOST=GUEST[=required|optional]")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("guest_http_smoke_url")
+                .long("guest-http-smoke-url")
+                .value_name("URL"),
+        )
+        .arg(
+            Arg::new("allow_ip")
+                .long("allow-ip")
+                .value_name("IP_OR_CIDR")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("allow_domain")
+                .long("allow-domain")
+                .value_name("DOMAIN")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("allow_public_internet")
+                .long("allow-public-internet")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("qemu_timeout_seconds")
+                .long("qemu-timeout-seconds")
+                .value_name("N"),
+        )
+        .arg(
+            Arg::new("local_http_smoke_upstream")
+                .long("local-http-smoke-upstream")
+                .value_name("IP:PORT"),
+        )
+        .arg(
+            Arg::new("host_docker_listener")
+                .long("host-docker-listener")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("host_payload_listener")
+                .long("host-payload-listener")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("publish")
+                .long("publish")
+                .value_name("HOST:GUEST")
+                .action(ArgAction::Append),
+        )
+        .arg(Arg::new("pcap").long("pcap").value_name("PATH"))
+        .arg(
+            Arg::new("payload_script")
+                .long("payload-script")
+                .value_name("SCRIPT"),
+        )
+        .arg(
+            Arg::new("payload_cwd")
+                .long("payload-cwd")
+                .value_name("PATH"),
+        )
+        .arg(
+            Arg::new("payload_env")
+                .long("payload-env")
+                .value_name("KEY=VALUE")
+                .action(ArgAction::Append),
+        )
+        .arg(
+            Arg::new("payload_rows")
+                .long("payload-rows")
+                .value_name("N"),
+        )
+        .arg(
+            Arg::new("payload_cols")
+                .long("payload-cols")
+                .value_name("N"),
+        )
+        .arg(
+            Arg::new("payload_no_stdin")
+                .long("payload-no-stdin")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("tls_ca_cert")
+                .long("tls-ca-cert")
+                .value_name("PATH"),
+        )
+        .arg(Arg::new("tls_ca_key").long("tls-ca-key").value_name("PATH"))
+        .arg(
+            Arg::new("tls_generate_per_host_certs")
+                .long("tls-generate-per-host-certs")
+                .action(ArgAction::SetTrue),
+        )
 }
 
 fn payload_launch_args(policy: &mut PolicyArgs) -> &mut PayloadLaunchArgs {
@@ -2470,13 +2768,6 @@ fn validate_no_net_args(
         return Err("--no-net cannot be combined with --publish".to_string());
     }
     Ok(())
-}
-
-fn value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
-    *index += 1;
-    args.get(*index)
-        .cloned()
-        .ok_or_else(|| format!("{flag} requires a value"))
 }
 
 fn print_usage() {
