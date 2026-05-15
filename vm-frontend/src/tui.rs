@@ -17,8 +17,8 @@ use tui_term::widget::PseudoTerminal;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ConfigCommand, ConfigNetworkMode, ConfigPort, ConfigShare, ConfigShareAccess, ConfigToolState,
-    SetupTool, WrapperSandboxConfig,
+    ConfigCommand, ConfigNetworkMode, ConfigPort, ConfigShare, ConfigShareAccess, SetupTool,
+    WrapperSandboxConfig,
 };
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -208,27 +208,22 @@ impl ConfigEditor {
 
     fn cycle_default_command(&mut self) {
         match self.config.default_command.command.as_str() {
-            "codex" => {
-                self.config.setup_tool = Some(SetupTool::Pi);
-                self.config.default_command = ConfigCommand::new("pi");
-                self.config.tool_state = ConfigToolState {
-                    codex: false,
-                    pi: true,
-                };
-            }
+            "codex" => self.apply_setup_tool(SetupTool::Pi),
             "pi" => {
                 self.config.setup_tool = None;
                 self.config.default_command = ConfigCommand::new("bash");
-                self.config.tool_state = ConfigToolState::default();
+                self.config.shares.clear();
             }
-            _ => {
-                self.config.setup_tool = Some(SetupTool::Codex);
-                self.config.default_command = ConfigCommand::new("codex");
-                self.config.tool_state = ConfigToolState {
-                    codex: true,
-                    pi: false,
-                };
-            }
+            _ => self.apply_setup_tool(SetupTool::Codex),
+        }
+    }
+
+    fn apply_setup_tool(&mut self, tool: SetupTool) {
+        if let Ok(mut config) = WrapperSandboxConfig::setup_tool(tool) {
+            config.network = self.config.network.clone();
+            config.auth = self.config.auth.clone();
+            config.published_ports = self.config.published_ports.clone();
+            self.config = config;
         }
     }
 
@@ -964,7 +959,9 @@ mod tests {
 
     #[test]
     fn config_editor_model_edits_main_config_fields_before_save() {
-        let mut editor = ConfigEditor::new(WrapperSandboxConfig::setup_tool(SetupTool::Codex));
+        let mut editor = ConfigEditor::new(
+            WrapperSandboxConfig::setup_tool(SetupTool::Codex).expect("setup config"),
+        );
 
         assert_eq!(
             editor.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
@@ -972,7 +969,9 @@ mod tests {
         );
         assert_eq!(editor.config.setup_tool, Some(SetupTool::Pi));
         assert_eq!(editor.config.default_command.command, "pi");
-        assert!(editor.config.tool_state.pi);
+        let pi_share = editor.config.shares.first().expect("pi share");
+        assert!(pi_share.host_path.ends_with("/.pi"));
+        assert_eq!(pi_share.access, ConfigShareAccess::Rw);
 
         assert_eq!(
             editor.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
@@ -999,7 +998,7 @@ mod tests {
             editor.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
             ConfigEditorResult::Redraw
         );
-        assert_eq!(editor.config.shares.len(), 1);
+        assert_eq!(editor.config.shares.len(), 2);
 
         assert_eq!(
             editor.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
@@ -1015,7 +1014,9 @@ mod tests {
 
     #[test]
     fn config_editor_renders_fixed_size_summary_without_overlap() {
-        let mut editor = ConfigEditor::new(WrapperSandboxConfig::setup_tool(SetupTool::Codex));
+        let mut editor = ConfigEditor::new(
+            WrapperSandboxConfig::setup_tool(SetupTool::Codex).expect("setup config"),
+        );
         editor.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         editor.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         editor.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
@@ -1033,7 +1034,7 @@ mod tests {
             assert!(text.contains("Default: pi"), "{width}x{height}\n{text}");
             assert!(text.contains("Network: none"), "{width}x{height}\n{text}");
             assert!(text.contains("GitHub auth: on"), "{width}x{height}\n{text}");
-            assert!(text.contains("Shares: 1"), "{width}x{height}\n{text}");
+            assert!(text.contains("Shares: 2"), "{width}x{height}\n{text}");
             assert!(
                 text.contains("Published ports: 1"),
                 "{width}x{height}\n{text}"

@@ -126,17 +126,18 @@ Required/default guest shares:
 - `/workspace` is a compatibility alias for the project path.
 - Guest `$HOME` is the host user's natural home path inside the VM and lives on
   the persistent root overlay unless a more specific configured share covers it.
-- Selected tool state is shared deliberately, not by mounting broad host `$HOME`.
-- Enabling Codex in the wrapper/TUI setup exposes Codex state, currently
-  `~/.codex`, as writable tool state at the same absolute path in the guest.
-- Enabling the Pi setup recipe exposes Pi state, currently `~/.pi`, as writable
-  tool state at the same absolute path in the guest.
+- Selected tool state is shared deliberately through explicit recipe/config
+  shares, not by mounting broad host `$HOME`.
+- Enabling Codex in the wrapper/TUI setup writes an explicit optional writable
+  `~/.codex` share, including project-local shadows for volatile children.
+- Enabling the Pi setup recipe writes an explicit optional writable `~/.pi`
+  share.
 - `~/.docker` is shared as writable tool state when present.
 - `--gh` shares `~/.config/gh` read-only and forwards `GH_TOKEN` when available.
 - `--ro PATH` exposes a required read-only host path at the same guest path.
 - `--rw PATH` exposes a required read-write host path at the same guest path.
-- Configured read-write shares may declare `shadows`: guest-relative child
-  paths that are backed by project-local `.sandbox/share-shadows/` state
+- Configured shares may declare `shadows`: guest-relative child paths that are
+  backed by read-write project-local `.sandbox/root/<full guest path>` state
   instead of the corresponding child path under the host share. This is a
   generic mount composition feature for volatile subtrees; it is not tied to a
   specific tool.

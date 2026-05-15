@@ -23,9 +23,7 @@ use agentvm_frontend::payload_client::{
     ping_payload, run_payload_tcp_with_control, socket_addr, terminal_size, PayloadControlOptions,
     PayloadRequest,
 };
-use agentvm_frontend::runtime_manifest::{
-    guest_runtime_mounts, GuestShareSpec, RuntimeMount, ToolStateMounts,
-};
+use agentvm_frontend::runtime_manifest::{guest_runtime_mounts, GuestShareSpec, RuntimeMount};
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
 use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
@@ -276,12 +274,14 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
     if let Some(setup_tool) = wrapper.setup_tool {
         write_wrapper_sandbox_config(
             &wrapper.project,
-            &WrapperSandboxConfig::setup_tool(setup_tool),
+            &WrapperSandboxConfig::setup_tool(setup_tool)?,
         )?;
     }
     if wrapper.edit_config {
-        let config = read_wrapper_sandbox_config(&wrapper.project)?
-            .unwrap_or_else(WrapperSandboxConfig::codex_default);
+        let config = match read_wrapper_sandbox_config(&wrapper.project)? {
+            Some(config) => config,
+            None => WrapperSandboxConfig::codex_default()?,
+        };
         let edited = tui::run_config_editor(config).map_err(|error| error.to_string())?;
         write_wrapper_sandbox_config(&wrapper.project, &edited)?;
         return Ok(());
@@ -306,7 +306,7 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
     if needs_startup_dialog {
         let selection = tui::run_startup_dialog().map_err(|error| error.to_string())?;
         if selection.enable_codex {
-            let config = WrapperSandboxConfig::codex_default();
+            let config = WrapperSandboxConfig::codex_default()?;
             write_wrapper_sandbox_config(&project, &config)?;
             apply_configured_launch_defaults(&mut launch_args, &config, &project, false, false)?;
             apply_configured_default_command(&mut launch_args, &config);
@@ -435,17 +435,19 @@ impl SetupTool {
         }
     }
 
-    fn tool_state(self) -> ConfigToolState {
-        match self {
-            Self::Codex => ConfigToolState {
-                codex: true,
-                pi: false,
-            },
-            Self::Pi => ConfigToolState {
-                codex: false,
-                pi: true,
-            },
-        }
+    fn config_shares(self, host_home: &Path) -> Vec<ConfigShare> {
+        let (dir, shadows) = match self {
+            Self::Codex => (".codex", vec!["tmp".to_string()]),
+            Self::Pi => (".pi", Vec::new()),
+        };
+        let path = host_home.join(dir).display().to_string();
+        vec![ConfigShare {
+            host_path: path.clone(),
+            guest_path: Some(path),
+            access: ConfigShareAccess::Rw,
+            required: false,
+            shadows,
+        }]
     }
 }
 
@@ -538,12 +540,7 @@ struct ConfigShare {
     #[serde(default = "default_required_share")]
     required: bool,
     #[serde(default)]
-    shadows: Vec<ConfigShareShadow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ConfigShareShadow {
-    path: String,
+    shadows: Vec<String>,
 }
 
 fn default_required_share() -> bool {
@@ -583,23 +580,6 @@ struct ConfigPort {
     guest: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-struct ConfigToolState {
-    #[serde(default)]
-    codex: bool,
-    #[serde(default)]
-    pi: bool,
-}
-
-impl From<ConfigToolState> for ToolStateMounts {
-    fn from(value: ConfigToolState) -> Self {
-        Self {
-            codex: value.codex,
-            pi: value.pi,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WrapperSandboxConfig {
     schema_version: u32,
@@ -607,8 +587,6 @@ struct WrapperSandboxConfig {
     setup_tool: Option<SetupTool>,
     #[serde(default)]
     default_command: ConfigCommand,
-    #[serde(default)]
-    tool_state: ConfigToolState,
     #[serde(default)]
     network: ConfigNetwork,
     #[serde(default)]
@@ -620,20 +598,20 @@ struct WrapperSandboxConfig {
 }
 
 impl WrapperSandboxConfig {
-    fn setup_tool(tool: SetupTool) -> Self {
-        Self {
+    fn setup_tool(tool: SetupTool) -> Result<Self, String> {
+        let host_home = host_home_dir()?;
+        Ok(Self {
             schema_version: 2,
             setup_tool: Some(tool),
             default_command: tool.default_command(),
-            tool_state: tool.tool_state(),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
-            shares: Vec::new(),
+            shares: tool.config_shares(&host_home),
             published_ports: Vec::new(),
-        }
+        })
     }
 
-    fn codex_default() -> Self {
+    fn codex_default() -> Result<Self, String> {
         Self::setup_tool(SetupTool::Codex)
     }
 
@@ -652,16 +630,13 @@ impl WrapperSandboxConfig {
             if share.guest_path.as_deref().is_some_and(str::is_empty) {
                 return Err("sandbox config share guest_path must not be empty".to_string());
             }
-            if !share.shadows.is_empty() && share.access != ConfigShareAccess::Rw {
-                return Err("sandbox config share shadows require rw access".to_string());
-            }
             let mut shadow_paths = BTreeSet::new();
             for shadow in &share.shadows {
-                let path = validate_share_shadow_path(&shadow.path)?;
+                let path = validate_share_shadow_path(shadow)?;
                 if !shadow_paths.insert(path) {
                     return Err(format!(
                         "duplicate sandbox config share shadow path: {}",
-                        shadow.path
+                        shadow
                     ));
                 }
             }
@@ -724,13 +699,12 @@ fn parse_legacy_wrapper_sandbox_config(
         .unwrap_or("codex")
         .to_string();
     let mut config = if codex_enabled {
-        WrapperSandboxConfig::codex_default()
+        WrapperSandboxConfig::codex_default()?
     } else {
         WrapperSandboxConfig {
             schema_version: 2,
             setup_tool: None,
             default_command: ConfigCommand::new(command.clone()),
-            tool_state: ConfigToolState::default(),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
             shares: Vec::new(),
@@ -938,7 +912,7 @@ fn parse_wrapper_args_with_terminal(
     }
     let ui_mode = wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty);
     let sandbox_config = if let Some(setup_tool) = setup_tool {
-        Some(WrapperSandboxConfig::setup_tool(setup_tool))
+        Some(WrapperSandboxConfig::setup_tool(setup_tool)?)
     } else {
         read_wrapper_sandbox_config(&project)?
     };
@@ -1091,14 +1065,6 @@ fn apply_configured_launch_defaults(
     saw_network_override: bool,
     cli_no_net: bool,
 ) -> Result<(), String> {
-    if !launch_args.iter().any(|arg| arg == "--tool-state") {
-        if config.tool_state.codex {
-            launch_args.extend(["--tool-state".to_string(), "codex".to_string()]);
-        }
-        if config.tool_state.pi {
-            launch_args.extend(["--tool-state".to_string(), "pi".to_string()]);
-        }
-    }
     if !saw_network_override {
         match config.network.mode {
             ConfigNetworkMode::Public => {
@@ -1128,7 +1094,7 @@ fn apply_configured_launch_defaults(
             launch_args.extend(["--aws".to_string(), profile.clone()]);
         }
     }
-    for (share_index, share) in config.shares.iter().enumerate() {
+    for share in &config.shares {
         let host = absolute_cli_path(&share.host_path)?;
         let guest = share
             .guest_path
@@ -1150,8 +1116,9 @@ fn apply_configured_launch_defaults(
             format!("{}={}={required}", host.display(), guest.display()),
         ]);
         for shadow in &share.shadows {
-            let relative_path = validate_share_shadow_path(&shadow.path)?;
-            let backing = config_share_shadow_backing_path(project, share_index, &relative_path);
+            let relative_path = validate_share_shadow_path(shadow)?;
+            let shadow_guest_path = guest.join(&relative_path);
+            let backing = config_share_shadow_backing_path(project, &shadow_guest_path)?;
             launch_args.extend([
                 "--share-shadow".to_string(),
                 format!(
@@ -1175,15 +1142,21 @@ fn apply_configured_launch_defaults(
     Ok(())
 }
 
-fn config_share_shadow_backing_path(
-    project: &Path,
-    share_index: usize,
-    relative_path: &Path,
-) -> PathBuf {
-    project
-        .join(".sandbox/share-shadows")
-        .join(format!("share-{share_index:04}"))
-        .join(relative_path)
+fn config_share_shadow_backing_path(project: &Path, guest_path: &Path) -> Result<PathBuf, String> {
+    if !guest_path.is_absolute() {
+        return Err("share shadow guest path must be absolute".to_string());
+    }
+    let mut backing = project.join(".sandbox/root");
+    for component in guest_path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => backing.push(part),
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err("share shadow guest path must stay under guest root".to_string());
+            }
+        }
+    }
+    Ok(backing)
 }
 
 fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
@@ -1607,7 +1580,6 @@ struct PolicyArgs {
     tls_generate_per_host_certs: bool,
     pcap_path: Option<PathBuf>,
     payload: Option<PayloadLaunchArgs>,
-    tool_state: ToolStateMounts,
     gh: bool,
     aws_profile: Option<String>,
     extra_ro: Vec<PathBuf>,
@@ -2482,13 +2454,6 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64"));
     let mut policy = PolicyArgs::default();
-    for tool_state in append_many(&matches, "tool_state") {
-        match tool_state.as_str() {
-            "codex" => policy.tool_state.codex = true,
-            "pi" => policy.tool_state.pi = true,
-            value => return Err(format!("unknown --tool-state: {value}")),
-        }
-    }
     policy.gh = matches.get_flag("gh");
     policy.aws_profile = matches.get_one::<String>("aws").cloned();
     for path in append_many(&matches, "ro") {
@@ -2621,12 +2586,6 @@ fn frontend_clap_command() -> ClapCommand {
                 .value_name("PATH"),
         )
         .arg(Arg::new("qemu").long("qemu").value_name("PATH"))
-        .arg(
-            Arg::new("tool_state")
-                .long("tool-state")
-                .value_name("codex|pi")
-                .action(ArgAction::Append),
-        )
         .arg(Arg::new("gh").long("gh").action(ArgAction::SetTrue))
         .arg(Arg::new("aws").long("aws").value_name("PROFILE"))
         .arg(
@@ -2783,7 +2742,6 @@ fn runtime_mounts(
     let mut mounts = guest_runtime_mounts(
         config.project.clone(),
         &GuestShareSpec {
-            tool_state: policy.tool_state,
             host_home,
             gh: policy.gh,
             extra_ro: policy.extra_ro.clone(),
@@ -2811,10 +2769,10 @@ fn runtime_mounts(
         let parent = policy
             .extra_shares
             .iter()
-            .find(|share| !share.readonly && share.guest_path == shadow.parent_guest_path)
+            .find(|share| share.guest_path == shadow.parent_guest_path)
             .ok_or_else(|| {
                 format!(
-                    "share shadow parent must match a configured rw share: {}",
+                    "share shadow parent must match a configured share: {}",
                     shadow.parent_guest_path.display()
                 )
             })?;
@@ -2846,8 +2804,8 @@ fn runtime_mounts(
 }
 
 fn shadow_backing_is_project_local(config: &FrontendConfig, backing_path: &Path) -> bool {
-    let sandbox = config.project.join(".sandbox");
-    backing_path == sandbox || backing_path.starts_with(&sandbox)
+    let root = config.project.join(".sandbox/root");
+    backing_path == root || backing_path.starts_with(&root)
 }
 
 fn guest_payload_env(
@@ -3625,8 +3583,6 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool-state".to_string(),
-            "codex".to_string(),
             "--payload-script".to_string(),
             "exec codex --model gpt-5".to_string(),
             "--gh".to_string(),
@@ -3640,7 +3596,6 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.project, root.join("repo"));
-        assert!(policy.tool_state.codex);
         assert!(policy.gh);
         assert_eq!(policy.aws_profile.as_deref(), Some("dev"));
         assert_eq!(policy.extra_ro, vec![ro]);
@@ -3835,8 +3790,11 @@ mod tests {
     fn wrapper_selects_tui_for_interactive_terminals_by_default() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
             &["--project".to_string(), project.display().to_string()],
@@ -3852,8 +3810,11 @@ mod tests {
     fn wrapper_no_tui_selects_plain_mode() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
             &[
@@ -3874,8 +3835,11 @@ mod tests {
     fn wrapper_non_tty_selects_plain_mode() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
         let stdin_plain = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
             &["--project".to_string(), project.display().to_string()],
@@ -3918,8 +3882,11 @@ mod tests {
     fn configured_codex_project_skips_startup_dialog() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
 
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
@@ -3938,10 +3905,11 @@ mod tests {
 
         assert_eq!(args.ui_mode, WrapperUiMode::Tui);
         assert!(args.tool_selected);
-        assert!(args
-            .launch_args
-            .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+        let host_home = host_home_dir().expect("host home");
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-rw"
+                && window[1].contains(&host_home.join(".codex").display().to_string())
+        }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
                 && window[1].contains("@openai/codex@latest")
@@ -3969,10 +3937,11 @@ mod tests {
 
         assert_eq!(args.setup_tool, Some(SetupTool::Pi));
         assert!(args.tool_selected);
-        assert!(args
-            .launch_args
-            .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "pi"));
+        let host_home = host_home_dir().expect("host home");
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-rw"
+                && window[1].contains(&host_home.join(".pi").display().to_string())
+        }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
                 && window[1].contains("@mariozechner/pi-coding-agent@latest")
@@ -4036,7 +4005,7 @@ mod tests {
     fn setup_tool_config_writes_are_idempotent() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        let config = WrapperSandboxConfig::setup_tool(SetupTool::Codex);
+        let config = WrapperSandboxConfig::setup_tool(SetupTool::Codex).expect("setup tool");
 
         write_wrapper_sandbox_config(&project, &config).expect("first write");
         let first = std::fs::read_to_string(wrapper_sandbox_config_path(&project)).expect("first");
@@ -4051,8 +4020,11 @@ mod tests {
     fn post_separator_overrides_configured_command_for_one_launch() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
 
         let args = parse_wrapper_args_with_terminal(
             "agentvm",
@@ -4078,10 +4050,6 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
-        assert!(args
-            .launch_args
-            .windows(2)
             .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
     }
 
@@ -4097,10 +4065,6 @@ mod tests {
                 schema_version: 2,
                 setup_tool: None,
                 default_command: ConfigCommand::new("bash"),
-                tool_state: ConfigToolState {
-                    codex: true,
-                    pi: false,
-                },
                 network: ConfigNetwork {
                     mode: ConfigNetworkMode::Allowlist,
                     allowed_domains: vec!["example.com".to_string()],
@@ -4141,10 +4105,6 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
-        assert!(args
-            .launch_args
-            .windows(2)
             .any(|window| window[0] == "--allow-domain" && window[1] == "example.com"));
         assert!(args
             .launch_args
@@ -4180,7 +4140,6 @@ mod tests {
                 schema_version: 2,
                 setup_tool: None,
                 default_command: ConfigCommand::new("bash"),
-                tool_state: ConfigToolState::default(),
                 network: ConfigNetwork::default(),
                 auth: ConfigAuth::default(),
                 shares: vec![ConfigShare {
@@ -4188,9 +4147,7 @@ mod tests {
                     guest_path: Some("/home/test/.codex".to_string()),
                     access: ConfigShareAccess::Rw,
                     required: true,
-                    shadows: vec![ConfigShareShadow {
-                        path: "tmp/arg0".to_string(),
-                    }],
+                    shadows: vec!["tmp/arg0".to_string()],
                 }],
                 published_ports: Vec::new(),
             },
@@ -4219,12 +4176,12 @@ mod tests {
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--share-shadow"
                 && window[1].contains("/home/test/.codex=tmp/arg0=")
-                && window[1].contains(".sandbox/share-shadows/share-0000/tmp/arg0")
+                && window[1].contains(".sandbox/root/home/test/.codex/tmp/arg0")
         }));
 
         let (frontend, policy) = frontend_config_from_args(&args.launch_args).expect("frontend");
         let mounts = runtime_mounts(&frontend, &policy).expect("mounts");
-        let shadow_backing = project.join(".sandbox/share-shadows/share-0000/tmp/arg0");
+        let shadow_backing = project.join(".sandbox/root/home/test/.codex/tmp/arg0");
         assert!(shadow_backing.is_dir());
         let parent_index = mounts
             .iter()
@@ -4240,12 +4197,75 @@ mod tests {
     }
 
     #[test]
-    fn config_share_shadow_validation_rejects_readonly_and_escaping_paths() {
+    fn config_share_shadow_allows_readonly_parent_with_writable_shadow() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let share = root.join("host-readonly");
+        std::fs::create_dir_all(&share).expect("share");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig {
+                schema_version: 2,
+                setup_tool: None,
+                default_command: ConfigCommand::new("bash"),
+                network: ConfigNetwork::default(),
+                auth: ConfigAuth::default(),
+                shares: vec![ConfigShare {
+                    host_path: share.display().to_string(),
+                    guest_path: Some("/mnt/share".to_string()),
+                    access: ConfigShareAccess::Ro,
+                    required: true,
+                    shadows: vec!["cache".to_string()],
+                }],
+                published_ports: Vec::new(),
+            },
+        )
+        .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--artifact-manifest".to_string(),
+                root.join("docker/out/artifact-manifest.json")
+                    .display()
+                    .to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-ro" && window[1].ends_with("=/mnt/share=required")
+        }));
+        let (frontend, policy) = frontend_config_from_args(&args.launch_args).expect("frontend");
+        let mounts = runtime_mounts(&frontend, &policy).expect("mounts");
+        let parent_index = mounts
+            .iter()
+            .position(|mount| mount.guest_path == PathBuf::from("/mnt/share"))
+            .expect("parent mount");
+        let shadow_index = mounts
+            .iter()
+            .position(|mount| mount.guest_path == PathBuf::from("/mnt/share/cache"))
+            .expect("shadow mount");
+        assert!(parent_index < shadow_index);
+        assert!(mounts[parent_index].readonly);
+        assert!(!mounts[shadow_index].readonly);
+        assert_eq!(
+            mounts[shadow_index].host_path,
+            project.join(".sandbox/root/mnt/share/cache")
+        );
+    }
+
+    #[test]
+    fn config_share_shadow_validation_accepts_readonly_and_rejects_escaping_paths() {
         let readonly_shadow = WrapperSandboxConfig {
             schema_version: 2,
             setup_tool: None,
             default_command: ConfigCommand::new("bash"),
-            tool_state: ConfigToolState::default(),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
             shares: vec![ConfigShare {
@@ -4253,23 +4273,16 @@ mod tests {
                 guest_path: Some("/tmp/guest".to_string()),
                 access: ConfigShareAccess::Ro,
                 required: true,
-                shadows: vec![ConfigShareShadow {
-                    path: "tmp".to_string(),
-                }],
+                shadows: vec!["tmp".to_string()],
             }],
             published_ports: Vec::new(),
         };
-        assert_eq!(
-            readonly_shadow.validate().expect_err("readonly shadow"),
-            "sandbox config share shadows require rw access"
-        );
+        readonly_shadow.validate().expect("readonly parent shadow");
 
         let escaping_shadow = WrapperSandboxConfig {
             shares: vec![ConfigShare {
                 access: ConfigShareAccess::Rw,
-                shadows: vec![ConfigShareShadow {
-                    path: "../tmp".to_string(),
-                }],
+                shadows: vec!["../tmp".to_string()],
                 ..readonly_shadow.shares[0].clone()
             }],
             ..readonly_shadow
@@ -4278,6 +4291,50 @@ mod tests {
             escaping_shadow.validate().expect_err("escaping shadow"),
             "share shadow path must stay under the parent share"
         );
+
+        let duplicate_shadow = WrapperSandboxConfig {
+            shares: vec![ConfigShare {
+                access: ConfigShareAccess::Rw,
+                shadows: vec!["tmp".to_string(), "./tmp".to_string()],
+                ..escaping_shadow.shares[0].clone()
+            }],
+            ..escaping_shadow
+        };
+        assert_eq!(
+            duplicate_shadow.validate().expect_err("duplicate shadow"),
+            "duplicate sandbox config share shadow path: ./tmp"
+        );
+    }
+
+    #[test]
+    fn config_share_shadow_json_uses_string_array_not_objects() {
+        let config: WrapperSandboxConfig = serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "default_command": { "command": "bash", "args": [] },
+                "shares": [{
+                    "host_path": "/tmp/host",
+                    "guest_path": "/tmp/guest",
+                    "access": "rw",
+                    "shadows": ["tmp"]
+                }]
+            }"#,
+        )
+        .expect("string shadows");
+        assert_eq!(config.shares[0].shadows, vec!["tmp".to_string()]);
+
+        let object_form = r#"{
+            "schema_version": 2,
+            "default_command": { "command": "bash", "args": [] },
+            "shares": [{
+                "host_path": "/tmp/host",
+                "guest_path": "/tmp/guest",
+                "access": "rw",
+                "shadows": [{ "path": "tmp" }]
+            }]
+        }"#;
+        serde_json::from_str::<WrapperSandboxConfig>(object_form)
+            .expect_err("object-form shadows are obsolete");
     }
 
     #[test]
@@ -4340,10 +4397,11 @@ mod tests {
         .expect("legacy wrapper");
 
         assert!(args.tool_selected);
-        assert!(args
-            .launch_args
-            .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+        let host_home = host_home_dir().expect("host home");
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-rw"
+                && window[1].contains(&host_home.join(".codex").display().to_string())
+        }));
         assert!(args.launch_args.contains(&"--payload-script".to_string()));
     }
 
@@ -4366,7 +4424,8 @@ mod tests {
         .expect("wrapper");
         write_wrapper_sandbox_config(
             &args.project,
-            &WrapperSandboxConfig::setup_tool(args.setup_tool.expect("setup tool")),
+            &WrapperSandboxConfig::setup_tool(args.setup_tool.expect("setup tool"))
+                .expect("setup config"),
         )
         .expect("write config");
 
@@ -4375,12 +4434,28 @@ mod tests {
         assert_eq!(value["schema_version"], 2);
         assert_eq!(value["setup_tool"], "codex");
         assert_eq!(value["default_command"]["command"], "codex");
-        assert_eq!(value["tool_state"]["codex"], true);
+        assert!(value.get("tool_state").is_none());
         assert_eq!(value["network"]["mode"], "public");
+        let host_home = host_home_dir().expect("host home");
+        assert_eq!(
+            value["shares"][0]["host_path"],
+            host_home.join(".codex").display().to_string()
+        );
+        assert_eq!(
+            value["shares"][0]["guest_path"],
+            host_home.join(".codex").display().to_string()
+        );
+        assert_eq!(value["shares"][0]["access"], "rw");
+        assert_eq!(value["shares"][0]["required"], false);
+        assert_eq!(value["shares"][0]["shadows"], serde_json::json!(["tmp"]));
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-rw"
+                && window[1].contains(&host_home.join(".codex").display().to_string())
+        }));
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+            .any(|window| window[0] == "--share-shadow" && window[1].contains(".codex=tmp=")));
     }
 
     #[test]
@@ -4418,7 +4493,7 @@ mod tests {
     fn cli_network_overrides_take_precedence_over_config_no_net() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        let mut config = WrapperSandboxConfig::codex_default();
+        let mut config = WrapperSandboxConfig::codex_default().expect("codex default");
         config.network.mode = ConfigNetworkMode::None;
         config.published_ports.push(ConfigPort {
             host: 18080,
@@ -4470,8 +4545,11 @@ mod tests {
     fn agentvm_argv0_uses_wrapper_without_wrap_subcommand() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
 
         let args = parse_wrapper_args_with_terminal(
             "agentvm",
@@ -4486,18 +4564,17 @@ mod tests {
         .expect("wrapper");
 
         assert!(args.tool_selected);
-        assert!(args
-            .launch_args
-            .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
     }
 
     #[test]
     fn wrapper_command_override_runs_payload_script_and_keeps_configured_codex_state() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
-            .expect("sandbox config");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig::codex_default().expect("codex default"),
+        )
+        .expect("sandbox config");
 
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
@@ -4524,10 +4601,6 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
-        assert!(args
-            .launch_args
-            .windows(2)
             .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
     }
 
@@ -4544,7 +4617,6 @@ mod tests {
                     command: "bash".to_string(),
                     args: vec!["-l".to_string()],
                 },
-                tool_state: ConfigToolState::default(),
                 network: ConfigNetwork::default(),
                 auth: ConfigAuth::default(),
                 shares: Vec::new(),

@@ -7,9 +7,6 @@ use serde::Serialize;
 
 use crate::{FrontendConfig, COMPOSED_FS_MOUNTPOINT};
 
-pub const CODEX_TOOL_STATE_DIRS: &[&str] = &[".codex"];
-pub const PI_TOOL_STATE_DIRS: &[&str] = &[".pi"];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ManifestSourceClass {
@@ -47,31 +44,8 @@ impl RuntimeMount {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ToolStateMounts {
-    pub codex: bool,
-    pub pi: bool,
-}
-
-impl ToolStateMounts {
-    pub fn codex() -> Self {
-        Self {
-            codex: true,
-            pi: false,
-        }
-    }
-
-    pub fn union(self, other: Self) -> Self {
-        Self {
-            codex: self.codex || other.codex,
-            pi: self.pi || other.pi,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestShareSpec {
-    pub tool_state: ToolStateMounts,
     pub host_home: PathBuf,
     pub gh: bool,
     pub extra_ro: Vec<PathBuf>,
@@ -81,7 +55,6 @@ pub struct GuestShareSpec {
 impl GuestShareSpec {
     pub fn minimal(host_home: impl Into<PathBuf>) -> Self {
         Self {
-            tool_state: ToolStateMounts::default(),
             host_home: host_home.into(),
             gh: false,
             extra_ro: Vec::new(),
@@ -164,32 +137,6 @@ pub fn guest_runtime_mounts(
     let mut mounts = vec![RuntimeMount::workspace(project)];
     let mut next_id = 2;
 
-    if spec.tool_state.codex {
-        for rel_dir in CODEX_TOOL_STATE_DIRS {
-            mounts.push(home_mount(
-                next_id,
-                &spec.host_home,
-                &guest_home,
-                rel_dir,
-                false,
-                ManifestSourceClass::ToolState,
-            ));
-            next_id += 1;
-        }
-    }
-    if spec.tool_state.pi {
-        for rel_dir in PI_TOOL_STATE_DIRS {
-            mounts.push(home_mount(
-                next_id,
-                &spec.host_home,
-                &guest_home,
-                rel_dir,
-                false,
-                ManifestSourceClass::ToolState,
-            ));
-            next_id += 1;
-        }
-    }
     mounts.push(home_mount(
         next_id,
         &spec.host_home,
@@ -637,7 +584,6 @@ mod tests {
         let extra_ro = root.join("extra-ro");
         let extra_rw = root.join("extra-rw");
         fs::create_dir_all(&project).expect("repo");
-        fs::create_dir_all(home.join(".codex")).expect("codex");
         fs::create_dir_all(home.join(".docker")).expect("docker");
         fs::create_dir_all(home.join(".config/gh")).expect("gh");
         fs::create_dir_all(&extra_ro).expect("extra ro");
@@ -646,7 +592,6 @@ mod tests {
         let mounts = guest_runtime_mounts(
             project.clone(),
             &GuestShareSpec {
-                tool_state: ToolStateMounts::codex(),
                 host_home: home.clone(),
                 gh: true,
                 extra_ro: vec![extra_ro.clone()],
@@ -661,7 +606,6 @@ mod tests {
         assert!(host_manifest.contains("\"guest_path\": \""));
         assert!(!host_manifest.contains("\"source_class\": \"persistent-home\""));
         assert!(!host_manifest.contains(&project.join(".sandbox/home").display().to_string()));
-        assert!(host_manifest.contains(&home.join(".codex").display().to_string()));
         assert!(host_manifest.contains(&home.join(".docker").display().to_string()));
         assert!(host_manifest.contains(&home.join(".config/gh").display().to_string()));
         assert!(host_manifest.contains("\"source_class\": \"tool-state\""));
@@ -670,32 +614,6 @@ mod tests {
         assert!(host_manifest.contains("\"source_class\": \"user-rw\""));
         assert!(host_manifest.contains(&extra_ro.display().to_string()));
         assert!(host_manifest.contains(&extra_rw.display().to_string()));
-    }
-
-    #[test]
-    fn codex_tool_state_mounts_do_not_require_tool_selection() {
-        let root = unique_temp_dir();
-        let project = root.join("repo");
-        let home = root.join("host-home");
-        fs::create_dir_all(&project).expect("repo");
-        fs::create_dir_all(home.join(".codex")).expect("codex");
-        let mounts = guest_runtime_mounts(
-            project.clone(),
-            &GuestShareSpec {
-                tool_state: ToolStateMounts::codex(),
-                host_home: home.clone(),
-                gh: false,
-                extra_ro: Vec::new(),
-                extra_rw: Vec::new(),
-            },
-        );
-
-        assert!(mounts.iter().any(|mount| {
-            mount.host_path == home.join(".codex")
-                && mount.guest_path == home.join(".codex")
-                && !mount.readonly
-                && mount.source_class == ManifestSourceClass::ToolState
-        }));
     }
 
     #[test]

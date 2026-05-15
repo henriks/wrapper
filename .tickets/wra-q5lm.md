@@ -1,6 +1,6 @@
 ---
 id: wra-q5lm
-status: open
+status: closed
 deps: [wra-ieju]
 links: []
 created: 2026-05-15T19:43:27Z
@@ -24,3 +24,9 @@ First document the actual current model and intended target: immutable rootfs pl
 
 There is a documented decision on whether .sandbox/home remains, moves to a generic .sandbox/root/home/<user> backing, becomes an explicit recipe/config share, or is removed in favor of a persistent root overlay. Follow-up implementation tickets are created if needed. Documentation no longer implies docker-data.raw is a general persistent overlay.
 
+
+## Notes
+
+**2026-05-15T20:36:28Z**
+
+Reassessment result after epic wra-ia1a: the guest persistence model is now immutable rootfs.raw lower plus project-local persistent root overlay .sandbox/docker-vm/state.raw. The legacy .sandbox/home persistent-home composed-fs mount has been removed; guest $HOME is an ordinary guest path on the root overlay unless covered by explicit configured shares/tool recipe shares. Documentation has already been moved away from docker-data.raw as general persistence during wra-ia1a; current shadow work should use generic .sandbox/root backing only for configured share shadows, not default HOME persistence.

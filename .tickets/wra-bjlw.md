@@ -1,6 +1,6 @@
 ---
 id: wra-bjlw
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T19:42:52Z
@@ -25,3 +25,9 @@ Implement in small steps: first normalize the config file shape and validation, 
 
 The config format documents shadows as string arrays. Runtime accepts shadows on both ro and rw parent shares. Shadow mounts are always rw and backed by .sandbox/root/<full guest shadow path>. Tests cover ro parent + rw shadow, rw parent + rw shadow, escaping/duplicate validation, and manifest/runtime mount ordering. Setup recipes produce explicit share template config for tool state needs. Required validation ./vm-frontend/validate.sh required passes before closing.
 
+
+## Notes
+
+**2026-05-15T20:44:26Z**
+
+Implemented and validated generic share shadow model: config shadows are string arrays; shadows work for ro/rw parent shares; shadow mounts are always rw UserRw and backed by .sandbox/root/<full guest path>; setup recipes write explicit share templates (Codex ~/.codex with shadows ["tmp"], Pi ~/.pi); tool_state/--tool-state and runtime Codex/Pi path lists were removed. Guest HOME persistence remains root-overlay state from wra-ia1a, not special .sandbox/home. ./vm-frontend/validate.sh required passed.

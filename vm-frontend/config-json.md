@@ -22,10 +22,6 @@ All fields except `schema_version` have defaults when omitted.
     "command": "codex",
     "args": []
   },
-  "tool_state": {
-    "codex": true,
-    "pi": false
-  },
   "network": {
     "mode": "public",
     "allowed_domains": [],
@@ -36,7 +32,15 @@ All fields except `schema_version` have defaults when omitted.
     "github": false,
     "aws_profile": null
   },
-  "shares": [],
+  "shares": [
+    {
+      "host_path": "/home/USER/.codex",
+      "guest_path": "/home/USER/.codex",
+      "access": "rw",
+      "required": false,
+      "shadows": ["tmp"]
+    }
+  ],
   "published_ports": []
 }
 ```
@@ -52,7 +56,7 @@ Optional string or `null`. Supported values:
 - `"codex"`: use the Codex setup recipe. If `default_command.command` is `"codex"`, launch through the recipe bootstrap script for `@openai/codex`.
 - `"pi"`: use the Pi setup recipe. If `default_command.command` is `"pi"`, launch through the recipe bootstrap script for `@mariozechner/pi-coding-agent`.
 
-`setup_tool` does not itself mount state. State sharing is controlled by `tool_state` and `shares`.
+`setup_tool` selects recipe bootstrap behavior. Setup writes explicit `shares` for tool state needs; runtime mount composition remains generic.
 
 ### `default_command`
 
@@ -64,15 +68,6 @@ Object with:
 For config compatibility, the reader also accepts a string value such as `"codex"` and treats it as `{ "command": "codex", "args": [] }`. Writers should emit the object form.
 
 Arguments after `agentvm --` override this command for one launch and do not modify the file.
-
-### `tool_state`
-
-Object with booleans:
-
-- `codex`: mount host `~/.codex` read-write at the same guest path.
-- `pi`: mount host `~/.pi` read-write at the same guest path.
-
-This is intentionally coarse setup state. If a tool state directory needs child shadows, disable the matching `tool_state` flag and model the directory with an explicit `shares` entry instead.
 
 ### `network`
 
@@ -102,9 +97,7 @@ Array of explicit host path shares.
   "guest_path": "/absolute/guest/path",
   "access": "rw",
   "required": true,
-  "shadows": [
-    { "path": "tmp" }
-  ]
+  "shadows": ["tmp"]
 }
 ```
 
@@ -114,13 +107,13 @@ Fields:
 - `guest_path`: optional non-empty path. If omitted, the guest path is the resolved `host_path`.
 - `access`: `"ro"` or `"rw"`.
 - `required`: boolean, default `true`. Missing required sources fail launch; missing optional sources are skipped.
-- `shadows`: optional array of child shadow mounts. Only allowed on `"rw"` shares.
+- `shadows`: optional array of child shadow mount paths. Allowed on both `"ro"` and `"rw"` shares.
 
 #### Share Shadows
 
-A shadow replaces a guest-visible child path under a read-write share with project-local backing storage under `.sandbox/share-shadows/`. The parent host share remains writable for all other paths.
+A shadow replaces a guest-visible child path under a configured share with read-write project-local backing storage under `.sandbox/root/<full guest shadow path>`. The parent host share keeps its configured access for all other paths.
 
-`shadows[].path` is relative to the share's guest root. It must be a normalized relative path: no empty value, no absolute path, no `..`, and no `=`.
+Each `shadows[]` string is relative to the share's guest root. It must be a normalized relative path: no empty value, no absolute path, no `..`, and no `=`.
 
 Example: writable host `~/.codex`, but project-local guest `~/.codex/tmp`:
 
@@ -129,7 +122,6 @@ Example: writable host `~/.codex`, but project-local guest `~/.codex/tmp`:
   "schema_version": 2,
   "setup_tool": "codex",
   "default_command": { "command": "codex", "args": [] },
-  "tool_state": { "codex": false, "pi": false },
   "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
   "auth": { "github": false, "aws_profile": null },
   "shares": [
@@ -138,7 +130,7 @@ Example: writable host `~/.codex`, but project-local guest `~/.codex/tmp`:
       "guest_path": "/home/USER/.codex",
       "access": "rw",
       "required": true,
-      "shadows": [{ "path": "tmp" }]
+      "shadows": ["tmp"]
     }
   ],
   "published_ports": []

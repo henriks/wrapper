@@ -138,7 +138,7 @@ fn config_editor_terminal_keys_update_and_save_config() {
     assert_eq!(config["default_command"]["command"], "pi");
     assert_eq!(config["network"]["mode"], "none");
     assert_eq!(config["auth"]["github"], true);
-    assert_eq!(config["shares"].as_array().expect("shares array").len(), 1);
+    assert_eq!(config["shares"].as_array().expect("shares array").len(), 2);
     assert_eq!(
         config["published_ports"]
             .as_array()

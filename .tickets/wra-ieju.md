@@ -1,6 +1,6 @@
 ---
 id: wra-ieju
-status: open
+status: closed
 deps: [wra-cr8p]
 links: []
 created: 2026-05-15T19:43:18Z
@@ -24,3 +24,13 @@ After the generic shadow behavior lands, update WrapperSandboxConfig::setup_tool
 
 agentvm --setup-tool codex writes config with explicit share template(s), including project-local shadow(s) for volatile state. agentvm --setup-tool pi writes explicit share template(s). Tests assert generated config shape and launch args. No runtime code contains Codex-specific child path filters; tool-specific choices live in recipe config generation only.
 
+
+## Notes
+
+**2026-05-15T20:37:15Z**
+
+Iteration 2 progress: setup recipes now generate explicit ConfigShare entries instead of enabling tool_state booleans. Codex recipe writes an optional rw ~/.codex share with shadows ["tmp"] so volatile state backs onto .sandbox/root/<guest path>; Pi recipe writes an optional rw ~/.pi share. Updated setup-tool tests and config-json/wrapper UX docs for explicit recipe shares. Targeted validation passed: ./vm-frontend/validate.sh docs; cargo test --manifest-path vm-frontend/Cargo.toml --offline setup_tool; cargo test --manifest-path vm-frontend/Cargo.toml --offline config_share_shadow; cargo test --manifest-path vm-frontend/Cargo.toml --offline legacy_config. Remaining before closing: remove or collapse old manual tool_state/runtime Codex/Pi path handling so tool-specific path choices live only in recipe config generation.
+
+**2026-05-15T20:42:17Z**
+
+Completed implementation: removed tool_state from config schema/WrapperSandboxConfig, removed --tool-state CLI parsing and Codex/Pi ToolStateMounts/runtime_manifest path lists, and updated TUI config cycling to apply setup recipe share templates. Runtime no longer contains Codex/Pi-specific child path filters; tool-specific share choices live in SetupTool::config_shares. Codex setup emits optional rw ~/.codex plus shadows ["tmp"]; Pi emits optional rw ~/.pi. Targeted validation passed: ./vm-frontend/validate.sh docs; cargo test --manifest-path vm-frontend/Cargo.toml --offline setup_tool; cargo test --manifest-path vm-frontend/Cargo.toml --offline config_share_shadow; cargo test --manifest-path vm-frontend/Cargo.toml --offline legacy_config; cargo test --manifest-path vm-frontend/Cargo.toml --offline config_editor_model_edits_main_config_fields_before_save; cargo test --manifest-path vm-frontend/Cargo.toml --offline frontend_parses_payload_guest_share_options; cargo test --manifest-path vm-frontend/Cargo.toml --offline guest_runtime_mounts.

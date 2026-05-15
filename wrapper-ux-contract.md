@@ -55,13 +55,13 @@ agentvm --setup-tool pi
 ```
 
 `--setup-tool codex` writes a Codex-oriented `config.json`: default command
-`codex`, Codex writable state sharing, the package/bootstrap metadata needed to
-install the CLI in the guest, and the normal project workspace and guest home
-shares.
+`codex`, explicit writable `~/.codex` share configuration with project-local
+shadow backing for volatile children, and the package/bootstrap metadata needed
+to install the CLI in the guest.
 
-`--setup-tool pi` writes a Pi-oriented `config.json`: default command `pi`,
-package metadata for `@mariozechner/pi-coding-agent`, and the normal sandbox
-shares.
+`--setup-tool pi` writes a Pi-oriented `config.json`: default command `pi`, an
+explicit writable `~/.pi` share configuration, and package metadata for
+`@mariozechner/pi-coding-agent`.
 
 Interactive setup can be offered by the TUI when no config exists. Non-TTY mode
 must fail with an actionable message rather than prompting.
@@ -127,8 +127,9 @@ one-run flags, not arbitrary host environment passthrough.
 
 Extra shares are structured records with host path, guest path, access mode,
 whether the source is required, and optional child `shadows`. A shadow names a
-relative path inside a read-write share that should be backed by project-local
-`.sandbox/share-shadows/` state instead of the corresponding host child path.
+relative child path inside a configured share that should be backed by
+read-write project-local `.sandbox/root/<full guest path>` state instead of the
+corresponding host child path.
 CLI `--ro PATH` and `--rw PATH` expose the path at the same absolute guest path
 for one launch.
 

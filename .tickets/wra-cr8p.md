@@ -1,6 +1,6 @@
 ---
 id: wra-cr8p
-status: open
+status: closed
 deps: [wra-71xw]
 links: []
 created: 2026-05-15T19:43:09Z
@@ -24,3 +24,9 @@ Remove the parent-rw validation. Compute the full guest shadow path as parent gu
 
 Runtime accepts shadows on ro and rw parent shares. Shadow RuntimeMount entries are always readonly=false and source_class UserRw. Backing directories are created under .sandbox/root/<full guest shadow path>. Tests assert ro parent + rw shadow, rw parent + rw shadow, backing path shape, and parent-before-shadow ordering.
 
+
+## Notes
+
+**2026-05-15T20:32:35Z**
+
+Implemented generic runtime shadow semantics: shadows are allowed on ro or rw parent shares; runtime parent lookup no longer requires rw; shadow mounts remain readonly=false/UserRw and are emitted after parent mounts. Shadow backing is now derived from the full guest shadow path as <project>/.sandbox/root/<guest path without leading slash>, and runtime backing validation is restricted to .sandbox/root. Added tests for ro parent + writable shadow, rw parent ordering/backing, escaping and duplicate validation. Targeted validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check; cargo test --manifest-path vm-frontend/Cargo.toml --offline config_share_shadow -- --nocapture.

@@ -1,6 +1,6 @@
 ---
 id: wra-mur9
-status: open
+status: closed
 deps: [wra-q5lm]
 links: []
 created: 2026-05-15T19:43:34Z
@@ -24,3 +24,13 @@ Audit docs for stale object-form shadows, rw-parent-only language, .sandbox/shar
 
 All docs describe shadows as string arrays, parent ro/rw support, always-rw project-local shadows, and .sandbox/root backing. Docs accurately distinguish docker-data.raw from any guest root/home persistence. Required validation ./vm-frontend/validate.sh required passes.
 
+
+## Notes
+
+**2026-05-15T20:42:49Z**
+
+Docs/coverage progress: removed active docs references to tool_state, --tool-state, object-form shadows, .sandbox/share-shadows, and rw-parent-only shadow language across the active config/requirements/runtime/UX docs. requirements.md now says Codex/Pi setup writes explicit optional shares, and vm-frontend/config-json.md no longer documents tool_state. ./vm-frontend/validate.sh docs passed. Remaining before close: final full validation gate after any remaining cleanup.
+
+**2026-05-15T20:44:26Z**
+
+Final validation/docs evidence: active docs no longer mention tool_state, --tool-state, object-form shadows, .sandbox/share-shadows, or rw-parent-only shadow rules. Tests cover string-array shadows, object-form rejection, duplicate/escaping validation, ro parent + writable shadow, rw parent ordering/backing, setup recipe share output, TUI config editing with recipe shares, and runtime mount generation. ./vm-frontend/validate.sh required passed, including docs drift, formatting, composed-fs and vm-frontend offline tests, offline guest service tests, fuzz target compilation, and live-smoke.

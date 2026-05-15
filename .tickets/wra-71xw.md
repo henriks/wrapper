@@ -1,6 +1,6 @@
 ---
 id: wra-71xw
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T19:42:58Z
@@ -24,3 +24,9 @@ Represent ConfigShare.shadows as Vec<String>. Reuse/adjust validate_share_shadow
 
 Config parsing and serialization use shadows as string arrays. Object-form shadows are no longer documented or required. Tests cover valid string shadows and duplicate/escaping rejection.
 
+
+## Notes
+
+**2026-05-15T20:32:35Z**
+
+Implemented config shadows as Vec<String> in vm-frontend/src/main.rs and removed ConfigShareShadow object type. Updated validation to use each string directly, added JSON regression coverage proving string arrays parse and obsolete object-form shadows fail, and updated vm-frontend/config-json.md to document string arrays. Targeted validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check; cargo test --manifest-path vm-frontend/Cargo.toml --offline config_share_shadow -- --nocapture.
