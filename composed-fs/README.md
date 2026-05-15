@@ -11,8 +11,13 @@ It currently:
 - supports the initial host-backed operation slice: open/create/read/write,
   mkdir/unlink/rmdir/rename/link/symlink/readlink, statfs/access/lseek, and
   regular-file `mknod`
-- starts a vhost-user socket using upstream `virtiofsd` protocol-boundary APIs
+- starts a vhost-user socket using the vendored `virtiofsd` protocol-boundary
+  APIs
 - exposes the same backend as a Rust library for the VM frontend
+
+`virtiofsd` is vendored under `third_party/virtiofsd` because the upstream
+`1.13.3` `FileSystem` trait does not expose full FUSE lock request details.
+See `third_party/virtiofsd/README.agentvm.md` before updating that dependency.
 
 The backend deliberately does not yet implement the full v1 operation surface.
 Remaining work is documented in `docker/composed-fs-operations.md`.
