@@ -1,0 +1,1 @@
+{"schema_version":1,"mounts":[{"id":"workspace","guest_path":"/workspace","host_path":"/tmp","kind":"dir","access":"rw","source_class":"workspace","required":true,"bind":true,"metadata":{"uid_gid":"host","permissions":"host"}}]}

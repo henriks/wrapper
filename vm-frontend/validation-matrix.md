@@ -24,8 +24,9 @@ Use the lowest tier that proves the behavior.
 | --- | --- | --- |
 | Fast offline unit | `cargo test --manifest-path vm-frontend/Cargo.toml --offline`; `cargo test --manifest-path composed-fs/Cargo.toml --offline` | Pure Rust behavior with no QEMU, no KVM, no real network dependency. This is the default regression gate. |
 | In-process integration | Same cargo commands, using local fake upstreams, fake QEMU streams, temp projects, and generated CA material | Cross-module behavior that needs realistic bytes, sockets, manifests, or async pumps but can stay deterministic. |
-| Model/property style | Cargo ignored tests or deterministic seeded tests | Large operation spaces where example tests are insufficient, especially filesystem semantics and network chunking/backpressure. Failures must print the seed or operation sequence. |
-| Local stress/adversarial | Ignored cargo tests run explicitly on a developer machine | Higher volume, timing, malformed input, concurrency, and resource pressure. These must be deterministic enough to reproduce from logged artifacts. |
+| Model/property style | Cargo ignored tests, deterministic seeded tests, or `vm-frontend/validate.sh stress` | Large operation spaces where example tests are insufficient, especially filesystem semantics and network chunking/backpressure. Failures must print the seed or operation sequence. |
+| Local stress/adversarial | `vm-frontend/validate.sh stress` plus any explicitly documented host-only stress tests | Higher volume, timing, malformed input, concurrency, and resource pressure. These must be deterministic enough to reproduce from logged artifacts. |
+| Coverage-guided fuzzing | `cargo fuzz run <target>` under `vm-frontend/fuzz` | Long-running mutation of parser and state-machine inputs with checked-in seed corpora and ignored crash artifacts. Use for vmnet stream framing, DNS payloads, guest Ethernet frames, and composed-fs manifest/path shape validation. |
 | Live KVM/QEMU | `agentvm-frontend self-test` and targeted `launch` smokes on a host with `/dev/kvm`, QEMU, and rebuilt image artifacts | Final contract validation against the real guest kernel, init scripts, virtiofs, QEMU stream netdev, Docker, and tool payload path. |
 
 ## Outcome Requirements
@@ -48,6 +49,7 @@ tier becomes large enough to deserve its own file.
 Exact day-to-day commands are maintained in `validation-workflow.md`. Use
 `vm-frontend/validate.sh fast` for the default offline gate,
 `vm-frontend/validate.sh stress` for ignored property/stress tests, and
+`cargo fuzz run <target>` from `vm-frontend/` for coverage-guided fuzzing, and
 `vm-frontend/validate.sh live` for the KVM/QEMU self-test.
 
 ## Network Matrix

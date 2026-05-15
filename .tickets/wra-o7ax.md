@@ -1,6 +1,6 @@
 ---
 id: wra-o7ax
-status: open
+status: closed
 deps: [wra-k8br, wra-rysl, wra-735i]
 links: []
 created: 2026-05-15T06:51:31Z
@@ -18,3 +18,9 @@ Build on the fuzz harness infrastructure with concrete high-value targets. Files
 
 At least several coverage-guided fuzz targets exist for both network and filesystem surfaces. Each target has seed corpus entries, a short README or validation-workflow section with run/minimize/reproduce commands, and crash artifacts are excluded or stored according to repo policy. Targets avoid external network, root, KVM, QEMU, and Docker requirements.
 
+
+## Notes
+
+**2026-05-15T07:08:40Z**
+
+Added concrete cargo-fuzz targets for vmnet stream framing, DNS payload parsing/classification, full vmnet gateway frame ingestion, and composed-fs manifest shape validation. Added seed corpus files and a safe public validate_manifest_json_shape API that validates manifest schema/path shape without opening fuzz-supplied host paths. Verified cargo check --manifest-path vm-frontend/fuzz/Cargo.toml, composed-fs manifest_shape_validation_does_not_open_host_sources, and vm-frontend DNS malformed payload test.

@@ -1622,6 +1622,48 @@ pub fn run_cli() -> io::Result<()> {
     })
 }
 
+pub fn validate_manifest_json_shape(manifest_text: &str) -> io::Result<()> {
+    let manifest: Manifest = serde_json::from_str(manifest_text)
+        .map_err(|error| invalid_input(format!("invalid manifest JSON: {error}")))?;
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err(invalid_input(format!(
+            "unsupported schema_version {}, expected {}",
+            manifest.schema_version, SCHEMA_VERSION
+        )));
+    }
+    if manifest.mounts.is_empty() {
+        return Err(invalid_input("manifest must contain at least one mount"));
+    }
+    if let Some(synthetic) = &manifest.synthetic {
+        parse_octal_mode(&synthetic.dir_mode)?;
+    }
+
+    let mut normalized_paths = Vec::new();
+    for mount in &manifest.mounts {
+        mount.validate()?;
+        let guest_path = normalize_guest_path(&mount.guest_path)?;
+        if manifest
+            .protected_guest_paths
+            .iter()
+            .any(|protected| protected == &guest_path)
+        {
+            return Err(invalid_input(format!(
+                "mount targets protected guest path: {guest_path}"
+            )));
+        }
+        if guest_path == "/" {
+            return Err(invalid_input("mount guest_path cannot be /"));
+        }
+        if normalized_paths.iter().any(|path| path == &guest_path) {
+            return Err(invalid_input(format!(
+                "duplicate guest_path in manifest: {guest_path}"
+            )));
+        }
+        normalized_paths.push(guest_path);
+    }
+    Ok(())
+}
+
 pub fn serve_vhost_user_fs(config: ServeConfig) -> io::Result<()> {
     let manifest_text = fs::read_to_string(&config.manifest)?;
     let manifest: Manifest = serde_json::from_str(&manifest_text)
@@ -2381,8 +2423,13 @@ mod tests {
     use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
     use std::os::unix::fs::symlink;
     use std::os::unix::fs::FileExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use virtiofsd::oslib::{ReadvFlags, WritevFlags};
+
+    static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir {
         path: PathBuf,
@@ -2390,8 +2437,9 @@ mod tests {
 
     impl TestDir {
         fn new(name: &str) -> Self {
+            let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "agentvm-composed-fs-{name}-{}-{}",
+                "agentvm-composed-fs-{name}-{}-{}-{counter}",
                 std::process::id(),
                 now_secs()
             ));
@@ -2755,6 +2803,8 @@ mod tests {
         HostPut { path: usize, len: usize, byte: u8 },
         HostMkdir { path: usize },
         Readdir { path: usize },
+        Truncate { path: usize, len: u64 },
+        Chmod { path: usize, mode: u32 },
         ReadonlyCreateProbe,
         CrossMountRenameProbe,
         HostSymlinkEscapeProbe,
@@ -2763,27 +2813,47 @@ mod tests {
     fn nested_fs_ops() -> impl Strategy<Value = Vec<NestedFsOp>> {
         prop::collection::vec(
             prop_oneof![
-                (0usize..8).prop_map(|path| NestedFsOp::Mkdir { path }),
-                (0usize..8, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
+                (0usize..16).prop_map(|path| NestedFsOp::Mkdir { path }),
+                (0usize..16, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
                     NestedFsOp::Put {
                         path,
                         len: len + 1,
                         byte,
                     }
                 }),
-                (0usize..8).prop_map(|path| NestedFsOp::Read { path }),
-                (0usize..8, 0usize..8).prop_map(|(from, to)| NestedFsOp::Rename { from, to }),
-                (0usize..8).prop_map(|path| NestedFsOp::Unlink { path }),
-                (0usize..8).prop_map(|path| NestedFsOp::Rmdir { path }),
-                (0usize..8, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
+                (0usize..16).prop_map(|path| NestedFsOp::Read { path }),
+                (0usize..16, 0usize..16).prop_map(|(from, to)| NestedFsOp::Rename { from, to }),
+                (0usize..16).prop_map(|path| NestedFsOp::Unlink { path }),
+                (0usize..16).prop_map(|path| NestedFsOp::Rmdir { path }),
+                (0usize..16, 0usize..96, any::<u8>()).prop_map(|(path, len, byte)| {
                     NestedFsOp::HostPut {
                         path,
                         len: len + 1,
                         byte,
                     }
                 }),
-                (0usize..8).prop_map(|path| NestedFsOp::HostMkdir { path }),
-                (0usize..8).prop_map(|path| NestedFsOp::Readdir { path }),
+                (0usize..16).prop_map(|path| NestedFsOp::HostMkdir { path }),
+                (0usize..16).prop_map(|path| NestedFsOp::Readdir { path }),
+                (0usize..16, 0u64..128).prop_map(|(path, len)| NestedFsOp::Truncate { path, len }),
+                (
+                    prop_oneof![
+                        Just(0usize),
+                        Just(1),
+                        Just(3),
+                        Just(5),
+                        Just(7),
+                        Just(8),
+                        Just(9),
+                        Just(10),
+                        Just(11),
+                        Just(12),
+                        Just(13),
+                        Just(14),
+                        Just(15),
+                    ],
+                    prop_oneof![Just(0o600_u32), Just(0o644), Just(0o700), Just(0o755)]
+                )
+                    .prop_map(|(path, mode)| NestedFsOp::Chmod { path, mode }),
                 Just(NestedFsOp::ReadonlyCreateProbe),
                 Just(NestedFsOp::CrossMountRenameProbe),
                 Just(NestedFsOp::HostSymlinkEscapeProbe),
@@ -3088,7 +3158,7 @@ mod tests {
     }
 
     fn nested_path(index: usize) -> &'static str {
-        match index % 8 {
+        match index % 16 {
             0 => "a.txt",
             1 => "b.txt",
             2 => "dir",
@@ -3096,7 +3166,15 @@ mod tests {
             4 => "dir/sub",
             5 => "dir/sub/c.txt",
             6 => "other",
-            _ => "other/d.txt",
+            7 => "other/d.txt",
+            8 => ".hidden",
+            9 => "UPPER.case",
+            10 => "space name.txt",
+            11 => "dash_under-123.txt",
+            12 => "dir/space child.txt",
+            13 => "dir/sub/deep.txt",
+            14 => "long-name-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt",
+            _ => "dir/long-child-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789.txt",
         }
     }
 
@@ -3207,6 +3285,22 @@ mod tests {
         )
     }
 
+    fn fs_truncate_path(fs: &ComposedFs, root_inode: u64, path: &str, len: u64) -> io::Result<()> {
+        let inode = lookup_relative_inode(fs, root_inode, path)?;
+        let mut attr = fuse::SetattrIn::default();
+        attr.size = len;
+        fs.setattr(ctx(), inode, attr, None, SetattrValid::SIZE)?;
+        Ok(())
+    }
+
+    fn fs_chmod_path(fs: &ComposedFs, root_inode: u64, path: &str, mode: u32) -> io::Result<()> {
+        let inode = lookup_relative_inode(fs, root_inode, path)?;
+        let mut attr = fuse::SetattrIn::default();
+        attr.mode = mode;
+        fs.setattr(ctx(), inode, attr, None, SetattrValid::MODE)?;
+        Ok(())
+    }
+
     fn fs_readdir_names(fs: &ComposedFs, root_inode: u64, path: &str) -> io::Result<Vec<String>> {
         let inode = lookup_relative_inode(fs, root_inode, path)?;
         let mut names = dir_names(fs.readdir(ctx(), inode, inode, 16 * 1024, 0)?);
@@ -3235,6 +3329,20 @@ mod tests {
             .collect::<io::Result<Vec<_>>>()?;
         names.sort();
         Ok(names)
+    }
+
+    fn host_truncate_path(root: &Path, path: &str, len: u64) -> io::Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(path))?
+            .set_len(len)
+    }
+
+    fn host_chmod_path(root: &Path, path: &str, mode: u32) -> io::Result<()> {
+        let path = root.join(path);
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions)
     }
 
     fn same_result<T: PartialEq + std::fmt::Debug>(
@@ -3389,6 +3497,26 @@ mod tests {
                         host_readdir_names(&oracle, path),
                         &trace,
                         "readdir",
+                    );
+                }
+                NestedFsOp::Truncate { path, len } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: truncate {path} len={len}"));
+                    same_result(
+                        fs_truncate_path(&fs, workspace.inode, path, *len),
+                        host_truncate_path(&oracle, path, *len),
+                        &trace,
+                        "truncate",
+                    );
+                }
+                NestedFsOp::Chmod { path, mode } => {
+                    let path = nested_path(*path);
+                    trace.push(format!("{step}: chmod {path} mode={mode:o}"));
+                    same_result(
+                        fs_chmod_path(&fs, workspace.inode, path, *mode),
+                        host_chmod_path(&oracle, path, *mode),
+                        &trace,
+                        "chmod",
                     );
                 }
                 NestedFsOp::ReadonlyCreateProbe => {
@@ -3842,6 +3970,26 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         ));
+    }
+
+    #[test]
+    fn manifest_shape_validation_does_not_open_host_sources() {
+        let manifest = r#"{
+            "schema_version": 1,
+            "mounts": [{
+                "id": "missing-but-shape-valid",
+                "guest_path": "/workspace",
+                "host_path": "/definitely/missing/agentvm/fuzz/source",
+                "kind": "dir",
+                "access": "rw",
+                "source_class": "workspace",
+                "required": true,
+                "bind": true,
+                "metadata": { "uid_gid": "host", "permissions": "host" }
+            }]
+        }"#;
+
+        validate_manifest_json_shape(manifest).expect("shape validation should not open host path");
     }
 
     #[test]
@@ -5393,6 +5541,93 @@ mod tests {
                 Some(libc::ENOENT | libc::EXDEV | libc::ELOOP)
             )),
         }
+    }
+
+    #[test]
+    fn cached_parent_lookup_after_host_symlink_replacement_does_not_escape() {
+        let test_dir = TestDir::new("parent-lookup-symlink-replace");
+        let root = test_dir.path.join("root");
+        let outside = test_dir.path.join("outside");
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::create_dir(&outside).expect("create outside");
+        fs::write(root.join("dir/file"), b"inside").expect("write inside");
+        fs::write(outside.join("file"), b"outside-secret").expect("write outside");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let dir = lookup(&fs, workspace.inode, "dir").expect("lookup dir");
+
+        fs::rename(root.join("dir"), root.join("moved")).expect("move dir");
+        symlink(&outside, root.join("dir")).expect("replace dir with symlink");
+
+        match lookup(&fs, dir.inode, "file") {
+            Ok(entry) => {
+                let (handle, _options) = fs
+                    .open(ctx(), entry.inode, false, libc::O_RDONLY as u32)
+                    .expect("open looked-up child");
+                let handle = handle.expect("handle");
+                let mut reader = VecWriter::default();
+                fs.read(ctx(), entry.inode, handle, &mut reader, 64, 0, None, 0)
+                    .expect("read looked-up child");
+                assert_ne!(reader.data, b"outside-secret");
+                fs.release(ctx(), entry.inode, 0, handle, false, false, None)
+                    .expect("release");
+            }
+            Err(error) => assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ENOENT | libc::EXDEV | libc::ELOOP | libc::ENOTDIR)
+            )),
+        }
+    }
+
+    #[test]
+    fn concurrent_lookup_forget_churn_preserves_lookup_count() {
+        let test_dir = TestDir::new("lookup-forget-churn");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file"), b"data").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = Arc::new(ComposedFs::new(namespace));
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "file").expect("initial lookup");
+        let baseline = lookup_count(&fs, file.inode);
+        let workers = 4;
+        let iterations = 32;
+        let barrier = Arc::new(Barrier::new(workers));
+
+        let threads = (0..workers)
+            .map(|_| {
+                let fs = Arc::clone(&fs);
+                let barrier = Arc::clone(&barrier);
+                let parent = workspace.inode;
+                thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..iterations {
+                        let entry = lookup(&fs, parent, "file").expect("thread lookup");
+                        fs.forget(ctx(), entry.inode, 1);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().expect("lookup thread");
+        }
+
+        assert_eq!(lookup_count(&fs, file.inode), baseline);
+        fs.forget(ctx(), file.inode, baseline);
     }
 
     #[test]

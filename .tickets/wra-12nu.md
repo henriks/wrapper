@@ -1,6 +1,6 @@
 ---
 id: wra-12nu
-status: open
+status: closed
 deps: [wra-rysl]
 links: []
 created: 2026-05-15T06:51:13Z
@@ -18,3 +18,9 @@ Add deterministic adversarial interleaving coverage for composed-fs race classes
 
 New tests exercise multiple host/guest interleaving classes without relying on flaky timing. They fail closed on path escape attempts, preserve expected open-handle semantics, and document any intentionally unsupported race behavior. The fast tier includes cheap deterministic cases; heavier variants are wired into the stress tier if needed.
 
+
+## Notes
+
+**2026-05-15T07:05:49Z**
+
+Added deterministic composed-fs interleaving tests: cached parent lookup after host-side symlink replacement must not expose outside content, and barrier-synchronized concurrent lookup/forget churn preserves lookup counts. Verified with targeted lookup tests and full cargo test --manifest-path composed-fs/Cargo.toml --offline.

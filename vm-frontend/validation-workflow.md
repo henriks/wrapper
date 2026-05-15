@@ -35,14 +35,61 @@ Equivalent commands:
 
 ```sh
 cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_flat_file_operation_sequences -- --ignored --nocapture
+cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_nested_operation_sequences_stress -- --ignored --nocapture
+cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_lock_operation_sequences_stress -- --ignored --nocapture
 cargo test --manifest-path composed-fs/Cargo.toml --offline stress_seeded_flat_file_operation_sequences -- --ignored --nocapture
+cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream::tests::stress_many_chunked_frame_splits -- --ignored --nocapture
+cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_gateway::tests::stress_seeded_generated_guest_frames -- --ignored --nocapture
 cargo test --manifest-path vm-frontend/Cargo.toml --offline dns_proxy_stress -- --ignored --nocapture
 ```
 
-The composed-fs property test uses `proptest` with shrinking. The fixed-seed
-filesystem regression uses seed `0x5eedf17e20260514`. The DNS stress regression
-uses seed `0xd15c20260514`. Failures print either the minimized generated input
-or an operation trace; paste that trace into the fixing ticket before closing it.
+The composed-fs operation and lock property tests use `proptest` with shrinking.
+The fixed-seed filesystem regression uses seed `0x5eedf17e20260514`, the vmnet
+gateway generated-frame stress uses seed `0x676174657761795f`, and the DNS
+stress regression uses seed `0xd15c20260514`. Failures print either the
+minimized generated input, seed, or operation trace; paste that reproducer into
+the fixing ticket before closing it.
+
+## Coverage-Guided Fuzzing
+
+The cargo-fuzz targets live under `vm-frontend/fuzz`. They are not part of the
+fast or stress tiers because they require the `cargo-fuzz` runner and are meant
+for manual or scheduled bug-finding runs.
+
+Install the runner on a machine that can fetch tools:
+
+```sh
+cargo install cargo-fuzz
+```
+
+Short smoke run:
+
+```sh
+cd vm-frontend
+cargo fuzz run vmnet_stream_frame_io -- -max_total_time=30
+```
+
+Current targets:
+
+```sh
+cargo fuzz run vmnet_stream_frame_io
+cargo fuzz run dns_proxy_payload
+cargo fuzz run vmnet_gateway_frame
+cargo fuzz run composed_manifest_shape
+```
+
+The fuzz package can be checked without running libFuzzer:
+
+```sh
+cargo check --manifest-path vm-frontend/fuzz/Cargo.toml
+```
+
+Checked-in seed inputs live in `vm-frontend/fuzz/corpus/<target>/`. Generated
+crashes and temporary outputs belong under `vm-frontend/fuzz/artifacts/`, which
+is ignored. When filing a ticket from a fuzz failure, include the target name,
+the minimized crashing input path, the exact `cargo fuzz run ...` command, and
+whether the failure is a panic, timeout, memory growth issue, or invariant
+assertion.
 
 ## Live KVM
 
@@ -181,6 +228,8 @@ Recommended split:
 
 - Per-commit CI: `vm-frontend/validate.sh fast`.
 - Pre-merge/manual CI: `vm-frontend/validate.sh all-local`.
+- Scheduled fuzz smoke on a machine with `cargo-fuzz`: short runs of each
+  `vm-frontend/fuzz` target.
 - Nightly or host-only CI: `vm-frontend/validate.sh live` on a runner with KVM
   and rebuilt appliance artifacts.
 

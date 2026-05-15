@@ -1,6 +1,6 @@
 ---
 id: wra-735i
-status: open
+status: closed
 deps: [wra-reoq]
 links: []
 created: 2026-05-15T06:51:20Z
@@ -18,3 +18,9 @@ Extend vmnet fuzz/property coverage beyond arbitrary byte frames and one-shot SY
 
 Network property tests include structured packet/session sequences, not only arbitrary bytes. Generated cases reach DNS, UDP, TCP accept/deny, unsupported protocol, and malformed packet branches. Invariants include bounded guest output, fail-closed policy behavior, no leaked active sessions after denied/malformed traffic, and deterministic failure traces or seeds.
 
+
+## Notes
+
+**2026-05-15T07:04:20Z**
+
+Added structured vmnet gateway proptests that generate meaningful packet classes: IPv6, unknown ethertype, unknown IPv4 protocol, malformed UDP length, UDP/443 denial, unsupported UDP, allowed/blocked gateway DNS, denied/allowed TCP SYN, and fragmented/stale-checksum IPv4. Added repeated TCP SYN sequence property to ensure sessions do not grow unbounded. Verified with cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_gateway::tests -- --nocapture.

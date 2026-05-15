@@ -1027,6 +1027,146 @@ mod tests {
             prop_assert_eq!(log.domain.as_deref(), Some(normalized_query_domain.as_str()));
             prop_assert_eq!(result.guest_frames.len(), 1);
         }
+
+        #[test]
+        fn proptest_structured_guest_packets_keep_policy_invariants(
+            packet_kind in 0_u8..=10,
+            port in 1_u16..=u16::MAX,
+            payload in prop::collection::vec(any::<u8>(), 0..=128),
+            domain_label in 0_u16..=999,
+        ) {
+            let network = GuestNetwork::default();
+            let mut policy = VmnetPolicy::default_sandbox(network.clone());
+            let mut gateway = VmnetGateway::new_with_dns_upstream(
+                &policy,
+                &network,
+                Instant::from_millis(0),
+                Box::new(StaticDnsUpstream),
+            )
+            .expect("gateway");
+
+            let frame = match packet_kind {
+                0 => test_support::ipv6_frame(&payload),
+                1 => test_support::unknown_ethertype_frame(0x88b5, &payload),
+                2 => test_support::unknown_ipv4_protocol_frame(132),
+                3 => test_support::malformed_udp_len_frame((payload.len() as u16).min(7)),
+                4 => test_support::udp_frame(
+                    port,
+                    443,
+                    test_support::TEST_GUEST_IP,
+                    test_support::TEST_PUBLIC_IP,
+                    &payload,
+                ),
+                5 => test_support::udp_frame(
+                    port,
+                    port.saturating_add(1).max(1),
+                    test_support::TEST_GUEST_IP,
+                    test_support::TEST_PUBLIC_IP,
+                    &payload,
+                ),
+                6 => {
+                    policy.egress.allow_domains.push(format!("case{domain_label}.example"));
+                    gateway = VmnetGateway::new_with_dns_upstream(
+                        &policy,
+                        &network,
+                        Instant::from_millis(0),
+                        Box::new(StaticDnsUpstream),
+                    )
+                    .expect("gateway");
+                    test_support::dns_query_frame(
+                        &format!("case{domain_label}.example"),
+                        test_support::TEST_DNS_IP,
+                        port,
+                    )
+                }
+                7 => test_support::dns_query_frame(
+                    &format!("blocked{domain_label}.example"),
+                    test_support::TEST_DNS_IP,
+                    port,
+                ),
+                8 => test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, port),
+                9 => {
+                    policy.egress.allow_ips.push(test_support::TEST_PUBLIC_IP.to_string());
+                    gateway = VmnetGateway::new_with_dns_upstream(
+                        &policy,
+                        &network,
+                        Instant::from_millis(0),
+                        Box::new(StaticDnsUpstream),
+                    )
+                    .expect("gateway");
+                    test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, port)
+                }
+                _ => {
+                    let mut frame = test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, port);
+                    frame[14 + 6..14 + 8].copy_from_slice(&0x2001_u16.to_be_bytes());
+                    frame
+                }
+            };
+
+            let result = gateway.handle_guest_frame(frame, Instant::from_millis(1));
+            prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+
+            match packet_kind {
+                4 => prop_assert!(matches!(result.outcome, GuestFrameOutcome::UdpDenied(_))),
+                6 | 7 => prop_assert!(
+                    matches!(result.outcome, GuestFrameOutcome::DnsQuery { .. }),
+                    "expected DNS query outcome, got {:?}",
+                    result.outcome
+                ),
+                8 => {
+                    prop_assert!(
+                        matches!(result.outcome, GuestFrameOutcome::TcpDenied { .. }),
+                        "expected TCP deny outcome, got {:?}",
+                        result.outcome
+                    );
+                    prop_assert!(gateway.active_tcp_sessions().is_empty());
+                }
+                9 => {
+                    prop_assert!(
+                        matches!(result.outcome, GuestFrameOutcome::TcpAccepted { .. }),
+                        "expected TCP accepted outcome, got {:?}",
+                        result.outcome
+                    );
+                    prop_assert!(gateway.active_tcp_sessions().len() <= 1);
+                }
+                _ => {
+                    prop_assert!(gateway.active_tcp_sessions().is_empty());
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_repeated_tcp_syns_do_not_grow_sessions_unbounded(
+            port in 1_u16..=u16::MAX,
+            allowed in any::<bool>(),
+            repeats in 1_usize..=8,
+        ) {
+            let network = GuestNetwork::default();
+            let mut policy = VmnetPolicy::default_sandbox(network.clone());
+            if allowed {
+                policy.egress.allow_ips.push(test_support::TEST_PUBLIC_IP.to_string());
+            }
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+
+            for step in 0..repeats {
+                let result = gateway.handle_guest_frame(
+                    test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, port),
+                    Instant::from_millis(step as i64 + 1),
+                );
+                prop_assert_guest_frames_bounded(&result.guest_frames, &policy)?;
+                if allowed {
+                    prop_assert!(gateway.active_tcp_sessions().len() <= 1);
+                } else {
+                    prop_assert!(
+                        matches!(result.outcome, GuestFrameOutcome::TcpDenied { .. }),
+                        "expected TCP deny outcome, got {:?}",
+                        result.outcome
+                    );
+                    prop_assert!(gateway.active_tcp_sessions().is_empty());
+                }
+            }
+        }
     }
 
     #[test]

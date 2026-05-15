@@ -1,6 +1,6 @@
 ---
 id: wra-yxtb
-status: open
+status: closed
 deps: [wra-reoq, wra-k8br, wra-rysl, wra-12nu, wra-735i, wra-o7ax]
 links: []
 created: 2026-05-15T06:51:46Z
@@ -18,3 +18,9 @@ Document the final fuzz/property/stress workflow once the implementation tickets
 
 Docs describe how to run, reproduce, minimize, and triage failures from the expanded fuzzing strategy. The validation matrix maps the new tests and fuzz targets to filesystem/network risk areas. The CI/manual tier recommendation is explicit and does not require unavailable host capabilities for normal fast checks.
 
+
+## Notes
+
+**2026-05-15T07:10:49Z**
+
+Updated validation-workflow.md with coverage-guided fuzzing commands, corpus/crash policy, fuzz package check command, triage requirements, and CI/manual tier recommendations. Updated validation-matrix.md with a coverage-guided fuzzing tier and updated README pointer to vm-frontend/fuzz. Verified vm-frontend/validate.sh fast, vm-frontend/validate.sh stress, cargo check --manifest-path vm-frontend/fuzz/Cargo.toml, and tk dep cycle.

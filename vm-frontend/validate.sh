@@ -30,7 +30,15 @@ stress() {
   cargo test --manifest-path composed-fs/Cargo.toml --offline \
     proptest_flat_file_operation_sequences -- --ignored --nocapture
   cargo test --manifest-path composed-fs/Cargo.toml --offline \
+    proptest_nested_operation_sequences_stress -- --ignored --nocapture
+  cargo test --manifest-path composed-fs/Cargo.toml --offline \
+    proptest_lock_operation_sequences_stress -- --ignored --nocapture
+  cargo test --manifest-path composed-fs/Cargo.toml --offline \
     stress_seeded_flat_file_operation_sequences -- --ignored --nocapture
+  cargo test --manifest-path vm-frontend/Cargo.toml --offline \
+    vmnet_stream::tests::stress_many_chunked_frame_splits -- --ignored --nocapture
+  cargo test --manifest-path vm-frontend/Cargo.toml --offline \
+    vmnet_gateway::tests::stress_seeded_generated_guest_frames -- --ignored --nocapture
   cargo test --manifest-path vm-frontend/Cargo.toml --offline \
     dns_proxy_stress -- --ignored --nocapture
 }

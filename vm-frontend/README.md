@@ -59,6 +59,7 @@ Real VM validation status and the KVM-host smoke procedure are documented in
 The broader network and filesystem validation taxonomy is documented in
 `validation-matrix.md`. Exact tier commands and triage guidance are in
 `validation-workflow.md`; the shortcut runner is `vm-frontend/validate.sh`.
+Coverage-guided fuzz targets and seed corpora live in `vm-frontend/fuzz/`.
 
 Run the KVM-required VM-only self-test:
 

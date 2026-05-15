@@ -1,0 +1,43 @@
+[package]
+name = "agentvm-frontend-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+agentvm-composed-fs = { path = "../../composed-fs" }
+agentvm-frontend = { path = ".." }
+hickory-proto = "0.26.1"
+libfuzzer-sys = "0.4"
+smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
+
+[[bin]]
+name = "vmnet_stream_frame_io"
+path = "fuzz_targets/vmnet_stream_frame_io.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_proxy_payload"
+path = "fuzz_targets/dns_proxy_payload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vmnet_gateway_frame"
+path = "fuzz_targets/vmnet_gateway_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "composed_manifest_shape"
+path = "fuzz_targets/composed_manifest_shape.rs"
+test = false
+doc = false
+bench = false

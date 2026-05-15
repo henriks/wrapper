@@ -1,6 +1,6 @@
 ---
 id: wra-k8br
-status: open
+status: closed
 deps: [wra-reoq]
 links: []
 created: 2026-05-15T06:50:58Z
@@ -18,3 +18,9 @@ Add a repo-local coverage-guided fuzzing setup for the Rust crates, such as carg
 
 A developer can run at least one coverage-guided fuzz target locally from documented commands. The fuzz workspace layout is checked in, corpora/crashes/artifacts policy is documented, and the normal fast test tier remains offline and unaffected. The first target should prove the harness can build and exercise code from either vm-frontend or composed-fs.
 
+
+## Notes
+
+**2026-05-15T07:00:39Z**
+
+Added vm-frontend/fuzz cargo-fuzz-compatible harness infrastructure with target vmnet_stream_frame_io, corpus directory, artifact ignore rules, and README command notes. Verified with cargo check --manifest-path vm-frontend/fuzz/Cargo.toml after fetching libfuzzer-sys/arbitrary dependencies outside the sandbox; normal vm-frontend cargo test remains unaffected.

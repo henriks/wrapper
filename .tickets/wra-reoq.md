@@ -1,6 +1,6 @@
 ---
 id: wra-reoq
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T06:50:51Z
@@ -18,3 +18,9 @@ Fix the current validation workflow so the documented stress tier actually runs 
 
 vm-frontend/validate.sh stress invokes all intended ignored local stress/property tests or explicitly documents any excluded test and why. validation-workflow.md lists the exact commands and expected reproduction artifacts. validation-matrix.md reflects the updated coverage. Running tk dep cycle reports no dependency cycles after ticket wiring.
 
+
+## Notes
+
+**2026-05-15T06:56:33Z**
+
+Updated vm-frontend/validate.sh stress to include the previously orphaned ignored local tests: composed-fs nested operation stress, composed-fs lock operation stress, vmnet stream chunk split stress, and vmnet gateway generated-frame stress. Updated validation-workflow.md and validation-matrix.md to match. Verified bash -n vm-frontend/validate.sh and cargo test -- --list for composed-fs/vm-frontend show the named tests.
