@@ -1,6 +1,6 @@
 ---
 id: wra-yz27
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-14T21:45:17Z
@@ -33,3 +33,7 @@ This epic tracks bringing the implementation and docs back to the natural guest 
 **2026-05-14T21:47:26Z**
 
 Clarification: do not encode Codex-specific semantics in wrapper code. Codex should work because guest-visible paths and composed-fs semantics are correct at the filesystem level. Codex is only a workload/regression case, not a policy source.
+
+**2026-05-14T22:01:24Z**
+
+Epic completed. Guest-visible HOME/tool paths now use the host-natural path while .sandbox/home remains backing storage. Composed-fs gained explicit persistent-home source class support, natural-home/nested mount tests, host/guest shared writable visibility tests, and explicit POSIX lock non-advertising/EOPNOTSUPP behavior due to virtiofsd API limits. Live self-test now covers SQLite/WAL activity under guest HOME. Payloads now drop to host-mapped uid/gid and use the guest Docker TCP bridge. No Codex-specific path allowlists or SQLite policies were added.

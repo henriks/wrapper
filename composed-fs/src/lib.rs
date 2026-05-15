@@ -75,6 +75,7 @@ impl MountSpec {
         };
         let _source_class = match self.source_class {
             SourceClass::Workspace => "workspace",
+            SourceClass::PersistentHome => "persistent-home",
             SourceClass::ToolState => "tool-state",
             SourceClass::AuthConfig => "auth-config",
             SourceClass::SystemRo => "system-ro",
@@ -106,6 +107,7 @@ enum AccessMode {
 #[serde(rename_all = "kebab-case")]
 enum SourceClass {
     Workspace,
+    PersistentHome,
     ToolState,
     AuthConfig,
     SystemRo,
@@ -750,6 +752,18 @@ impl FileSystem for ComposedFs {
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
         Ok(capable & FsOptions::BIG_WRITES)
+    }
+
+    fn getlk(&self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    fn setlk(&self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    }
+
+    fn setlkw(&self) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
     }
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
@@ -3603,6 +3617,71 @@ mod tests {
     }
 
     #[test]
+    fn init_does_not_advertise_posix_locks_and_lock_ops_fail_explicitly() {
+        let test_dir = TestDir::new("lock-policy");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+
+        let options = fs
+            .init(FsOptions::BIG_WRITES | FsOptions::POSIX_LOCKS)
+            .expect("init");
+        assert!(options.contains(FsOptions::BIG_WRITES));
+        assert!(!options.contains(FsOptions::POSIX_LOCKS));
+        assert_eq!(raw_error(fs.getlk(), "getlk"), Some(libc::EOPNOTSUPP));
+        assert_eq!(raw_error(fs.setlk(), "setlk"), Some(libc::EOPNOTSUPP));
+        assert_eq!(raw_error(fs.setlkw(), "setlkw"), Some(libc::EOPNOTSUPP));
+    }
+
+    #[test]
+    fn natural_home_overlay_merges_nested_workspace_and_tool_state_mounts() {
+        let test_dir = TestDir::new("natural-home");
+        let backing_home = test_dir.path.join("backing-home");
+        let workspace = test_dir.path.join("workspace");
+        let tool_state = test_dir.path.join("codex");
+        fs::create_dir(&backing_home).expect("create home backing");
+        fs::create_dir(&workspace).expect("create workspace");
+        fs::create_dir(&tool_state).expect("create tool state");
+        fs::write(backing_home.join(".profile"), b"home").expect("write home");
+        fs::write(workspace.join("project.txt"), b"workspace").expect("write workspace");
+        fs::write(tool_state.join("auth.json"), b"{}").expect("write tool state");
+        let mut home_mount = dir_mount("home", "/home/user", &backing_home, AccessMode::Rw);
+        home_mount.source_class = SourceClass::PersistentHome;
+        let mut tool_mount = dir_mount("codex", "/home/user/.codex", &tool_state, AccessMode::Rw);
+        tool_mount.source_class = SourceClass::ToolState;
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![
+            home_mount,
+            dir_mount(
+                "workspace",
+                "/home/user/project",
+                &workspace,
+                AccessMode::Rw,
+            ),
+            tool_mount,
+        ]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let home = lookup(&fs, ROOT_ID, "home").expect("lookup home");
+        let user = lookup(&fs, home.inode, "user").expect("lookup user");
+        let project = lookup(&fs, user.inode, "project").expect("lookup project");
+        let codex = lookup(&fs, user.inode, ".codex").expect("lookup tool state");
+
+        assert!(lookup(&fs, user.inode, ".profile").is_ok());
+        assert!(lookup(&fs, project.inode, "project.txt").is_ok());
+        assert!(lookup(&fs, codex.inode, "auth.json").is_ok());
+        assert!(backing_home.join(".profile").exists());
+        assert!(workspace.join("project.txt").exists());
+        assert!(tool_state.join("auth.json").exists());
+    }
+
+    #[test]
     fn create_write_read_and_release_host_file() {
         let test_dir = TestDir::new("io");
         let root = test_dir.path.join("root");
@@ -3695,6 +3774,68 @@ mod tests {
 
         assert_eq!(error.raw_os_error(), Some(libc::EROFS));
         assert!(!root.join("blocked").exists());
+    }
+
+    #[test]
+    fn host_and_guest_writes_are_visible_through_same_rw_mount() {
+        let test_dir = TestDir::new("host-guest-rw");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let name = CString::new("shared.txt").expect("name");
+        let (entry, handle, _options) = fs
+            .create(
+                ctx(),
+                workspace.inode,
+                name.as_c_str(),
+                0o644,
+                false,
+                libc::O_RDWR as u32,
+                0,
+                Extensions::default(),
+            )
+            .expect("create file");
+        let handle = handle.expect("file handle");
+
+        fs.write(
+            ctx(),
+            entry.inode,
+            handle,
+            VecReader {
+                data: b"guest".to_vec(),
+            },
+            5,
+            0,
+            None,
+            false,
+            false,
+            0,
+        )
+        .expect("guest write");
+        fs.fsync(ctx(), entry.inode, false, handle).expect("fsync");
+        assert_eq!(
+            fs::read_to_string(root.join("shared.txt")).expect("host read"),
+            "guest"
+        );
+
+        fs::write(root.join("shared.txt"), b"host-update").expect("host write");
+        let mut reader = VecWriter::default();
+        let read = fs
+            .read(ctx(), entry.inode, handle, &mut reader, 64, 0, None, 0)
+            .expect("guest read after host write");
+        assert_eq!(read, 11);
+        assert_eq!(reader.data, b"host-update");
+
+        fs.release(ctx(), entry.inode, 0, handle, true, false, None)
+            .expect("release");
     }
 
     #[test]

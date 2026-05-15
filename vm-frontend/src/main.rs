@@ -807,6 +807,9 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         "AGENTVM_SELF_TEST_NETWORK".to_string(),
         if self_test.no_net { "deny" } else { "allow" }.to_string(),
     );
+    if let Some(home) = guest_env.get("HOME").cloned() {
+        guest_env.insert("AGENTVM_SELF_TEST_HOME".to_string(), home);
+    }
     let mut policy = policy_from_args(config.network.clone(), policy_args);
     let _lock = ProjectLock::acquire(&config)?;
     let host_port = ensure_payload_listener(&mut policy);
@@ -913,14 +916,30 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
     Ok(config)
 }
 
-fn self_test_payload_script(config: &FrontendConfig, image: &str, hostile: bool) -> String {
+fn self_test_payload_script(_config: &FrontendConfig, image: &str, hostile: bool) -> String {
+    let sqlite_smoke = r#"import os, sqlite3
+root = os.path.join(os.environ["HOME"], ".cache", "agentvm-sqlite-smoke")
+os.makedirs(root, exist_ok=True)
+db = os.path.join(root, "state.sqlite")
+conn = sqlite3.connect(db, timeout=1.0)
+mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+assert mode == "wal", mode
+conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+with conn:
+    conn.execute("INSERT INTO kv(k, v) VALUES('key', 'value') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+conn.close()
+conn = sqlite3.connect(db, timeout=1.0)
+value = conn.execute("SELECT v FROM kv WHERE k='key'").fetchone()[0]
+assert value == "value", value
+conn.close()
+assert os.path.exists(db)
+"#;
     let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
-        format!(
-            "test \"$HOME\" = {}",
-            shell_quote(&config.project.join(".sandbox/home").display().to_string())
-        ),
+        "test \"$HOME\" = \"${AGENTVM_SELF_TEST_HOME:?}\"".to_string(),
+        "test \"$(id -u)\" = \"${AGENTVM_UID:?}\"".to_string(),
+        "test \"$(id -g)\" = \"${AGENTVM_GID:?}\"".to_string(),
         "test -d \"$HOME\"".to_string(),
         "test \"$PWD\" = \"$AGENTVM_SELF_TEST_PROJECT\"".to_string(),
         "test -f /run/agentvm-config/mitm-ca.crt".to_string(),
@@ -935,6 +954,7 @@ fn self_test_payload_script(config: &FrontendConfig, image: &str, hostile: bool)
         "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = allow ]; then node -e 'const dns = require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) throw err; });'; fi".to_string(),
         "printf workspace-ok > .agentvm-self-test-workspace".to_string(),
         "test \"$(cat .agentvm-self-test-workspace)\" = workspace-ok".to_string(),
+        format!("python3 -c {}", shell_quote(sqlite_smoke)),
         "printf bind-ok > .agentvm-self-test-bind".to_string(),
         "docker version >/tmp/agentvm-docker-version".to_string(),
         "docker info >/tmp/agentvm-docker-info".to_string(),
@@ -1182,10 +1202,8 @@ fn runtime_mounts(
     config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<Vec<RuntimeMount>, String> {
-    if policy.tool.is_some() || policy.gh || policy.aws_profile.is_some() {
-        std::fs::create_dir_all(config.project.join(".sandbox/home"))
-            .map_err(|error| format!("failed to create guest HOME: {error}"))?;
-    }
+    std::fs::create_dir_all(config.project.join(".sandbox/home"))
+        .map_err(|error| format!("failed to create persistent guest HOME backing dir: {error}"))?;
     let host_home = host_home_dir()?;
     Ok(guest_runtime_mounts(
         config.project.clone(),
@@ -1201,7 +1219,7 @@ fn runtime_mounts(
 }
 
 fn guest_payload_env(
-    config: &FrontendConfig,
+    _config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<BTreeMap<String, String>, String> {
     let mut env_vars = BTreeMap::new();
@@ -1223,14 +1241,22 @@ fn guest_payload_env(
             "/run/agentvm-ca-bundle.pem".to_string(),
         );
     }
-    if policy.tool.is_none() && !policy.gh && policy.aws_profile.is_none() {
+    if policy.tool.is_none()
+        && policy.payload.is_none()
+        && !policy.gh
+        && policy.aws_profile.is_none()
+    {
         return Ok(env_vars);
     }
     let user = env::var("USER").unwrap_or_else(|_| "sandbox".to_string());
-    let guest_home = config.project.join(".sandbox/home").display().to_string();
+    let guest_home = host_home_dir()?.display().to_string();
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
     env_vars.insert("HOME".to_string(), guest_home.clone());
     env_vars.insert("USER".to_string(), user.clone());
     env_vars.insert("LOGNAME".to_string(), user);
+    env_vars.insert("AGENTVM_UID".to_string(), uid.to_string());
+    env_vars.insert("AGENTVM_GID".to_string(), gid.to_string());
     env_vars.insert(
         "TERM".to_string(),
         env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
@@ -1270,7 +1296,7 @@ fn guest_payload_env(
     env_vars.insert("TMPDIR".to_string(), "/tmp".to_string());
     env_vars.insert(
         "DOCKER_HOST".to_string(),
-        "unix:///var/run/docker.sock".to_string(),
+        "tcp://127.0.0.1:1075".to_string(),
     );
     env_vars.insert("SSH_AUTH_SOCK".to_string(), String::new());
     env_vars.insert("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string());
@@ -1958,9 +1984,10 @@ mod tests {
         .expect("config");
 
         let env = guest_payload_env(&config, &policy).expect("env");
-        let guest_home = root.join("repo/.sandbox/home").display().to_string();
+        let guest_home = host_home_dir().expect("host home").display().to_string();
 
         assert_eq!(env.get("HOME"), Some(&guest_home));
+        assert!(!env.get("HOME").expect("HOME").contains(".sandbox/home"));
         assert_eq!(
             env.get("XDG_CACHE_HOME"),
             Some(&format!("{guest_home}/.cache"))
@@ -1971,7 +1998,17 @@ mod tests {
         );
         assert_eq!(
             env.get("DOCKER_HOST").map(String::as_str),
-            Some("unix:///var/run/docker.sock")
+            Some("tcp://127.0.0.1:1075")
+        );
+        let uid = unsafe { libc::geteuid() }.to_string();
+        let gid = unsafe { libc::getegid() }.to_string();
+        assert_eq!(
+            env.get("AGENTVM_UID").map(String::as_str),
+            Some(uid.as_str())
+        );
+        assert_eq!(
+            env.get("AGENTVM_GID").map(String::as_str),
+            Some(gid.as_str())
         );
         assert_eq!(env.get("SSH_AUTH_SOCK").map(String::as_str), Some(""));
         assert_eq!(
@@ -1986,6 +2023,7 @@ mod tests {
             .get("PATH")
             .expect("PATH")
             .starts_with(&format!("{guest_home}/.local/share/mise/shims:")));
+        assert!(!env.get("PATH").expect("PATH").contains(".sandbox/home"));
         assert_eq!(
             env.get("NODE_EXTRA_CA_CERTS").map(String::as_str),
             Some("/run/agentvm-ca-bundle.pem")
@@ -2303,6 +2341,8 @@ mod tests {
         let script = self_test_payload_script(&config, "alpine:3.22", false);
 
         assert!(script.contains("self-test: payload-start"));
+        assert!(script.contains("id -u"));
+        assert!(script.contains("AGENTVM_UID"));
         assert!(script.contains("/run/agentvm-config/mitm-ca.crt"));
         assert!(script.contains("test ! -e /run/agentvm-config/mitm-ca.key"));
         assert!(script.contains("NODE_EXTRA_CA_CERTS"));
@@ -2311,6 +2351,8 @@ mod tests {
         assert!(script.contains("agentvm-self-test-state"));
         assert!(script.contains("dns.lookup"));
         assert!(script.contains(".agentvm-self-test-workspace"));
+        assert!(script.contains("sqlite3.connect"));
+        assert!(script.contains("PRAGMA journal_mode=WAL"));
         assert!(script.contains("docker info"));
         assert!(script.contains("docker run --rm -v \"$PWD:/work:ro\" alpine:3.22"));
         assert!(script.contains(".agentvm-self-test-bind"));

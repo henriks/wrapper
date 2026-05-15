@@ -78,9 +78,10 @@ All mutable state is project-local under `.sandbox/`:
       guest-config/composed-binds.json
 ```
 
-`.sandbox/home/` is the persistent guest `$HOME`. The sparse
-`docker-data.raw` disk is mounted in the guest at `/var/lib/docker`. `run/`
-contains per-launch sockets, manifests, state, and diagnostic logs.
+`.sandbox/home/` is the project-local backing store for the guest user's
+natural home path. The sparse `docker-data.raw` disk is mounted in the guest at
+`/var/lib/docker`. `run/` contains per-launch sockets, manifests, state, and
+diagnostic logs.
 
 `--reset` removes `.sandbox/` unless the project VM lock is held.
 
@@ -93,10 +94,11 @@ Required/default guest shares:
 
 - The project workspace is mounted read-write at its original absolute path.
 - `/workspace` is a compatibility alias for the project path.
-- `.sandbox/home/` is used as guest `$HOME` for tool launches.
-- Selected tool state is shared deliberately, not by recreating host `$HOME`.
+- `.sandbox/home/` is mounted at the host user's natural home path in the guest;
+  the guest does not see `.sandbox/home` as `$HOME`.
+- Selected tool state is shared deliberately, not by mounting broad host `$HOME`.
 - Enabling Codex in the wrapper/TUI setup exposes Codex state, currently
-  `~/.codex`, as writable tool state under the project guest home.
+  `~/.codex`, as writable tool state at the same absolute path in the guest.
 - `~/.docker` is shared as writable tool state when present.
 - `--gh` shares `~/.config/gh` read-only and forwards `GH_TOKEN` when available.
 - `--ro PATH` exposes a required read-only host path at the same guest path.
@@ -109,13 +111,15 @@ The guest root filesystem is the appliance image.
 
 For tool launches, the frontend sets:
 
-- `HOME=<project>/.sandbox/home`
+- `HOME=<host home path>`
 - `USER` and `LOGNAME`
 - `TERM` and `LANG`
 - XDG base directories under guest `$HOME`
 - `PATH` with guest-home local bins plus standard guest system paths
 - `TMPDIR=/tmp`
-- `DOCKER_HOST=unix:///var/run/docker.sock`
+- `DOCKER_HOST=tcp://127.0.0.1:1075`
+- `AGENTVM_UID` and `AGENTVM_GID` carrying the host uid/gid used for payload
+  privilege drop inside the guest
 
 Credential leakage controls:
 

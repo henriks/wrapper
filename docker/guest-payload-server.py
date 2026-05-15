@@ -55,6 +55,29 @@ def set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, packed)
 
 
+def payload_identity(env: dict[str, str]) -> tuple[int | None, int | None]:
+    uid = env.get("AGENTVM_UID")
+    gid = env.get("AGENTVM_GID")
+    if uid is None and gid is None:
+        return None, None
+    if uid is None or gid is None:
+        raise ValueError("payload identity requires both AGENTVM_UID and AGENTVM_GID")
+    return int(uid), int(gid)
+
+
+def payload_preexec(uid: int | None, gid: int | None):
+    def preexec() -> None:
+        os.setsid()
+        if uid is None or gid is None:
+            return
+        if hasattr(os, "setgroups"):
+            os.setgroups([gid])
+        os.setgid(gid)
+        os.setuid(uid)
+
+    return preexec
+
+
 def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
     script = str(request.get("script") or "")
     if not script:
@@ -63,6 +86,7 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
     cwd = str(request.get("cwd") or "/")
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in dict(request.get("env") or {}).items()})
+    uid, gid = payload_identity(env)
     rows = int(request.get("rows") or 24)
     cols = int(request.get("cols") or 80)
 
@@ -76,7 +100,7 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
         stderr=slave_fd,
         cwd=cwd,
         env=env,
-        preexec_fn=os.setsid,
+        preexec_fn=payload_preexec(uid, gid),
         close_fds=True,
     )
     os.close(slave_fd)

@@ -97,7 +97,7 @@ impl StartupDialog {
         let area = centered_rect(frame.area(), 64, 11);
         let choice = if self.enable_codex { "yes" } else { "no" };
         let body = format!(
-            "Initialize Codex for this sandbox?\n\nCodex state will be mounted read-write under the project guest home.\n\n[Y] yes  [N] no  [Space] toggle  [Enter] accept  [Esc] cancel\n\nCurrent: {choice}"
+            "Initialize Codex for this sandbox?\n\nCodex state will be mounted read-write at its normal home path.\n\n[Y] yes  [N] no  [Space] toggle  [Enter] accept  [Esc] cancel\n\nCurrent: {choice}"
         );
         let paragraph = Paragraph::new(body)
             .block(

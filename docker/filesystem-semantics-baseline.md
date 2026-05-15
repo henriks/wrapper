@@ -30,7 +30,9 @@ The baseline is driven by these wrapper workflows:
   auth/config, and user-requested paths
 - guest init creates `.sandbox/docker-vm/run/` under the shared workspace and
   writes mirrored logs there
-- Codex/Copilot install or run from project-local `$HOME` under `.sandbox/home`
+- Codex/Copilot install or run from the host user's natural `$HOME` path in the
+  guest, backed by project-local `.sandbox/home` storage where no more specific
+  host-backed mount overrides it
 - npm, mise, shell startup, and tool caches write under `$HOME/.local`,
   `$HOME/.cache`, `$HOME/.config`, and `$HOME/.local/state`
 - Git reads and writes normal workspace files and may use lock-file rename
@@ -47,6 +49,8 @@ The baseline is driven by these wrapper workflows:
 The backend should distinguish these source classes from the manifest:
 
 - `workspace`: writable project tree
+- `persistent-home`: project-local backing store mounted at the guest-visible
+  host home path
 - `tool-state`: writable tool state such as `.codex`, `.copilot`, and
   `.docker` when present
 - `auth-config`: readonly host auth/config such as `.config/gh`
@@ -168,7 +172,11 @@ These operations are required for v1:
 
 These may be deferred in v1 if documented and covered by tests:
 
-- POSIX locks: `getlk`, `setlk`, `setlkw`
+- POSIX locks: `getlk`, `setlk`, `setlkw`. ComposedFs does not advertise
+  `POSIX_LOCKS` with the current `virtiofsd` crate API and returns
+  `EOPNOTSUPP` if those trait hooks are reached; shared writable workloads that
+  require host-coherent byte-range locks need explicit validation before being
+  considered fully supported.
 - `ioctl`
 - `bmap`
 - `poll`
@@ -312,6 +320,26 @@ printf '{}' > "$HOME/.config/fs-smoke.json"
 npm config get prefix
 ```
 
+SQLite-style state, where Python's `sqlite3` module is present:
+
+```sh
+python3 - <<'PY'
+import os, sqlite3
+root = os.path.join(os.environ["HOME"], ".cache", "agentvm-sqlite-smoke")
+os.makedirs(root, exist_ok=True)
+db = os.path.join(root, "state.sqlite")
+conn = sqlite3.connect(db, timeout=1.0)
+assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() == "wal"
+conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT NOT NULL)")
+with conn:
+    conn.execute("INSERT INTO kv VALUES('key', 'value') ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+conn.close()
+conn = sqlite3.connect(db, timeout=1.0)
+assert conn.execute("SELECT v FROM kv WHERE k='key'").fetchone()[0] == "value"
+conn.close()
+PY
+```
+
 Docker bind mount:
 
 ```sh
@@ -359,6 +387,8 @@ Backend correctness tests should cover:
 - xattr success and unsupported-host behavior
 - `access` enforcing readonly/write intent
 - `flush`, `fsync`, and `release` handle cleanup
+- SQLite-style WAL smoke on a real mounted composed-fs path in live VM
+  validation
 
 VM integration tests should run the smoke commands above on:
 - `q35 + composed fs`
@@ -371,7 +401,9 @@ implementation ticket:
 
 - no live migration state support beyond default `SerializableFileSystem`
   unsupported behavior
-- no POSIX lock implementation unless a real workload requires it
+- no POSIX lock implementation with the current `virtiofsd` crate API; the
+  backend must not advertise `POSIX_LOCKS`, and lock hooks fail explicitly with
+  `EOPNOTSUPP`
 - no special-device `mknod`
 - no cross-mount hardlinks or renames
 - no reliable host-coherent long-lived attribute/path cache

@@ -216,7 +216,7 @@ case "${PROJECT_PATH}" in
     ;;
 esac
 
-mkdir -p /proc /sys /dev /dev/pts /run /tmp /workspace /var/lib/docker /var/log /sys/fs/cgroup
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /home /workspace /var/lib/docker /var/log /sys/fs/cgroup
 mount -t proc proc /proc || true
 mount -t sysfs sysfs /sys || true
 mount -t devtmpfs devtmpfs /dev || true
@@ -225,15 +225,13 @@ ln -sf /dev/pts/ptmx /dev/ptmx
 mount -t cgroup2 none /sys/fs/cgroup || true
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /home || true
 mount /dev/vdb /var/lib/docker
 mkdir -p /run/agentvm-config /run/agentvm-share-mnts
 mount -t virtiofs "${CONFIG_VIRTIOFS_TAG}" /run/agentvm-config
 
 case "${PROJECT_PATH}" in
-  /home/*)
-    mount -t tmpfs tmpfs /home || true
-    ;;
-  /tmp/*|/workspace)
+  /home/*|/tmp/*|/workspace)
     ;;
   *)
     log "warning: unsupported guest project path '${PROJECT_PATH}', falling back to /workspace"

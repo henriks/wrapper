@@ -11,6 +11,7 @@ The supported end state is one isolation boundary only: the project-scoped VM.
   tool command runs.
 - The selected tool command runs inside the guest, not on the host.
 - Docker runs inside the same guest and is available to the tool there.
+- Payload commands run as the host-mapped uid/gid inside the guest, not as root.
 - The VM exists only for the lifetime of that wrapper invocation.
 - Persistent Docker state is limited to the sparse data disk under
   `.sandbox/docker-vm/`.
@@ -45,7 +46,8 @@ The guest is responsible for:
 - starting `dockerd`
 - applying guest network configuration
 - making any configured auth/config shares visible at their guest paths
-- launching the requested payload command
+- launching the requested payload command after dropping to the host-mapped
+  uid/gid
 
 The guest is the only execution environment for the tool payload.
 
@@ -128,7 +130,8 @@ Layout:
 
 Rules:
 
-- `.sandbox/home/` is the persistent guest home for the selected tool.
+- `.sandbox/home/` is the project-local backing store for the guest user's
+  natural home path.
 - `.sandbox/docker-vm/docker-data.raw` is the persistent sparse disk mounted in
   the guest at `/var/lib/docker`.
 - `.sandbox/docker-vm/run/` is per-launch runtime and diagnostic state.
@@ -145,7 +148,9 @@ The VM-only contract assumes a deliberately small set of host inputs:
   - optionally also available at `/workspace` as a compatibility alias
 - persistent guest home
   - sourced from `.sandbox/home/`
-  - mounted inside the guest at the guest user's home path
+  - mounted inside the guest at the host user's natural home path
+  - hidden from the guest as an implementation path; `$HOME` must not point at
+    `.sandbox/home`
 - tool/auth/config material
   - only the minimum required host-backed inputs should be exposed
   - examples include tool auth state, Docker client config, GitHub auth, and

@@ -1,6 +1,6 @@
 ---
 id: wra-x8pk
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-14T21:45:52Z
@@ -35,3 +35,13 @@ Relevant code/docs:
 - Docs update the V1 compromises section to reflect the actual policy.
 - Any unsupported lock operation fails in a way that does not let applications silently assume locking works when it does not.
 
+
+## Notes
+
+**2026-05-14T21:51:16Z**
+
+User requested extending test sets to cover missing POSIX filesystem behavior. In addition to lock implementation/gating, add tests for lock contention and the failure mode seen by normal POSIX callers so apps do not silently assume unsupported semantics.
+
+**2026-05-14T21:57:14Z**
+
+Audited virtiofsd 1.13.3 FileSystem lock hooks. The trait methods getlk/setlk/setlkw expose no inode, handle, lock owner, range, or lock type details, so correct host-coherent POSIX byte-range lock forwarding is not implementable against this API. ComposedFs now does not advertise POSIX_LOCKS and overrides lock hooks to fail explicitly with EOPNOTSUPP if reached. Added tests for the advertised capability and explicit lock failures. Docs updated in filesystem-semantics-baseline.md and plan.md.

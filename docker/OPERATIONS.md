@@ -6,8 +6,8 @@ This document describes the current VM-only runtime operated by the Rust
 ## Summary
 
 - The agent payload always runs inside a project-scoped QEMU microvm.
-- Docker runs inside the same guest and is available at
-  `unix:///var/run/docker.sock`.
+- Docker runs inside the same guest and is available to payloads through the
+  guest socket bridge at `tcp://127.0.0.1:1075`.
 - The host does not run the payload under Bubblewrap.
 - Filesystem sharing is served by embedded Rust composed-fs instances.
 - Guest networking is enforced by the Rust userspace vmnet gateway over QEMU
@@ -56,7 +56,8 @@ sudo docker/build-appliance.sh
 
 Meaning:
 
-- `.sandbox/home/` is the persistent guest `$HOME`.
+- `.sandbox/home/` backs the guest user's natural home path; the guest-visible
+  `$HOME` is the host home path, not `.sandbox/home`.
 - `docker-data.raw` is the persistent sparse ext4 disk mounted at
   `/var/lib/docker`.
 - `lock` prevents concurrent VM launches for the same project.

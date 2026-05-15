@@ -1,6 +1,6 @@
 ---
 id: wra-ndxm
-status: open
+status: closed
 deps: [wra-jek5]
 links: []
 created: 2026-05-14T21:47:08Z
@@ -36,3 +36,13 @@ Relevant code/docs:
 - Documented composed-fs semantics are sufficient for normal tools sharing a writable directory through natural paths.
 - Any unsupported filesystem feature fails explicitly or is documented as a generic mount capability limitation.
 
+
+## Notes
+
+**2026-05-14T21:51:16Z**
+
+User requested extending the test sets for these aspects and any other missing POSIX filesystem behavior. When implementing this ticket, broaden tests beyond the motivating Codex case: cover natural home path overlays, nested mount boundaries, concurrent host/guest mutation, and additional POSIX filesystem semantics not already covered by the existing baseline.
+
+**2026-05-14T21:57:14Z**
+
+Expanded generic shared filesystem coverage without adding Codex-specific policy. Added composed-fs tests for natural home overlay with nested workspace/tool-state mounts and host/guest visibility through the same writable mount. Existing tests already cover rename/unlink, xattrs, readonly boundaries, symlink escape, open handles, readdir snapshots, and operation-model/property sequences. Verification: cargo test --manifest-path composed-fs/Cargo.toml --offline.

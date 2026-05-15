@@ -198,9 +198,11 @@ Outcome:
 - required behavior includes lookup counts, open handles surviving
   rename/unlink, nested readonly enforcement, file mounts in parent `readdir`,
   `access` checks, `flush`/`fsync`, and xattr delegation where supported
-- explicit v1 deferrals include POSIX locks, special-device `mknod`, cross-mount
-  hardlinks/renames, live migration state, and rare operations such as
-  `ioctl`, `poll`, `copyfilerange`, and `syncfs`
+- explicit v1 deferrals include host-coherent POSIX locks, special-device
+  `mknod`, cross-mount hardlinks/renames, live migration state, and rare
+  operations such as `ioctl`, `poll`, `copyfilerange`, and `syncfs`; the
+  backend must not advertise unsupported lock capability and should fail lock
+  hooks explicitly
 
 ## Manifest Design
 

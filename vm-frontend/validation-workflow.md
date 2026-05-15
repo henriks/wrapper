@@ -78,8 +78,9 @@ Prerequisites:
 
 The live tier validates the real QEMU stream network, payload-control listener,
 published payload port, composed virtiofs workspace, guest config filesystem,
-MITM CA bundle exposure without private key exposure, guest DNS lookup, Docker
-CLI, and Docker bind-mounted workspace.
+MITM CA bundle exposure without private key exposure, guest DNS lookup,
+SQLite/WAL activity under guest `$HOME`, Docker CLI, and Docker bind-mounted
+workspace.
 
 ## Interactive TUI Smoke
 
@@ -103,7 +104,7 @@ Expected behavior:
 - A startup dialog appears because no tool was selected by argv0 or `--tool`.
 - Accepting the default initializes Codex and the generated
   `.sandbox/docker-vm/run/composed-fs-manifest.json` contains a writable
-  `.sandbox/home/.codex` tool-state mount.
+  `$HOME/.codex` tool-state mount backed by the same host path.
 - The guest payload renders inside the terminal viewport, with a
   one-line wrapper status/prompt area below it.
 - Typed input in guest focus reaches the guest payload.

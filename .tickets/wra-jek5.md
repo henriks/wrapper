@@ -1,6 +1,6 @@
 ---
 id: wra-jek5
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-14T21:45:29Z
@@ -38,3 +38,13 @@ Relevant code/docs:
 - Unit tests cover guest_payload_env and runtime_manifest path generation.
 - Docs describe guest-visible home path separately from backing storage.
 
+
+## Notes
+
+**2026-05-14T21:51:16Z**
+
+User requested tests for the guest home path fix. Add unit coverage proving HOME/XDG/PATH and generated bind targets use the host-natural home path and do not leak .sandbox/home into the guest-visible environment or manifest paths, except as host backing storage.
+
+**2026-05-14T21:54:40Z**
+
+Implemented natural guest home path. Runtime manifests now add a persistent-home mount from <project>/.sandbox/home to the host HOME path, then nest workspace/tool/auth mounts at their natural absolute paths. guest_payload_env now sets HOME/XDG/PATH from host_home_dir() and no longer leaks .sandbox/home in guest-visible env. guest-init always prepares /home as tmpfs for natural-home binds. Docs updated to describe .sandbox/home as backing storage. Verification: cargo test --manifest-path vm-frontend/Cargo.toml --offline; cargo test --manifest-path composed-fs/Cargo.toml --offline; sh -n docker/guest-init.sh.

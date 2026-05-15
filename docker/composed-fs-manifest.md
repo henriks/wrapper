@@ -78,8 +78,22 @@ Example:
       }
     },
     {
-      "id": "m0002_codex",
-      "guest_path": "/home/user/project/.sandbox/home/.codex",
+      "id": "m0002_home",
+      "guest_path": "/home/user",
+      "host_path": "/home/user/project/.sandbox/home",
+      "kind": "dir",
+      "access": "rw",
+      "source_class": "persistent-home",
+      "required": true,
+      "bind": true,
+      "metadata": {
+        "uid_gid": "host",
+        "permissions": "host"
+      }
+    },
+    {
+      "id": "m0003_codex",
+      "guest_path": "/home/user/.codex",
       "host_path": "/home/user/.codex",
       "kind": "dir",
       "access": "rw",
@@ -92,8 +106,8 @@ Example:
       }
     },
     {
-      "id": "m0003_docker_config",
-      "guest_path": "/home/user/project/.sandbox/home/.docker",
+      "id": "m0004_docker_config",
+      "guest_path": "/home/user/.docker",
       "host_path": "/home/user/.docker",
       "kind": "dir",
       "access": "rw",
@@ -106,8 +120,8 @@ Example:
       }
     },
     {
-      "id": "m0004_gh_config",
-      "guest_path": "/home/user/project/.sandbox/home/.config/gh",
+      "id": "m0005_gh_config",
+      "guest_path": "/home/user/.config/gh",
       "host_path": "/home/user/.config/gh",
       "kind": "dir",
       "access": "ro",
@@ -199,8 +213,8 @@ Required mount fields:
 - `host_path`: absolute normalized host source path
 - `kind`: `dir` or `file`
 - `access`: `rw` or `ro`
-- `source_class`: `workspace`, `tool-state`, `auth-config`, `system-ro`,
-  `user-ro`, or `user-rw`
+- `source_class`: `workspace`, `persistent-home`, `tool-state`, `auth-config`,
+  `system-ro`, `user-ro`, or `user-rw`
 - `required`: whether missing source fails startup
 - `bind`: whether guest init should bind this path into its final location
 - `metadata.uid_gid`: `host` for v1
@@ -264,25 +278,32 @@ Workspace:
 - `access` is `rw`
 - `source_class` is `workspace`
 
+Persistent guest home:
+- required
+- `guest_path` is the host user's natural home path
+- `host_path` is `<project>/.sandbox/home`
+- `access` is `rw`
+- `source_class` is `persistent-home`
+
 Tool state:
 - optional unless the current wrapper treats the source as required
 - host paths come from `TOOLS[tool]["host_home_mounts"]`
-- guest paths go under the project-local guest home:
-  `<project>/.sandbox/home/<relative-tool-path>`
+- guest paths go under the host user's natural home path:
+  `$HOME/<relative-tool-path>`
 - `access` is `rw`
 - `source_class` is `tool-state`
 
 Docker client config:
 - optional
 - host path: `$HOME/.docker`
-- guest path: `<project>/.sandbox/home/.docker`
+- guest path: `$HOME/.docker`
 - `access` is `rw`
 - `source_class` is `tool-state`
 
 GitHub config:
 - optional and only generated for `--gh`
 - host path: `$HOME/.config/gh`
-- guest path: `<project>/.sandbox/home/.config/gh`
+- guest path: `$HOME/.config/gh`
 - `access` is `ro`
 - `source_class` is `auth-config`
 
