@@ -12,7 +12,7 @@ Always consider carefully whether a problem can be solved by removing and combin
 
 # Testing
 
-After code changes, run the full validation set before considering the work done: the offline test suite (`cargo test --manifest-path vm-frontend/Cargo.toml --offline`) and live validation (`./vm-frontend/validate.sh live`). If live validation cannot be run in the current environment, explicitly document that limitation and ask the user to run it.
+After code changes, run the required validation gate before considering the work done: `./vm-frontend/validate.sh required`. That gate includes formatting, composed-fs and vm-frontend offline tests, offline guest service tests, fuzz target compilation, documentation drift checks, and the quick live host scenario (`live-smoke`). The live-only tier remains available as `./vm-frontend/validate.sh host-live` (or `live`), and broader live scenarios are available through `live-hostile`, `live-payload`, `live-dns`, `live-docker`, `live-fs`, and `live-full`. If live validation cannot be run in the current environment, explicitly document that limitation and ask the user to run it.
 
 Unless code has been exercised in the live environment, do not mark a task as completed.
 

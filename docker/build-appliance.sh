@@ -178,6 +178,30 @@ pack_rootfs() {
   mkfs.ext4 -F -d "${ROOTFS_DIR}" "${ROOTFS_IMAGE}"
 }
 
+source_inputs_json() {
+  local files=(
+    appliance.env
+    build-appliance.sh
+    guest-init.sh
+    guest-payload-server.py
+    guest-socket-bridge.py
+    refresh-pins.sh
+  )
+  local first=true
+  local file
+  local hash
+  for file in "${files[@]}"; do
+    hash=$(sha256sum "${SCRIPT_DIR}/${file}" | awk '{print $1}')
+    if [[ "${first}" == true ]]; then
+      first=false
+    else
+      printf ',\n'
+    fi
+    printf '    { "path": "docker/%s", "sha256": "%s" }' "${file}" "${hash}"
+  done
+  printf '\n'
+}
+
 write_manifest() {
   cat > "${MANIFEST_PATH}" <<EOF
 {
@@ -187,6 +211,8 @@ write_manifest() {
     "initrd": "docker/out/initrd.img",
     "rootfs": "docker/out/rootfs.raw"
   },
+  "source_inputs": [
+$(source_inputs_json)  ],
   "vm": {
     "cpus": 2,
     "memory_bytes": 2147483648,

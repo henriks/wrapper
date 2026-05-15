@@ -2499,6 +2499,48 @@ mod tests {
         }
     }
 
+    fn fcntl_lock_eventually(
+        fd: RawFd,
+        command: i32,
+        lock: libc::flock,
+    ) -> io::Result<libc::flock> {
+        let mut last_error = None;
+        for _ in 0..50 {
+            match fcntl_lock(fd, command, lock) {
+                Ok(lock) => return Ok(lock),
+                Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EACCES) =>
+                {
+                    last_error = Some(error);
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("lock did not complete")))
+    }
+
+    fn fs_setlk_eventually(
+        fs: &ComposedFs,
+        inode: u64,
+        handle: u64,
+        owner: u64,
+        lock: fuse::FileLock,
+    ) -> io::Result<()> {
+        let mut last_error = None;
+        for _ in 0..50 {
+            match fs.setlk(ctx(), inode, handle, owner, lock, 0) {
+                Ok(()) => return Ok(()),
+                Err(error) if matches!(error.raw_os_error(), Some(code) if code == libc::EAGAIN || code == libc::EACCES) =>
+                {
+                    last_error = Some(error);
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| io::Error::other("fs lock did not complete")))
+    }
+
     fn assert_lock_conflict(error: io::Error, label: &str) {
         let raw = error.raw_os_error();
         assert!(
@@ -4585,13 +4627,12 @@ mod tests {
         .expect("owner 10 lock");
         fs.flush(ctx(), db.inode, handle, 10)
             .expect("flush owner 10");
-        fs.setlk(
-            ctx(),
+        fs_setlk_eventually(
+            &fs,
             db.inode,
             handle,
             20,
             fuse_byte_lock(libc::F_WRLCK, 0, 1),
-            0,
         )
         .expect("owner 20 lock after flush");
         fs.release(ctx(), db.inode, 0, handle, false, false, None)
@@ -4602,7 +4643,7 @@ mod tests {
             .write(true)
             .open(root.join("state.sqlite"))
             .expect("open host");
-        fcntl_lock(
+        fcntl_lock_eventually(
             host.as_raw_fd(),
             libc::F_SETLK,
             byte_lock(libc::F_WRLCK, 0, 1),

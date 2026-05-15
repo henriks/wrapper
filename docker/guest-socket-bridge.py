@@ -72,6 +72,7 @@ def proxy_bidirectional(left: socket.socket, right: socket.socket,
 
 
 def handle_client(client: socket.socket, docker_sock: str) -> None:
+    upstream: socket.socket | None = None
     try:
         log(f"accepted client, connecting to {docker_sock}")
         upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -84,6 +85,8 @@ def handle_client(client: socket.socket, docker_sock: str) -> None:
             flush=True,
         )
         client.close()
+        if upstream is not None:
+            upstream.close()
         return
 
     proxy_bidirectional(client, upstream, "client", "docker")

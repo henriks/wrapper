@@ -630,6 +630,26 @@ mod tests {
     }
 
     #[test]
+    fn preserves_upstream_nxdomain_response_code() {
+        let policy = policy_allowing("missing.example");
+        let mut upstream_response = response_with_query(0x1234, "missing.example", RecordType::A);
+        upstream_response.metadata.response_code = ResponseCode::NXDomain;
+        let proxy = DnsProxy::new(
+            &policy,
+            StaticUpstream {
+                result: Ok(upstream_response),
+            },
+        );
+
+        let result = proxy.handle_udp_payload(&query("missing.example"));
+        let response = Message::from_vec(&result.response.expect("nxdomain response"))
+            .expect("parse nxdomain");
+
+        assert_eq!(result.log.decision, DnsDecision::Allowed);
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+    }
+
+    #[test]
     fn non_gateway_dns_destination_is_denied() {
         let policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
 

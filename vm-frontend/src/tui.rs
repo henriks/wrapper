@@ -762,6 +762,19 @@ mod tests {
 
     use super::*;
 
+    fn backend_rows(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> Vec<String> {
+        let cells = &terminal.backend().buffer().content;
+        cells
+            .chunks(usize::from(width))
+            .take(usize::from(height))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect()
+    }
+
+    fn backend_text(terminal: &Terminal<TestBackend>, width: u16, height: u16) -> String {
+        backend_rows(terminal, width, height).join("\n")
+    }
+
     #[test]
     fn viewport_size_uses_terminal_area_above_status() {
         let layout = viewport_layout(Rect::new(0, 0, 80, 24));
@@ -926,6 +939,29 @@ mod tests {
     }
 
     #[test]
+    fn startup_dialog_renders_at_representative_terminal_sizes() {
+        for (width, height) in [(80, 24), (42, 12)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let dialog = StartupDialog::new();
+
+            terminal.draw(|frame| dialog.render(frame)).expect("draw");
+
+            let text = backend_text(&terminal, width, height);
+            assert!(text.contains("Sandbox Setup"), "{width}x{height}\n{text}");
+            assert!(
+                text.contains("Initialize Codex"),
+                "{width}x{height}\n{text}"
+            );
+            assert!(text.contains("Current: yes"), "{width}x{height}\n{text}");
+            assert_eq!(
+                backend_rows(&terminal, width, height).len(),
+                usize::from(height)
+            );
+        }
+    }
+
+    #[test]
     fn config_editor_model_edits_main_config_fields_before_save() {
         let mut editor = ConfigEditor::new(WrapperSandboxConfig::setup_tool(SetupTool::Codex));
 
@@ -973,6 +1009,68 @@ mod tests {
         assert_eq!(
             editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             ConfigEditorResult::Save
+        );
+    }
+
+    #[test]
+    fn config_editor_renders_fixed_size_summary_without_overlap() {
+        let mut editor = ConfigEditor::new(WrapperSandboxConfig::setup_tool(SetupTool::Codex));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        editor.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+
+        for (width, height) in [(82, 24), (50, 14)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+
+            terminal.draw(|frame| editor.render(frame)).expect("draw");
+
+            let text = backend_text(&terminal, width, height);
+            assert!(text.contains("Sandbox Config"), "{width}x{height}\n{text}");
+            assert!(text.contains("Default: pi"), "{width}x{height}\n{text}");
+            assert!(text.contains("Network: none"), "{width}x{height}\n{text}");
+            assert!(text.contains("GitHub auth: on"), "{width}x{height}\n{text}");
+            assert!(text.contains("Shares: 1"), "{width}x{height}\n{text}");
+            assert!(
+                text.contains("Published ports: 1"),
+                "{width}x{height}\n{text}"
+            );
+            assert_eq!(
+                backend_rows(&terminal, width, height).len(),
+                usize::from(height)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_focus_keeps_text_out_of_guest_input_until_closed() {
+        let mut view = GuestTerminalView::new(10, 20);
+        view.open_prompt("wrapper prompt");
+
+        assert_eq!(view.status.focus, FocusMode::WrapperPrompt);
+        assert_eq!(
+            view.handle_wrapper_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            WrapperKeyOutcome::Redraw
+        );
+        assert_eq!(view.prompt.as_ref().expect("prompt").input.value(), "x");
+        assert_eq!(view.last_prompt_result, None);
+        assert_ne!(
+            view.handle_wrapper_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            WrapperKeyOutcome::GuestInput(GuestInput::Signal(libc::SIGINT))
+        );
+
+        assert_eq!(
+            view.handle_wrapper_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            WrapperKeyOutcome::PromptFinished
+        );
+        assert_eq!(view.status.focus, FocusMode::Guest);
+        assert_eq!(
+            view.last_prompt_result,
+            Some(PromptResult::Accepted {
+                value: "x".to_string()
+            })
         );
     }
 

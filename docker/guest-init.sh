@@ -1,7 +1,14 @@
 #!/bin/sh
 set -eu
 
-. /etc/agentvm.env
+if [ "${AGENTVM_GUEST_INIT_SOURCE_ONLY:-0}" = "1" ] && [ ! -f /etc/agentvm.env ]; then
+  DOCKER_TCP_PORT=1075
+  PAYLOAD_TCP_PORT=1076
+  VIRTIOFS_TAG=workspace
+  CONFIG_VIRTIOFS_TAG=agentvm-config
+else
+  . /etc/agentvm.env
+fi
 
 readonly DOCKER_TCP_PORT
 readonly PAYLOAD_TCP_PORT
@@ -196,6 +203,7 @@ teardown() {
   poweroff -f || reboot -f || true
 }
 
+main() {
 trap teardown INT TERM HUP
 
 PROJECT_PATH=$(get_cmdline_value agentvm_project || true)
@@ -323,3 +331,11 @@ dump_log_if_present "${GUEST_DOCKERD_LOG}" dockerd.log
 dump_log_if_present "${GUEST_SOCKET_BRIDGE_LOG}" socket-bridge.log
 dump_log_if_present "${GUEST_PAYLOAD_SERVER_LOG}" payload-server.log
 teardown
+
+}
+
+if [ "${AGENTVM_GUEST_INIT_SOURCE_ONLY:-0}" = "1" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+
+main "$@"

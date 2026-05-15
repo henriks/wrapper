@@ -18,6 +18,7 @@ import threading
 
 
 FRAME_HEADER = struct.Struct("!cI")
+MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -36,12 +37,16 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 def recv_frame(sock: socket.socket) -> tuple[bytes, bytes]:
     frame_type, length = FRAME_HEADER.unpack(recv_exact(sock, FRAME_HEADER.size))
+    if length > MAX_FRAME_PAYLOAD:
+        raise ValueError(f"payload frame too large: {length} > {MAX_FRAME_PAYLOAD}")
     payload = recv_exact(sock, length) if length else b""
     return frame_type, payload
 
 
 def send_frame(sock: socket.socket, frame_type: bytes, payload: bytes = b"",
                lock: threading.Lock | None = None) -> None:
+    if len(payload) > MAX_FRAME_PAYLOAD:
+        raise ValueError(f"payload frame too large: {len(payload)} > {MAX_FRAME_PAYLOAD}")
     frame = FRAME_HEADER.pack(frame_type, len(payload)) + payload
     if lock is None:
         sock.sendall(frame)
@@ -180,14 +185,29 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
 
 def handle_client(conn: socket.socket, session_lock: threading.Lock) -> None:
     with conn:
-        frame_type, payload = recv_frame(conn)
+        try:
+            frame_type, payload = recv_frame(conn)
+        except EOFError as exc:
+            log(f"payload client disconnected before initial frame: {exc}")
+            return
+        except ValueError as exc:
+            log(f"payload protocol failed: {exc}")
+            try:
+                send_frame(conn, b"F", str(exc).encode("utf-8"))
+            except OSError:
+                pass
+            return
         if frame_type == b"P":
             send_frame(conn, b"K", b"ok")
             return
         if frame_type != b"R":
             send_frame(conn, b"F", b"unexpected initial frame")
             return
-        request = json.loads(payload.decode("utf-8"))
+        try:
+            request = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            send_frame(conn, b"F", f"invalid payload request JSON: {exc}".encode("utf-8"))
+            return
         if not session_lock.acquire(blocking=False):
             send_frame(conn, b"F", b"payload session already active")
             return

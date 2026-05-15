@@ -158,6 +158,7 @@ pub struct RunningFrontend {
     policy: VmnetPolicy,
     child: std::process::Child,
     shutting_down: Arc<AtomicBool>,
+    finished: bool,
 }
 
 impl RunningFrontend {
@@ -182,7 +183,7 @@ impl RunningFrontend {
         })
     }
 
-    fn finish(self, qemu_exit: QemuExit) -> Result<QemuExit, LaunchError> {
+    fn finish(mut self, qemu_exit: QemuExit) -> Result<QemuExit, LaunchError> {
         self.shutting_down.store(true, Ordering::SeqCst);
         let state_status = if qemu_exit.timed_out {
             "timed_out"
@@ -197,7 +198,32 @@ impl RunningFrontend {
             Some(&qemu_status),
             Some(&self.policy),
         )?;
+        self.finished = true;
         Ok(qemu_exit)
+    }
+}
+
+impl Drop for RunningFrontend {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.to_string()),
+            Ok(None) => {
+                let _ = self.child.kill();
+                self.child.wait().ok().map(|status| status.to_string())
+            }
+            Err(error) => Some(format!("cleanup status unavailable: {error}")),
+        };
+        let _ = write_launch_state(
+            &self.config,
+            "terminated",
+            None,
+            status.as_deref(),
+            Some(&self.policy),
+        );
     }
 }
 
@@ -289,6 +315,7 @@ pub fn start_frontend_with_policy(
         policy,
         child,
         shutting_down,
+        finished: false,
     })
 }
 
@@ -633,6 +660,166 @@ mod tests {
     }
 
     #[test]
+    fn drop_running_frontend_kills_child_and_records_cleanup_state() {
+        let config = minimal_frontend_config("drop-cleanup");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .spawn()
+            .expect("spawn fake qemu");
+        let pid = child.id();
+        let shutting_down = Arc::new(AtomicBool::new(false));
+
+        drop(RunningFrontend {
+            config: config.clone(),
+            policy,
+            child,
+            shutting_down: shutting_down.clone(),
+            finished: false,
+        });
+
+        assert!(shutting_down.load(Ordering::SeqCst));
+        assert_process_exited(pid);
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[test]
+    fn waited_running_frontend_is_not_overwritten_by_drop_cleanup() {
+        let config = minimal_frontend_config("wait-finished");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .spawn()
+            .expect("spawn fake qemu");
+        let running = RunningFrontend {
+            config: config.clone(),
+            policy,
+            child,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            finished: false,
+        };
+
+        let exit = running.wait(None).expect("wait fake qemu");
+
+        assert!(!exit.status.success());
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"exited\""), "{state}");
+        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[test]
+    fn explicit_terminate_marks_finished_and_reaps_child() {
+        let config = minimal_frontend_config("explicit-terminate");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .spawn()
+            .expect("spawn fake qemu");
+        let pid = child.id();
+        let shutting_down = Arc::new(AtomicBool::new(false));
+        let running = RunningFrontend {
+            config: config.clone(),
+            policy,
+            child,
+            shutting_down: shutting_down.clone(),
+            finished: false,
+        };
+
+        let _ = running.terminate().expect("terminate fake qemu");
+
+        assert!(shutting_down.load(Ordering::SeqCst));
+        assert_process_exited(pid);
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"exited\""), "{state}");
+        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[test]
+    fn wait_timeout_kills_child_and_records_timed_out_state() {
+        let config = minimal_frontend_config("wait-timeout");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let child = Command::new("sh")
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .spawn()
+            .expect("spawn fake qemu");
+        let pid = child.id();
+        let running = RunningFrontend {
+            config: config.clone(),
+            policy,
+            child,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            finished: false,
+        };
+
+        let exit = running
+            .wait(Some(Duration::from_millis(1)))
+            .expect("timeout fake qemu");
+
+        assert!(exit.timed_out);
+        assert_process_exited(pid);
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"timed_out\""), "{state}");
+        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[test]
+    fn repeated_runner_after_drop_cleanup_can_update_state() {
+        let config = minimal_frontend_config("repeat-after-drop");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let first = Command::new("sh")
+            .arg("-c")
+            .arg("while true; do sleep 1; done")
+            .spawn()
+            .expect("spawn first fake qemu");
+        let first_pid = first.id();
+        drop(RunningFrontend {
+            config: config.clone(),
+            policy: policy.clone(),
+            child: first,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            finished: false,
+        });
+        assert_process_exited(first_pid);
+
+        let second = Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn second fake qemu");
+        let running = RunningFrontend {
+            config: config.clone(),
+            policy,
+            child: second,
+            shutting_down: Arc::new(AtomicBool::new(false)),
+            finished: false,
+        };
+
+        let exit = running.wait(None).expect("wait second fake qemu");
+
+        assert!(exit.status.success());
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"exited\""), "{state}");
+        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[test]
+    fn stale_socket_cleanup_removes_existing_paths_and_ignores_missing() {
+        let root = unique_temp_dir();
+        let stale = root.join("stale.sock");
+        fs::write(&stale, b"stale").expect("stale file");
+
+        remove_stale_socket(&stale).expect("remove stale file");
+        remove_stale_socket(&stale).expect("ignore missing stale file");
+
+        assert!(!stale.exists());
+    }
+
+    #[test]
     fn writes_launch_state_snapshot() {
         let root = unique_temp_dir();
         fs::create_dir_all(root.join("repo")).expect("repo");
@@ -680,6 +867,56 @@ mod tests {
         assert!(state.contains("composed-fs-manifest.json"));
         assert!(state.contains("config-fs-manifest.json"));
         assert!(state.contains("composed-binds.json"));
+    }
+
+    fn minimal_frontend_config(name: &str) -> FrontendConfig {
+        let root = unique_temp_dir();
+        let root_path = root.dir.keep();
+        fs::create_dir_all(root_path.join("repo")).expect("repo");
+        fs::write(root_path.join("vmlinuz"), b"kernel").expect("kernel");
+        fs::write(root_path.join("initrd.img"), b"initrd").expect("initrd");
+        fs::write(root_path.join("rootfs.raw"), b"rootfs").expect("rootfs");
+        ArtifactManifest {
+            artifacts: ArtifactPaths {
+                kernel: root_path.join("vmlinuz"),
+                initrd: root_path.join("initrd.img"),
+                rootfs: root_path.join("rootfs.raw"),
+            },
+            vm: ArtifactVm {
+                cpus: 1,
+                memory_bytes: 1024 * 1024 * 1024,
+                virtiofs_tag: "agentvm".to_string(),
+                kernel_cmdline: "console=hvc0 root=/dev/vda".to_string(),
+            },
+        }
+        .into_frontend_config(
+            root_path.join("repo"),
+            root_path.join(".sandbox/docker-vm").join(name),
+            "qemu-system-x86_64",
+            &root_path,
+        )
+        .expect("config")
+    }
+
+    fn assert_process_exited(pid: u32) {
+        for _ in 0..50 {
+            if !process_exists(pid) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("process {pid} is still running");
+    }
+
+    fn process_exists(pid: u32) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 
     fn unique_temp_dir() -> TestTempDir {

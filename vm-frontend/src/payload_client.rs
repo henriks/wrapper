@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 const FRAME_HEADER_LEN: usize = 5;
+const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 #[cfg(unix)]
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -513,6 +514,16 @@ fn exit_code_from_payload(payload: &[u8]) -> Result<i32, PayloadClientError> {
 }
 
 fn send_frame(writer: &mut impl Write, frame_type: u8, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "payload frame too large: {} > {}",
+                payload.len(),
+                MAX_FRAME_PAYLOAD
+            ),
+        ));
+    }
     let len = u32::try_from(payload.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload frame too large"))?;
     writer.write_all(&[frame_type])?;
@@ -524,6 +535,11 @@ fn recv_frame(reader: &mut impl Read) -> Result<(u8, Vec<u8>), PayloadClientErro
     let mut header = [0; FRAME_HEADER_LEN];
     reader.read_exact(&mut header)?;
     let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    if len > MAX_FRAME_PAYLOAD {
+        return Err(PayloadClientError::Protocol(format!(
+            "payload frame too large: {len} > {MAX_FRAME_PAYLOAD}"
+        )));
+    }
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload)?;
     Ok((header[0], payload))
@@ -558,6 +574,30 @@ impl std::error::Error for PayloadClientError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 32,
+            ..ProptestConfig::default()
+        })]
+
+        #[test]
+        fn proptest_payload_frames_round_trip(frame_type in any::<u8>(), payload in prop::collection::vec(any::<u8>(), 0..=1024)) {
+            let mut bytes = Vec::new();
+            send_frame(&mut bytes, frame_type, &payload).expect("send");
+            let (decoded_type, decoded_payload) = recv_frame(&mut io::Cursor::new(bytes)).expect("recv");
+
+            prop_assert_eq!(decoded_type, frame_type);
+            prop_assert_eq!(decoded_payload, payload);
+        }
+
+        #[test]
+        fn proptest_arbitrary_payload_frame_bytes_stay_bounded(bytes in prop::collection::vec(any::<u8>(), 0..=128)) {
+            let _ = recv_frame(&mut io::Cursor::new(bytes));
+        }
+    }
 
     #[test]
     fn frame_round_trip_uses_big_endian_length() {
@@ -589,6 +629,54 @@ mod tests {
         assert_eq!(frame_type, b'R');
         let request: serde_json::Value = serde_json::from_slice(&payload).expect("json");
         assert_eq!(request["script"], "echo hello");
+    }
+
+    #[test]
+    fn rust_client_runs_real_python_payload_server() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        let server_path = repo_root.join("docker/guest-payload-server.py");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let child = match std::process::Command::new("python3")
+            .arg(server_path)
+            .arg("--tcp-host")
+            .arg("127.0.0.1")
+            .arg("--tcp-port")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => panic!("spawn python payload server: {error}"),
+        };
+        let mut child = ChildGuard(Some(child));
+
+        let mut ready = false;
+        for _ in 0..50 {
+            if ping_payload(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "python payload server did not become ready");
+
+        let request = PayloadRequest::new("printf rust-python-ok; exit 6");
+        let mut output = Vec::new();
+        let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
+            .expect("python payload server run");
+
+        assert_eq!(exit_code, 6);
+        assert!(output
+            .windows(b"rust-python-ok".len())
+            .any(|window| window == b"rust-python-ok"));
+        child.kill_and_wait();
     }
 
     #[test]
@@ -678,9 +766,53 @@ mod tests {
     }
 
     #[test]
+    fn frame_length_limit_rejects_oversized_send_and_receive() {
+        let payload = vec![0; MAX_FRAME_PAYLOAD + 1];
+        let error = send_frame(&mut Vec::new(), b'I', &payload).expect_err("oversized send");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("payload frame too large"));
+
+        let mut bytes = vec![b'O'];
+        bytes.extend_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+        let error = recv_frame(&mut io::Cursor::new(bytes)).expect_err("oversized receive");
+        assert!(
+            matches!(error, PayloadClientError::Protocol(message) if message.contains("payload frame too large"))
+        );
+    }
+
+    #[test]
+    fn truncated_frame_reports_io_without_allocating_payload() {
+        let mut bytes = vec![b'O'];
+        bytes.extend_from_slice(&4u32.to_be_bytes());
+        bytes.extend_from_slice(b"ab");
+
+        let error = recv_frame(&mut io::Cursor::new(bytes)).expect_err("truncated");
+        assert!(
+            matches!(error, PayloadClientError::Io(io_error) if io_error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+    }
+
+    #[test]
     fn exit_code_payload_is_required_json() {
         let error = exit_code_from_payload(b"not-json").expect_err("invalid");
         assert!(matches!(error, PayloadClientError::Json(_)));
+    }
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl ChildGuard {
+        fn kill_and_wait(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            self.kill_and_wait();
+        }
     }
 
     #[derive(Debug)]

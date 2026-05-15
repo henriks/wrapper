@@ -135,12 +135,23 @@ should log the intercepted request in `.sandbox/docker-vm/run/vmnet-events.log`.
 The launcher is intentionally Rust-only for the stream path: it does not add a
 QEMU `user` netdev or `hostfwd` fallback.
 
-Validate:
+Validate the full required gate on a KVM-capable host:
 
 ```sh
-cargo test --manifest-path vm-frontend/Cargo.toml --offline
+vm-frontend/validate.sh required
+```
+
+For fast offline iteration only:
+
+```sh
+vm-frontend/validate.sh fast
 ```
 
 The unit suite is the non-KVM coverage for command parsing, wrapper flag
 translation, manifest generation, network policy, payload framing, and self-test
-script construction.
+script construction. The required gate also checks formatting, offline guest
+service tests, fuzz target compilation, validation documentation drift, and the
+quick `live-smoke` host self-test. Broader KVM scenarios are available through
+`vm-frontend/validate.sh live-hostile`, `vm-frontend/validate.sh live-payload`,
+`vm-frontend/validate.sh live-dns`, `vm-frontend/validate.sh live-docker`,
+`vm-frontend/validate.sh live-fs`, and `vm-frontend/validate.sh live-full`.

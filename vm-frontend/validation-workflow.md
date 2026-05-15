@@ -1,12 +1,24 @@
 # Validation Workflow
 
-This project has four validation tiers. Normal development should run the fast
-tier. Stress and live tiers are opt-in so they can be run when changing the VM
-frontend, composed filesystem, network gateway, or wrapper contract.
+This project has one required gate plus narrower tiers for iteration and triage.
+Before considering code complete, run the required gate:
+
+```sh
+vm-frontend/validate.sh required
+```
+
+The required gate performs the validation documentation drift check, `cargo fmt
+--check` for the Rust crates and fuzz package, composed-fs and vm-frontend
+offline tests, offline guest service tests, fuzz target compilation with `cargo
+check --manifest-path vm-frontend/fuzz/Cargo.toml --offline`, and the quick
+`live-smoke` host live validation scenario. `full` is an alias for the same gate.
+If `/dev/kvm` is unavailable, the gate fails with a host-live limitation instead
+of silently passing; rerun it on a KVM-capable host before closing live
+validation work.
 
 ## Fast Offline
 
-Run on every relevant code change:
+Use this during local iteration when the full gate would be too expensive:
 
 ```sh
 vm-frontend/validate.sh fast
@@ -25,6 +37,24 @@ For vmnet runtime changes this tier covers the domain event/poller boundary,
 readiness-buffered host ingress writes, readiness-buffered upstream proxy
 writes, smoltcp/QEMU stream framing, policy behavior, pcap output, and event log
 formatting without depending on host loopback networking.
+
+## Formatting And Drift Checks
+
+Run these directly when changing validation scripts or Rust formatting-sensitive
+code:
+
+```sh
+vm-frontend/validate.sh docs
+vm-frontend/validate.sh fmt
+vm-frontend/validate.sh fuzz-check
+vm-frontend/validate.sh guest-services
+```
+
+`docs` asserts that `AGENTS.md`, this workflow, and `vm-frontend/validate.sh`
+stay aligned on the required gate. `fuzz-check` compiles/checks the fuzz targets
+without running libFuzzer. `guest-services` runs offline `unittest` coverage for
+`docker/guest-init.sh`, `docker/guest-payload-server.py`, and
+`docker/guest-socket-bridge.py`.
 
 ## Stress And Property
 
@@ -98,10 +128,26 @@ assertion.
 ## Live KVM
 
 Run after rebuilding appliance artifacts and before closing live frontend
-contract work:
+contract work. The live matrix has named scenarios:
+
+- `live-smoke` (also `host-live`/`live`): quick required self-test with the published payload listener.
+- `live-hostile`: slower hostile/no-net self-test that probes denied metadata/loopback/DNS behavior.
+- `live-payload`: payload protocol stress self-test with a large request environment and large guest output.
+- `live-dns`: allowed resolver-path and denied/no-net resolver-path self-tests with explicit query diagnostics.
+- `live-docker`: Docker bridge container egress, no-net denial, and host-to-container published-port self-tests with image/policy/phase diagnostics.
+- `live-fs`: composed-fs live/adversarial self-test, run twice with the same run-dir to cover stale socket/state cleanup.
+- `live-full`: runs all named live scenarios.
+
+Prefer `host-live` in docs when emphasizing host prerequisites:
 
 ```sh
-vm-frontend/validate.sh live
+vm-frontend/validate.sh host-live
+vm-frontend/validate.sh live-hostile
+vm-frontend/validate.sh live-payload
+vm-frontend/validate.sh live-dns
+vm-frontend/validate.sh live-docker
+vm-frontend/validate.sh live-fs
+vm-frontend/validate.sh live-full
 ```
 
 Equivalent command:
@@ -119,7 +165,7 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
 
 Prerequisites:
 
-- `/dev/kvm` visible to the process.
+- `/dev/kvm` visible to the process, or set `KVM_DEVICE=/path/to/kvm` for an equivalent exposed device.
 - `qemu-system-x86_64` installed.
 - `docker/out/artifact-manifest.json`, `docker/out/vmlinuz`,
   `docker/out/initrd.img`, and `docker/out/rootfs.raw` built from the current
@@ -142,8 +188,16 @@ The run is valid only if both sides write 200 rows and a final
 
 ## Interactive TUI Smoke
 
-Run this after touching wrapper TUI behavior, terminal sizing/input, prompt
-focus, startup setup, or wrapper entrypoint semantics. It is manual because it
+Automated pty-backed terminal tests cover the non-live wrapper setup path, config
+editor keyboard flow, configured-project no-reprompt behavior, and launch failure
+artifact diagnostics. Run them directly while iterating on TUI behavior:
+
+```sh
+cargo test --manifest-path vm-frontend/Cargo.toml --offline --test tui_terminal -- --nocapture
+```
+
+Run the manual smoke below after touching wrapper TUI behavior, terminal
+sizing/input, prompt focus, startup setup, or wrapper entrypoint semantics. It
 requires a real terminal and user interaction in addition to the live KVM
 prerequisites above.
 
@@ -249,12 +303,15 @@ to the ticket note.
 Recommended split:
 
 - Per-commit CI: `vm-frontend/validate.sh fast`.
-- Pre-merge/manual CI: `vm-frontend/validate.sh all-local`.
+- Pre-merge/manual local CI without KVM: `vm-frontend/validate.sh all-local`.
+- Required pre-close gate on a KVM-capable host: `vm-frontend/validate.sh required`.
 - Scheduled fuzz smoke on a machine with `cargo-fuzz`: short runs of each
   `vm-frontend/fuzz` target.
-- Nightly or host-only CI: `vm-frontend/validate.sh live` on a runner with KVM
-  and rebuilt appliance artifacts.
+- Live-only reruns during triage: `vm-frontend/validate.sh host-live` on a
+  runner with KVM and rebuilt appliance artifacts.
 
 When adding validation, update `validation-matrix.md`, add the exact command to
 this file if it creates a new tier or named filter, and record the outcome in
-the relevant `tk` ticket before closing it.
+the relevant `tk` ticket before closing it. The required gate's `docs` check
+will fail if AGENTS.md stops naming `./vm-frontend/validate.sh required` or this
+workflow stops naming the required/host-live commands.

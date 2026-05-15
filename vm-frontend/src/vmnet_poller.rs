@@ -123,6 +123,22 @@ impl RuntimePoller {
         self.by_source.contains_key(&source)
     }
 
+    pub fn registered_interest(&self, source: VmnetEventSource) -> Option<VmnetInterest> {
+        self.by_source
+            .get(&source)
+            .map(|registration| registration.interest)
+    }
+
+    pub fn registered_fd(&self, source: VmnetEventSource) -> Option<RawFd> {
+        self.by_source
+            .get(&source)
+            .map(|registration| registration.fd)
+    }
+
+    pub fn registration_count(&self) -> usize {
+        self.by_source.len()
+    }
+
     pub fn reregister_fd(
         &mut self,
         source: VmnetEventSource,
@@ -183,6 +199,7 @@ impl RuntimePoller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
 
@@ -223,6 +240,11 @@ mod tests {
                 VmnetInterest::READABLE,
             )
             .expect("register");
+        assert_eq!(poller.registration_count(), 1);
+        assert_eq!(
+            poller.registered_interest(VmnetEventSource::HostListener(0)),
+            Some(VmnetInterest::READABLE)
+        );
         poller
             .reregister_fd(
                 VmnetEventSource::HostListener(0),
@@ -230,11 +252,121 @@ mod tests {
                 VmnetInterest::READ_WRITE,
             )
             .expect("reregister");
+        assert_eq!(
+            poller.registered_interest(VmnetEventSource::HostListener(0)),
+            Some(VmnetInterest::READ_WRITE)
+        );
         poller
             .deregister(VmnetEventSource::HostListener(0))
             .expect("deregister");
+        assert_eq!(poller.registration_count(), 0);
 
         let events = poller.poll(Some(Duration::from_millis(1))).expect("poll");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn detects_data_written_before_registration() {
+        let (mut writer, reader) = UnixStream::pair().expect("stream pair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        writer.write_all(b"queued-before-register").expect("write");
+
+        let mut poller = RuntimePoller::new().expect("poller");
+        poller
+            .register_fd(
+                VmnetEventSource::QemuStream,
+                reader.as_raw_fd(),
+                VmnetInterest::READABLE,
+            )
+            .expect("register reader");
+
+        let events = poller
+            .poll(Some(Duration::from_millis(50)))
+            .expect("poll ready");
+
+        assert!(events
+            .iter()
+            .any(|event| { event.source == VmnetEventSource::QemuStream && event.readable }));
+    }
+
+    #[test]
+    fn replacing_source_fd_ignores_stale_readiness_from_old_fd() {
+        let (mut old_writer, old_reader) = UnixStream::pair().expect("old pair");
+        let (mut new_writer, new_reader) = UnixStream::pair().expect("new pair");
+        old_reader.set_nonblocking(true).expect("old nonblocking");
+        new_reader.set_nonblocking(true).expect("new nonblocking");
+
+        let mut poller = RuntimePoller::new().expect("poller");
+        poller
+            .register_fd(
+                VmnetEventSource::HostSession(Default::default()),
+                old_reader.as_raw_fd(),
+                VmnetInterest::READABLE,
+            )
+            .expect("register old");
+        poller
+            .register_fd(
+                VmnetEventSource::HostSession(Default::default()),
+                new_reader.as_raw_fd(),
+                VmnetInterest::READABLE,
+            )
+            .expect("replace fd");
+        assert_eq!(
+            poller.registered_fd(VmnetEventSource::HostSession(Default::default())),
+            Some(new_reader.as_raw_fd())
+        );
+        old_writer.write_all(b"old").expect("write old");
+        assert!(poller
+            .poll(Some(Duration::from_millis(1)))
+            .expect("poll old")
+            .is_empty());
+
+        new_writer.write_all(b"new").expect("write new");
+        let events = poller
+            .poll(Some(Duration::from_millis(50)))
+            .expect("poll new");
+        assert!(events.iter().any(|event| {
+            event.source == VmnetEventSource::HostSession(Default::default()) && event.readable
+        }));
+    }
+
+    #[test]
+    fn reregistered_interest_changes_ready_events() {
+        let (mut writer, reader) = UnixStream::pair().expect("stream pair");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        let mut poller = RuntimePoller::new().expect("poller");
+        poller
+            .register_fd(
+                VmnetEventSource::UpstreamSession(Default::default()),
+                reader.as_raw_fd(),
+                VmnetInterest::WRITABLE,
+            )
+            .expect("register writable");
+        assert_eq!(
+            poller.registered_interest(VmnetEventSource::UpstreamSession(Default::default())),
+            Some(VmnetInterest::WRITABLE)
+        );
+        poller
+            .reregister_fd(
+                VmnetEventSource::UpstreamSession(Default::default()),
+                reader.as_raw_fd(),
+                VmnetInterest::READABLE,
+            )
+            .expect("reregister readable");
+        assert_eq!(
+            poller.registered_interest(VmnetEventSource::UpstreamSession(Default::default())),
+            Some(VmnetInterest::READABLE)
+        );
+
+        writer.write_all(b"readable-now").expect("write");
+        let events = poller
+            .poll(Some(Duration::from_millis(50)))
+            .expect("poll readable");
+
+        assert!(events.iter().any(|event| {
+            event.source == VmnetEventSource::UpstreamSession(Default::default())
+                && event.readable
+                && !event.writable
+        }));
     }
 }

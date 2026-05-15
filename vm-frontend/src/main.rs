@@ -1,13 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::{Ipv4Addr, TcpListener};
+use std::net::{Ipv4Addr, TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 mod tui;
 
@@ -133,6 +135,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
 fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
     let (config, policy_args) = frontend_config_from_args(args)?;
+    let artifacts = frontend_artifact_summary(&config);
     let _lock = ProjectLock::acquire(&config)?;
     let qemu_timeout = policy_args.qemu_timeout;
     let local_http_smoke_upstream = policy_args.local_http_smoke_upstream;
@@ -148,10 +151,13 @@ fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
     }
     if let Some(payload) = payload {
         let host_port = ensure_payload_listener(&mut policy);
+        println!("launch: phase=starting-frontend");
         let running = start_frontend_with_policy(config.clone(), mounts, policy)
-            .map_err(|error| format!("launch failed: {error}"))?;
+            .map_err(|error| format!("launch failed: {error}\n{artifacts}"))?;
         let addr = socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
-        wait_for_payload_ready(addr, Duration::from_secs(120))?;
+        println!("launch: phase=waiting-for-payload-ready timeout=120s");
+        wait_for_payload_ready(addr, Duration::from_secs(120))
+            .map_err(|error| format!("launch payload readiness failed: {error}\n{artifacts}"))?;
         let request = PayloadRequest {
             script: payload.script,
             cwd: payload.cwd,
@@ -182,24 +188,40 @@ fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
         let exit_code = payload_result?;
         std::process::exit(payload_exit_status(exit_code));
     }
+    println!("launch: phase=starting-frontend");
     let qemu_exit = run_frontend_until_qemu_exit_with_policy_and_timeout(
         config.clone(),
         mounts,
         policy,
         qemu_timeout,
     )
-    .map_err(|error| format!("launch failed: {error}"))?;
+    .map_err(|error| format!("launch failed: {error}\n{artifacts}"))?;
     if qemu_exit.status.success() {
         Ok(())
     } else if qemu_exit.timed_out {
         Err(format!(
-            "qemu timed out after {} seconds and was terminated with status: {}",
+            "qemu timed out after {} seconds and was terminated with status: {}\n{}",
             qemu_timeout.map_or(0, |timeout| timeout.as_secs()),
-            qemu_exit.status
+            qemu_exit.status,
+            artifacts
         ))
     } else {
-        Err(format!("qemu exited with status: {}", qemu_exit.status))
+        Err(format!(
+            "qemu exited with status: {}\n{}",
+            qemu_exit.status, artifacts
+        ))
     }
+}
+
+fn frontend_artifact_summary(config: &FrontendConfig) -> String {
+    format!(
+        "artifacts: run_dir={} state={} qemu_log={} console_log={} vmnet_event_log={}",
+        config.runtime.run_dir.display(),
+        config.runtime.state_json.display(),
+        config.runtime.run_dir.join("qemu.log").display(),
+        config.runtime.console_log.display(),
+        config.runtime.vmnet_event_log.display()
+    )
 }
 
 struct ProjectLock {
@@ -1647,8 +1669,13 @@ struct SelfTestConfig {
     qemu: PathBuf,
     image: String,
     publish_payload_port: Option<u16>,
+    publish_container_port: Option<PortPair>,
     no_net: bool,
     hostile: bool,
+    payload_stress: bool,
+    dns_check: bool,
+    docker_net_check: bool,
+    fs_check: bool,
     tool: GuestTool,
 }
 
@@ -1658,13 +1685,16 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let self_test = self_test_config_from_args(args)?;
+    ensure_appliance_sources_fresh(&self_test.artifact_manifest)?;
     let config = FrontendConfig::from_artifact_manifest_file(
         self_test.project.clone(),
-        self_test.run_dir,
+        self_test.run_dir.clone(),
         self_test.qemu,
         &self_test.artifact_manifest,
     )
     .map_err(|error| format!("failed to load frontend config: {error}"))?;
+    let artifacts = frontend_artifact_summary(&config);
+    println!("self-test: {artifacts}");
     let mut policy_args = PolicyArgs {
         allow_public: !self_test.no_net,
         no_net: self_test.no_net,
@@ -1680,6 +1710,11 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
             .host_listeners
             .push(HostListener::published_tcp(host_port, 1076));
     }
+    if let Some(port) = self_test.publish_container_port {
+        policy_args
+            .host_listeners
+            .push(HostListener::published_tcp(port.host, port.guest));
+    }
     let mounts = runtime_mounts(&config, &policy_args)?;
     let mut guest_env = guest_payload_env(&config, &policy_args)?;
     guest_env.insert(
@@ -1693,62 +1728,268 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
     if let Some(home) = guest_env.get("HOME").cloned() {
         guest_env.insert("AGENTVM_SELF_TEST_HOME".to_string(), home);
     }
+    if self_test.payload_stress {
+        guest_env.insert(
+            "AGENTVM_PAYLOAD_STRESS_BLOB".to_string(),
+            "r".repeat(64 * 1024),
+        );
+        guest_env.insert(
+            "AGENTVM_PAYLOAD_STRESS_BYTES".to_string(),
+            (192 * 1024).to_string(),
+        );
+    }
+    let sqlite_db_name = self_test
+        .run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            name.chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "self-test".to_string());
+    let skip_sqlite_concurrency = self_test.docker_net_check && self_test.no_net;
     let sqlite_concurrency_host_db = config
         .project
-        .join(".agentvm-self-test-sqlite/state.sqlite");
-    if let Some(parent) = sqlite_concurrency_host_db.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("failed to create sqlite concurrency dir: {error}"))?;
+        .join(format!(".agentvm-self-test-sqlite/{sqlite_db_name}.sqlite"));
+    if !skip_sqlite_concurrency {
+        if let Some(parent) = sqlite_concurrency_host_db.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create sqlite concurrency dir: {error}"))?;
+        }
+        guest_env.insert(
+            "AGENTVM_SQLITE_CONCURRENCY_DB".to_string(),
+            sqlite_concurrency_host_db.display().to_string(),
+        );
     }
-    guest_env.insert(
-        "AGENTVM_SQLITE_CONCURRENCY_DB".to_string(),
-        sqlite_concurrency_host_db.display().to_string(),
-    );
     let mut policy = policy_from_args(config.network.clone(), policy_args);
     let _lock = ProjectLock::acquire(&config)?;
     let host_port = ensure_payload_listener(&mut policy);
+    println!("self-test: phase=starting-frontend");
     let running = start_frontend_with_policy(config.clone(), mounts, policy)
-        .map_err(|error| format!("self-test launch failed: {error}"))?;
+        .map_err(|error| format!("self-test launch failed: {error}\n{artifacts}"))?;
     let payload_addr = socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
-    wait_for_payload_ready(payload_addr, Duration::from_secs(120))?;
+    println!("self-test: phase=waiting-for-payload-ready timeout=120s");
+    wait_for_payload_ready(payload_addr, Duration::from_secs(120))
+        .map_err(|error| format!("self-test payload readiness failed: {error}\n{artifacts}"))?;
 
     if let Some(host_port) = self_test.publish_payload_port {
         let publish_addr =
             socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
-        ping_payload(publish_addr)
-            .map_err(|error| format!("published payload-port check failed: {error}"))?;
+        println!("self-test: phase=checking-published-payload-port port={host_port}");
+        ping_payload(publish_addr).map_err(|error| {
+            format!("published payload-port check failed: {error}\n{artifacts}")
+        })?;
         println!("self-test: published payload port {host_port} ok");
     }
 
     let (rows, cols) = terminal_size();
     let request = PayloadRequest {
-        script: self_test_payload_script(&config, &self_test.image, self_test.hostile),
+        script: self_test_payload_script(
+            &config,
+            &self_test.image,
+            self_test.hostile,
+            self_test.payload_stress,
+            self_test.dns_check,
+            self_test.docker_net_check,
+            self_test.publish_container_port,
+            self_test.fs_check,
+            skip_sqlite_concurrency,
+        ),
         cwd: config.project.display().to_string(),
         env: guest_env,
         rows,
         cols,
     };
-    let mut host_sqlite = spawn_host_sqlite_concurrency(&sqlite_concurrency_host_db)?;
-    let exit_code = run_payload_tcp_with_control(
-        payload_addr,
-        &request,
-        None,
-        &mut io::stdout(),
-        PayloadControlOptions::disabled(),
-    )
-    .map_err(|error| format!("self-test payload failed: {error}"));
-    let host_sqlite_result = wait_host_sqlite_concurrency(&mut host_sqlite)
-        .and_then(|_| run_host_sqlite_integrity_check(&sqlite_concurrency_host_db));
+    println!("self-test: phase=running-payload");
+    let mut host_sqlite = if skip_sqlite_concurrency {
+        None
+    } else {
+        Some(
+            spawn_host_sqlite_concurrency(&sqlite_concurrency_host_db).map_err(|error| {
+                format!("self-test host sqlite setup failed: {error}\n{artifacts}")
+            })?,
+        )
+    };
+    let exit_code = if let Some(port) = self_test.publish_container_port {
+        run_payload_with_published_container_check(payload_addr, request, port, &artifacts)
+    } else {
+        run_payload_tcp_with_control(
+            payload_addr,
+            &request,
+            None,
+            &mut io::stdout(),
+            PayloadControlOptions::disabled(),
+        )
+        .map_err(|error| format!("self-test payload failed: {error}\n{artifacts}"))
+    };
+    let host_sqlite_result = if let Some(host_sqlite) = host_sqlite.as_mut() {
+        wait_host_sqlite_concurrency(host_sqlite)
+            .and_then(|_| run_host_sqlite_integrity_check(&sqlite_concurrency_host_db))
+    } else {
+        Ok(())
+    };
+    println!("self-test: phase=shutting-down-frontend");
     running
         .terminate()
-        .map_err(|error| format!("self-test shutdown failed: {error}"))?;
+        .map_err(|error| format!("self-test shutdown failed: {error}\n{artifacts}"))?;
     let exit_code = exit_code?;
     if exit_code != 0 {
-        return Err(format!("self-test payload exited with {exit_code}"));
+        return Err(format!(
+            "self-test payload exited with {exit_code}\n{artifacts}"
+        ));
     }
-    host_sqlite_result?;
+    host_sqlite_result
+        .map_err(|error| format!("self-test host sqlite failed: {error}\n{artifacts}"))?;
+    if self_test.fs_check {
+        verify_self_test_fs_check(&config.project)
+            .map_err(|error| format!("self-test fs check failed: {error}\n{artifacts}"))?;
+    }
     println!("self-test: ok");
     Ok(())
+}
+
+fn verify_self_test_fs_check(project: &Path) -> Result<(), String> {
+    let root = project.join(".agentvm-fs-live");
+    let host_visible = root.join("host-visible.txt");
+    let contents = fs::read_to_string(&host_visible)
+        .map_err(|error| format!("failed to read {}: {error}", host_visible.display()))?;
+    if contents != "host-visible-ok\n" {
+        return Err(format!(
+            "unexpected host-visible file contents in {}: {contents:?}",
+            host_visible.display()
+        ));
+    }
+    let removed = root.join("dir/file.txt");
+    if removed.exists() {
+        return Err(format!(
+            "guest unlink did not remove {} from host view",
+            removed.display()
+        ));
+    }
+    fs::remove_dir_all(&root)
+        .map_err(|error| format!("failed to clean fs check dir {}: {error}", root.display()))?;
+    Ok(())
+}
+
+fn run_payload_with_published_container_check(
+    payload_addr: std::net::SocketAddr,
+    request: PayloadRequest,
+    port: PortPair,
+    artifacts: &str,
+) -> Result<i32, String> {
+    let marker = "self-test: docker-publish-ready".to_string();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let thread_artifacts = artifacts.to_string();
+    let handle = thread::Builder::new()
+        .name("agentvm-self-test-published-container".to_string())
+        .spawn(move || {
+            let mut output = ReadyMarkerWriter::new(marker, ready_tx);
+            run_payload_tcp_with_control(
+                payload_addr,
+                &request,
+                None,
+                &mut output,
+                PayloadControlOptions::disabled(),
+            )
+            .map_err(|error| format!("self-test payload failed: {error}\n{thread_artifacts}"))
+        })
+        .map_err(|error| format!("failed to spawn published-container payload: {error}"))?;
+
+    ready_rx
+        .recv_timeout(Duration::from_secs(90))
+        .map_err(|error| {
+            format!("published container did not become ready: {error}\n{artifacts}")
+        })?;
+    check_published_container_port(port.host)
+        .map_err(|error| format!("published container check failed: {error}\n{artifacts}"))?;
+    handle
+        .join()
+        .map_err(|_| format!("published-container payload thread panicked\n{artifacts}"))?
+}
+
+struct ReadyMarkerWriter {
+    marker: String,
+    ready_tx: Option<mpsc::Sender<()>>,
+    recent: Vec<u8>,
+}
+
+impl ReadyMarkerWriter {
+    fn new(marker: String, ready_tx: mpsc::Sender<()>) -> Self {
+        Self {
+            marker,
+            ready_tx: Some(ready_tx),
+            recent: Vec::new(),
+        }
+    }
+}
+
+impl Write for ReadyMarkerWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stdout().write_all(bytes)?;
+        self.recent.extend_from_slice(bytes);
+        let max_len = self.marker.len().saturating_mul(2).max(1024);
+        if self.recent.len() > max_len {
+            let drop = self.recent.len() - max_len;
+            self.recent.drain(..drop);
+        }
+        if self.ready_tx.is_some() && String::from_utf8_lossy(&self.recent).contains(&self.marker) {
+            if let Some(tx) = self.ready_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+fn check_published_container_port(host_port: u16) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let addr = socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
+            Ok(mut stream) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|error| error.to_string())?;
+                stream
+                    .write_all(b"GET / HTTP/1.1\r\nHost: container\r\nConnection: close\r\n\r\n")
+                    .map_err(|error| error.to_string())?;
+                let mut response = String::new();
+                stream
+                    .read_to_string(&mut response)
+                    .map_err(|error| error.to_string())?;
+                if response.contains("agentvm-container-publish-ok") {
+                    println!(
+                        "self-test: published container port {host_port} ok phase=host-to-container"
+                    );
+                    return Ok(());
+                }
+                last_error = Some(format!(
+                    "unexpected response from published container port {host_port}: {response:?}"
+                ));
+            }
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(last_error.unwrap_or_else(|| {
+        format!("published container port {host_port} did not accept connections")
+    }))
 }
 
 fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String> {
@@ -1783,8 +2024,15 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
                     .map_err(|_| "invalid --publish-payload-port".to_string())
             })
             .transpose()?,
+        publish_container_port: matches
+            .get_one::<PortPair>("publish_container_port")
+            .copied(),
         no_net: matches.get_flag("no_net"),
         hostile: matches.get_flag("hostile"),
+        payload_stress: matches.get_flag("payload_stress"),
+        dns_check: matches.get_flag("dns_check"),
+        docker_net_check: matches.get_flag("docker_net_check"),
+        fs_check: matches.get_flag("fs_check"),
         tool: matches
             .get_one::<String>("tool")
             .map(|value| value.parse().map_err(|error: String| error))
@@ -1822,16 +2070,52 @@ fn self_test_clap_command() -> ClapCommand {
                 .long("publish-payload-port")
                 .value_name("PORT"),
         )
+        .arg(
+            Arg::new("publish_container_port")
+                .long("publish-container-port")
+                .value_name("HOST:GUEST")
+                .value_parser(clap::value_parser!(PortPair)),
+        )
         .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
         .arg(
             Arg::new("hostile")
                 .long("hostile")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("payload_stress")
+                .long("payload-stress")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("dns_check")
+                .long("dns-check")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("docker_net_check")
+                .long("docker-net-check")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("fs_check")
+                .long("fs-check")
+                .action(ArgAction::SetTrue),
+        )
         .arg(Arg::new("tool").long("tool").value_name("codex|copilot"))
 }
 
-fn self_test_payload_script(_config: &FrontendConfig, image: &str, hostile: bool) -> String {
+fn self_test_payload_script(
+    _config: &FrontendConfig,
+    image: &str,
+    hostile: bool,
+    payload_stress: bool,
+    dns_check: bool,
+    docker_net_check: bool,
+    publish_container_port: Option<PortPair>,
+    fs_check: bool,
+    skip_sqlite_concurrency: bool,
+) -> String {
     let sqlite_smoke = r#"import os, sqlite3
 root = os.path.join(os.environ["HOME"], ".cache", "agentvm-sqlite-smoke")
 os.makedirs(root, exist_ok=True)
@@ -1865,6 +2149,117 @@ for i in range(200):
 assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 conn.close()
 "#;
+    let payload_stress_script = r#"import os, sys
+blob = os.environ.get("AGENTVM_PAYLOAD_STRESS_BLOB", "")
+assert len(blob) == 65536, len(blob)
+size = int(os.environ["AGENTVM_PAYLOAD_STRESS_BYTES"])
+assert size > 65536, size
+sys.stdout.write("self-test: payload-stress-start\n")
+sys.stdout.write("X" * size)
+sys.stdout.write("\nself-test: payload-stress-ok\n")
+sys.stdout.flush()
+"#;
+    let dns_allow_script = r#"const dns = require("dns");
+dns.lookup("example.com", (err, address) => {
+  if (err) {
+    console.error(`dns-allow-failed example.com ${err.code || err.message}`);
+    process.exit(1);
+  }
+  if (!address) {
+    console.error("dns-allow-failed example.com empty-address");
+    process.exit(1);
+  }
+  console.log(`self-test: dns-allow-ok example.com ${address}`);
+});
+"#;
+    let docker_egress_ok =
+        format!("self-test: docker-egress-ok image={image} policy=allow phase=container-egress");
+    let docker_egress_failed =
+        format!("docker-egress-failed image={image} policy=allow phase=container-egress");
+    let docker_deny_ok =
+        format!("self-test: docker-deny-ok image={image} policy=deny phase=container-egress");
+    let docker_deny_unexpected =
+        format!("docker-deny-unexpected image={image} policy=deny phase=container-egress");
+    let docker_egress_allow_script = format!(
+        "if wget -qO- -T 10 http://example.com >/dev/null; then printf '%s\\n' {}; else printf '%s\\n' {} >&2; exit 1; fi",
+        shell_quote(&docker_egress_ok),
+        shell_quote(&docker_egress_failed),
+    );
+    let docker_egress_deny_script = format!(
+        "if wget -qO- -T 5 http://example.com >/tmp/agentvm-docker-egress 2>/tmp/agentvm-docker-egress.err; then printf '%s\\n' {} >&2; exit 1; else printf '%s\\n' {}; fi",
+        shell_quote(&docker_deny_unexpected),
+        shell_quote(&docker_deny_ok),
+    );
+    let docker_net_check_step = format!(
+        "if [ \"${{AGENTVM_SELF_TEST_NETWORK:-allow}}\" = allow ]; then docker run --rm {} sh -c {}; else docker run --rm {} sh -c {}; fi",
+        shell_quote(image),
+        shell_quote(&docker_egress_allow_script),
+        shell_quote(image),
+        shell_quote(&docker_egress_deny_script),
+    );
+    let docker_publish_step = publish_container_port.map(|port| {
+        let container = "agentvm-self-test-published";
+        let ok = format!(
+            "self-test: docker-publish-ok image={image} host_port={} guest_port={} phase=container-publish",
+            port.host, port.guest
+        );
+        let ready = format!(
+            "self-test: docker-publish-ready image={image} host_port={} guest_port={} phase=container-publish",
+            port.host, port.guest
+        );
+        let server = "{ printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 28\\r\\n\\r\\nagentvm-container-publish-ok'; } | nc -l -p 8080";
+        format!(
+            "docker rm -f {container} >/dev/null 2>&1 || true; docker run -d --name {container} -p {}:8080 {} sh -c {}; echo {}; sleep 10; docker rm -f {container} >/dev/null 2>&1 || true; echo {}",
+            port.guest,
+            shell_quote(image),
+            shell_quote(server),
+            shell_quote(&ready),
+            shell_quote(&ok),
+        )
+    });
+    let fs_check_script = r#"import os, shutil, subprocess, time
+root = ".agentvm-fs-live"
+def read_text_eventually(path):
+    last = None
+    for _ in range(50):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                return handle.read()
+        except OSError as exc:
+            last = exc
+            time.sleep(0.05)
+    raise last
+shutil.rmtree(root, ignore_errors=True)
+os.makedirs(os.path.join(root, "dir"), exist_ok=True)
+with open(os.path.join(root, "dir", "file.txt"), "w", encoding="utf-8") as handle:
+    handle.write("one\n")
+with open(os.path.join(root, "dir", "file.txt"), "a", encoding="utf-8") as handle:
+    handle.write("two\n")
+with open(os.path.join(root, "dir", "file.txt"), "r+", encoding="utf-8") as handle:
+    handle.truncate(4)
+assert read_text_eventually(os.path.join(root, "dir", "file.txt")) == "one\n"
+os.rename(os.path.join(root, "dir", "file.txt"), os.path.join(root, "renamed.txt"))
+assert read_text_eventually(os.path.join(root, "renamed.txt")) == "one\n"
+with open(os.path.join(root, "dir", "delete-me.txt"), "w", encoding="utf-8") as handle:
+    handle.write("delete-me\n")
+os.unlink(os.path.join(root, "dir", "delete-me.txt"))
+assert not os.path.exists(os.path.join(root, "dir", "delete-me.txt"))
+entries = sorted(os.listdir(root))
+assert entries == ["dir", "renamed.txt"], entries
+os.symlink("/run/agentvm-config/mitm-ca.key", os.path.join(root, "key-link"))
+try:
+    open(os.path.join(root, "key-link"), "rb").read(1)
+except OSError:
+    pass
+else:
+    raise AssertionError("config private key readable through workspace symlink")
+with open(os.path.join(root, "host-visible.txt"), "w", encoding="utf-8") as handle:
+    handle.write("host-visible-ok\n")
+uid_gid = subprocess.check_output(["stat", "-c", "%u:%g", os.path.join(root, "host-visible.txt")], text=True).strip()
+expected = f"{os.getuid()}:{os.getgid()}"
+assert uid_gid == expected, (uid_gid, expected)
+print("self-test: fs-live-ok")
+"#;
     let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
@@ -1895,8 +2290,6 @@ conn.close()
         "test \"$(cat .agentvm-self-test-workspace)\" = workspace-ok".to_string(),
         "echo self-test: sqlite-home-smoke".to_string(),
         format!("python3 -c {}", shell_quote(sqlite_smoke)),
-        "echo self-test: sqlite-concurrency-smoke".to_string(),
-        format!("python3 -c {}", shell_quote(sqlite_concurrency)),
         "printf bind-ok > .agentvm-self-test-bind".to_string(),
         "docker version >/tmp/agentvm-docker-version".to_string(),
         "docker info >/tmp/agentvm-docker-info".to_string(),
@@ -1910,6 +2303,43 @@ conn.close()
     ];
     if hostile {
         steps.splice(12..12, hostile_self_test_payload_steps());
+    }
+    if !skip_sqlite_concurrency {
+        let bind_index = steps
+            .iter()
+            .position(|step| step == "printf bind-ok > .agentvm-self-test-bind")
+            .expect("bind step");
+        steps.splice(
+            bind_index..bind_index,
+            [
+                "echo self-test: sqlite-concurrency-smoke".to_string(),
+                format!("python3 -c {}", shell_quote(sqlite_concurrency)),
+            ],
+        );
+    }
+    if dns_check {
+        steps.insert(
+            steps.len() - 1,
+            format!("node -e {}", shell_quote(dns_allow_script)),
+        );
+    }
+    if docker_net_check {
+        steps.insert(steps.len() - 1, docker_net_check_step);
+    }
+    if let Some(docker_publish_step) = docker_publish_step {
+        steps.insert(steps.len() - 1, docker_publish_step);
+    }
+    if fs_check {
+        steps.insert(
+            steps.len() - 1,
+            format!("python3 -c {}", shell_quote(fs_check_script)),
+        );
+    }
+    if payload_stress {
+        steps.insert(
+            steps.len() - 1,
+            format!("python3 -c {}", shell_quote(payload_stress_script)),
+        );
     }
     steps.join("; ")
 }
@@ -1983,7 +2413,7 @@ fn hostile_self_test_payload_steps() -> Vec<String> {
         "rm -f .agentvm-self-test-key-link".to_string(),
         "node -e 'const net=require(\"net\"); const s=net.connect({host:\"169.254.169.254\",port:80,timeout:750},()=>{console.error(\"metadata-connect-unexpected\"); process.exit(1);}); s.on(\"timeout\",()=>process.exit(0)); s.on(\"error\",()=>process.exit(0));'".to_string(),
         "node -e 'const net=require(\"net\"); const s=net.connect({host:\"127.0.0.1\",port:22,timeout:750},()=>{console.error(\"loopback-connect-unexpected\"); process.exit(1);}); s.on(\"timeout\",()=>process.exit(0)); s.on(\"error\",()=>process.exit(0));'".to_string(),
-        "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = deny ]; then node -e 'const dns=require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) process.exit(0); console.error(\"dns-deny-unexpected\"); process.exit(1); });'; fi".to_string(),
+        "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = deny ]; then node -e 'const dns=require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) { console.log(\"self-test: dns-deny-ok example.com \" + (err.code || err.message)); process.exit(0); } console.error(\"dns-deny-unexpected example.com\"); process.exit(1); });'; fi".to_string(),
         "echo self-test: hostile-ok".to_string(),
     ]
 }
@@ -2123,7 +2553,7 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         &policy.host_listeners,
     )?;
     if config.guest_http_smoke_url.is_some() {
-        ensure_smoke_hook_artifact_fresh(&artifact_manifest)?;
+        ensure_appliance_sources_fresh(&artifact_manifest)?;
     }
     if policy
         .payload
@@ -2483,8 +2913,9 @@ fn tool_payload_script(tool: GuestTool, tool_args: &[String]) -> String {
         r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
         r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
         format!(
-            "if ! command -v {} >/dev/null 2>&1; then printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
+            "if ! command -v {} >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
             shell_quote(tool.cli()),
+            shell_quote(&format!("agentvm: npm is required to install {} CLI", tool.cli())),
             shell_quote(&install_message),
             shell_quote(&npm_package)
         ),
@@ -2516,8 +2947,9 @@ fn tool_bootstrap_payload_script(
         r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
         r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
         format!(
-            "if ! command -v {} >/dev/null 2>&1; then printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
+            "if ! command -v {} >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
             shell_quote(cli),
+            shell_quote(&format!("agentvm: npm is required to install {cli} CLI")),
             shell_quote(&install_message),
             shell_quote(&npm_package)
         ),
@@ -2699,35 +3131,99 @@ fn start_local_http_smoke_upstream(
     })
 }
 
-fn ensure_smoke_hook_artifact_fresh(artifact_manifest: &std::path::Path) -> Result<(), String> {
-    let Some(repo_root) = artifact_manifest
+#[derive(Debug, Deserialize)]
+struct ApplianceFreshnessManifest {
+    source_inputs: Option<Vec<ApplianceSourceInput>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplianceSourceInput {
+    path: PathBuf,
+    sha256: String,
+}
+
+const REQUIRED_APPLIANCE_SOURCE_INPUTS: &[&str] = &[
+    "docker/appliance.env",
+    "docker/build-appliance.sh",
+    "docker/guest-init.sh",
+    "docker/guest-payload-server.py",
+    "docker/guest-socket-bridge.py",
+];
+
+fn ensure_appliance_sources_fresh(artifact_manifest: &Path) -> Result<(), String> {
+    let repo_root = artifact_manifest
         .parent()
-        .and_then(std::path::Path::parent)
-        .and_then(std::path::Path::parent)
-    else {
-        return Ok(());
-    };
-    let guest_init = repo_root.join("docker/guest-init.sh");
-    let rootfs = repo_root.join("docker/out/rootfs.raw");
-    if !guest_init.exists() || !rootfs.exists() {
-        return Ok(());
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            format!(
+                "stale appliance artifacts: cannot infer repository root from {}; rerun sudo ./docker/build-appliance.sh",
+                artifact_manifest.display()
+            )
+        })?;
+    let text = fs::read_to_string(artifact_manifest)
+        .map_err(|error| format!("failed to read {}: {error}", artifact_manifest.display()))?;
+    let manifest: ApplianceFreshnessManifest = serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse {}: {error}", artifact_manifest.display()))?;
+    let inputs = manifest
+        .source_inputs
+        .as_deref()
+        .filter(|inputs| !inputs.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "stale appliance artifacts: {} does not record appliance source hashes; rerun sudo ./docker/build-appliance.sh",
+                artifact_manifest.display()
+            )
+        })?;
+
+    let mut recorded_paths = BTreeSet::new();
+    for input in inputs {
+        if input.path.is_absolute()
+            || input
+                .path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "stale appliance artifacts: {} contains invalid source path {}; rerun sudo ./docker/build-appliance.sh",
+                artifact_manifest.display(),
+                input.path.display()
+            ));
+        }
+        recorded_paths.insert(input.path.to_string_lossy().into_owned());
+        let source_path = repo_root.join(&input.path);
+        let actual_hash = sha256_file_hex(&source_path)?;
+        if !input.sha256.eq_ignore_ascii_case(&actual_hash) {
+            return Err(format!(
+                "stale appliance artifacts: {} changed since {} was written (expected sha256 {}, current {}); rerun sudo ./docker/build-appliance.sh",
+                input.path.display(),
+                artifact_manifest.display(),
+                input.sha256,
+                actual_hash
+            ));
+        }
     }
-    let guest_init_modified = guest_init
-        .metadata()
-        .and_then(|metadata| metadata.modified())
-        .map_err(|error| format!("failed to stat {}: {error}", guest_init.display()))?;
-    let rootfs_modified = rootfs
-        .metadata()
-        .and_then(|metadata| metadata.modified())
-        .map_err(|error| format!("failed to stat {}: {error}", rootfs.display()))?;
-    if guest_init_modified >= rootfs_modified {
-        return Err(format!(
-            "--guest-http-smoke-url requires rebuilt appliance artifacts; {} is newer than {}",
-            guest_init.display(),
-            rootfs.display()
-        ));
+    for required in REQUIRED_APPLIANCE_SOURCE_INPUTS {
+        if !recorded_paths.contains(*required) {
+            return Err(format!(
+                "stale appliance artifacts: {} does not record required source hash for {}; rerun sudo ./docker/build-appliance.sh",
+                artifact_manifest.display(),
+                required
+            ));
+        }
     }
     Ok(())
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let digest = Sha256::digest(&bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
 }
 
 fn policy_from_args(network: GuestNetwork, args: PolicyArgs) -> VmnetPolicy {
@@ -2768,14 +3264,28 @@ fn ensure_payload_listener(policy: &mut VmnetPolicy) -> u16 {
 }
 
 fn wait_for_payload_ready(addr: std::net::SocketAddr, timeout: Duration) -> Result<(), String> {
+    wait_for_payload_ready_with_probe(timeout, Duration::from_millis(250), || {
+        ping_payload(addr).map_err(|error| error.to_string())
+    })
+}
+
+fn wait_for_payload_ready_with_probe(
+    timeout: Duration,
+    interval: Duration,
+    mut probe: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let started = Instant::now();
     let mut last_error = None;
     while started.elapsed() < timeout {
-        match ping_payload(addr) {
+        match probe() {
             Ok(()) => return Ok(()),
             Err(error) => {
-                last_error = Some(error.to_string());
-                thread::sleep(Duration::from_millis(250));
+                last_error = Some(error);
+                if interval.is_zero() {
+                    thread::yield_now();
+                } else {
+                    thread::sleep(interval);
+                }
             }
         }
     }
@@ -2918,24 +3428,7 @@ mod tests {
         std::fs::write(root.join("docker/out/vmlinuz"), b"kernel").expect("kernel");
         std::fs::write(root.join("docker/out/initrd.img"), b"initrd").expect("initrd");
         std::fs::write(root.join("docker/out/rootfs.raw"), b"rootfs").expect("rootfs");
-        std::fs::write(
-            root.join("docker/out/artifact-manifest.json"),
-            r#"{
-              "schema_version": 1,
-              "artifacts": {
-                "kernel": "docker/out/vmlinuz",
-                "initrd": "docker/out/initrd.img",
-                "rootfs": "docker/out/rootfs.raw"
-              },
-              "vm": {
-                "cpus": 2,
-                "memory_bytes": 2147483648,
-                "virtiofs_tag": "agentvm",
-                "kernel_cmdline": "console=hvc0 root=/dev/vda"
-              }
-            }"#,
-        )
-        .expect("manifest");
+        write_frontend_manifest(&root);
 
         let (config, policy) = frontend_config_from_args(&[
             "--project".to_string(),
@@ -3422,6 +3915,73 @@ mod tests {
     }
 
     #[test]
+    fn setup_tool_pi_bootstrap_script_is_idempotent_and_quotes_args() {
+        let script = setup_tool_payload_script(
+            SetupTool::Pi,
+            &["--model".to_string(), "claude 3.5".to_string()],
+        );
+
+        assert!(script.contains("command -v pi >/dev/null 2>&1"));
+        assert!(script
+            .contains("npm install --global --no-progress @mariozechner/pi-coding-agent@latest"));
+        assert!(script.contains("agentvm: npm is required to install pi CLI"));
+        assert!(script.contains("agentvm: installing pi CLI in guest HOME (first run only)"));
+        assert!(script.contains("exec pi --model 'claude 3.5'"));
+        assert!(script.contains("MISE_TRUSTED_CONFIG_PATHS=\"$PWD\""));
+    }
+
+    #[test]
+    fn codex_tool_bootstrap_script_uses_expected_package_flags_and_args() {
+        let script = tool_payload_script(
+            GuestTool::Codex,
+            &["--profile".to_string(), "work account".to_string()],
+        );
+
+        assert!(script.contains("command -v codex >/dev/null 2>&1"));
+        assert!(script.contains("npm install --global --no-progress @openai/codex@latest"));
+        assert!(script.contains("agentvm: npm is required to install codex CLI"));
+        assert!(script.contains("agentvm: installing codex CLI in guest HOME (first run only)"));
+        assert!(script.contains("--dangerously-bypass-approvals-and-sandbox"));
+        assert!(script.contains("--profile 'work account'"));
+    }
+
+    #[test]
+    fn setup_tool_rejects_unsupported_recipe_with_actionable_diagnostic() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let error = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--setup-tool".to_string(),
+                "emacs".to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect_err("unsupported setup tool");
+
+        assert!(error.contains("unknown setup tool: emacs"), "{error}");
+    }
+
+    #[test]
+    fn setup_tool_config_writes_are_idempotent() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let config = WrapperSandboxConfig::setup_tool(SetupTool::Codex);
+
+        write_wrapper_sandbox_config(&project, &config).expect("first write");
+        let first = std::fs::read_to_string(wrapper_sandbox_config_path(&project)).expect("first");
+        write_wrapper_sandbox_config(&project, &config).expect("second write");
+        let second =
+            std::fs::read_to_string(wrapper_sandbox_config_path(&project)).expect("second");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn post_separator_overrides_configured_command_for_one_launch() {
         let root = frontend_test_root();
         let project = root.join("repo");
@@ -3536,6 +4096,191 @@ mod tests {
             window[0] == "--share-ro" && window[1].ends_with("=/opt/share=optional")
         }));
         assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--publish" && window[1] == "18080:8080"));
+    }
+
+    #[test]
+    fn shell_command_override_allows_unconfigured_plain_project() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+                "--command".to_string(),
+                "bash -l".to_string(),
+            ],
+            false,
+            false,
+        )
+        .expect("shell override");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Plain);
+        assert!(!args.tool_selected);
+        assert_eq!(
+            args.command_override,
+            Some(WrapperCommandOverride::Shell {
+                command: "bash -l".to_string(),
+                args: Vec::new(),
+            })
+        );
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
+    }
+
+    #[test]
+    fn legacy_config_from_disk_migrates_to_current_launch_defaults() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let path = wrapper_sandbox_config_path(&project);
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":1,"codex_enabled":true,"default_command":"codex"}"#,
+        )
+        .expect("legacy config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("legacy wrapper");
+
+        assert!(args.tool_selected);
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+        assert!(!args.launch_args.contains(&"--payload-script".to_string()));
+    }
+
+    #[test]
+    fn setup_tool_codex_writes_expected_config_json() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--setup-tool".to_string(),
+                "codex".to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+        write_wrapper_sandbox_config(
+            &args.project,
+            &WrapperSandboxConfig::setup_tool(args.setup_tool.expect("setup tool")),
+        )
+        .expect("write config");
+
+        let text = std::fs::read_to_string(wrapper_sandbox_config_path(&project)).expect("config");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["setup_tool"], "codex");
+        assert_eq!(value["default_command"]["command"], "codex");
+        assert_eq!(value["tool_state"]["codex"], true);
+        assert_eq!(value["network"]["mode"], "public");
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+    }
+
+    #[test]
+    fn invalid_config_from_disk_reports_path_and_reason() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let path = wrapper_sandbox_config_path(&project);
+        std::fs::create_dir_all(path.parent().expect("config parent")).expect("config dir");
+        std::fs::write(
+            &path,
+            r#"{"schema_version":2,"default_command":{"command":""}}"#,
+        )
+        .expect("config");
+
+        let error = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect_err("invalid config");
+
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        assert!(
+            error.contains("default command must not be empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cli_network_overrides_take_precedence_over_config_no_net() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let mut config = WrapperSandboxConfig::codex_default();
+        config.network.mode = ConfigNetworkMode::None;
+        config.published_ports.push(ConfigPort {
+            host: 18080,
+            guest: 8080,
+        });
+        write_wrapper_sandbox_config(&project, &config).expect("sandbox config");
+
+        let config_default = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("config default");
+        assert!(config_default.launch_args.contains(&"--no-net".to_string()));
+        assert!(!config_default
+            .launch_args
+            .contains(&"--publish".to_string()));
+
+        let cli_override = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+                "--allow-domain".to_string(),
+                "example.com".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("cli override");
+        assert!(!cli_override.launch_args.contains(&"--no-net".to_string()));
+        assert!(cli_override
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--allow-domain" && window[1] == "example.com"));
+        assert!(cli_override
             .launch_args
             .windows(2)
             .any(|window| window[0] == "--publish" && window[1] == "18080:8080"));
@@ -3736,6 +4481,47 @@ mod tests {
     }
 
     #[test]
+    fn payload_readiness_timeout_reports_last_error() {
+        let mut attempts = 0;
+        let error =
+            wait_for_payload_ready_with_probe(Duration::from_millis(1), Duration::ZERO, || {
+                attempts += 1;
+                Err(format!("probe-{attempts}"))
+            })
+            .expect_err("timeout");
+
+        assert!(attempts > 0);
+        assert!(error.contains("timed out waiting for guest payload control path"));
+        assert!(error.contains("last error: probe-"));
+    }
+
+    #[test]
+    fn frontend_artifact_summary_names_key_run_artifacts() {
+        let root = frontend_test_root();
+        let (config, _) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--tool".to_string(),
+            "codex".to_string(),
+        ])
+        .expect("config");
+
+        let summary = frontend_artifact_summary(&config);
+
+        assert!(summary.contains("artifacts: run_dir="));
+        assert!(summary.contains("state="));
+        assert!(summary.contains("qemu_log="));
+        assert!(summary.contains("console_log="));
+        assert!(summary.contains("vmnet_event_log="));
+        assert!(summary.contains("state.json"));
+        assert!(summary.contains("qemu.log"));
+    }
+
+    #[test]
     fn frontend_defaults_runtime_under_absolute_project() {
         let root = frontend_test_root();
         let (config, _) = frontend_config_from_args(&[
@@ -3837,7 +4623,13 @@ mod tests {
             "alpine:3.22".to_string(),
             "--publish-payload-port".to_string(),
             "12079".to_string(),
+            "--publish-container-port".to_string(),
+            "18080:8080".to_string(),
             "--hostile".to_string(),
+            "--payload-stress".to_string(),
+            "--dns-check".to_string(),
+            "--docker-net-check".to_string(),
+            "--fs-check".to_string(),
             "--tool".to_string(),
             "copilot".to_string(),
         ])
@@ -3847,7 +4639,18 @@ mod tests {
         assert_eq!(config.run_dir, root.join(".sandbox/docker-vm/self-test"));
         assert_eq!(config.image, "alpine:3.22");
         assert_eq!(config.publish_payload_port, Some(12079));
+        assert_eq!(
+            config.publish_container_port,
+            Some(PortPair {
+                host: 18080,
+                guest: 8080
+            })
+        );
         assert!(config.hostile);
+        assert!(config.payload_stress);
+        assert!(config.dns_check);
+        assert!(config.docker_net_check);
+        assert!(config.fs_check);
         assert_eq!(config.tool, GuestTool::Copilot);
     }
 
@@ -3862,7 +4665,17 @@ mod tests {
         )
         .expect("config");
 
-        let script = self_test_payload_script(&config, "alpine:3.22", false);
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
 
         assert!(script.contains("self-test: payload-start"));
         assert!(script.contains("id -u"));
@@ -3887,6 +4700,188 @@ mod tests {
     }
 
     #[test]
+    fn self_test_payload_stress_covers_large_request_and_response() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            true,
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
+
+        assert!(script.contains("AGENTVM_PAYLOAD_STRESS_BLOB"));
+        assert!(script.contains("AGENTVM_PAYLOAD_STRESS_BYTES"));
+        assert!(script.contains("payload-stress-start"));
+        assert!(script.contains("payload-stress-ok"));
+    }
+
+    #[test]
+    fn self_test_payload_dns_check_reports_allowed_resolution() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            true,
+            false,
+            None,
+            false,
+            false,
+        );
+
+        assert!(script.contains("dns.lookup"));
+        assert!(script.contains("dns-allow-ok example.com"));
+        assert!(script.contains("dns-allow-failed example.com"));
+    }
+
+    #[test]
+    fn self_test_payload_docker_net_check_reports_allow_and_deny_policy() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+        );
+
+        assert!(script.contains("docker-egress-ok image=alpine:3.22 policy=allow"));
+        assert!(script.contains("docker-egress-failed image=alpine:3.22 policy=allow"));
+        assert!(script.contains("docker-deny-ok image=alpine:3.22 policy=deny"));
+        assert!(script.contains("docker-deny-unexpected image=alpine:3.22 policy=deny"));
+        assert!(script.contains("phase=container-egress"));
+    }
+
+    #[test]
+    fn self_test_payload_can_skip_sqlite_concurrency_for_specialized_network_checks() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            true,
+        );
+
+        assert!(script.contains("sqlite-home-smoke"));
+        assert!(!script.contains("sqlite-concurrency-smoke"));
+        assert!(script.contains("docker-deny-ok image=alpine:3.22 policy=deny"));
+    }
+
+    #[test]
+    fn self_test_payload_fs_check_covers_live_composed_fs_contracts() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            None,
+            true,
+            false,
+        );
+
+        assert!(script.contains("self-test: fs-live-ok"));
+        assert!(script.contains("delete-me.txt"));
+        assert!(script.contains("os.rename"));
+        assert!(script.contains("os.unlink"));
+        assert!(script.contains("host-visible-ok"));
+        assert!(script.contains("key-link"));
+        assert!(script.contains("stat"));
+    }
+
+    #[test]
+    fn self_test_payload_published_container_reports_ready_and_hit() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            Some(PortPair {
+                host: 18080,
+                guest: 8080,
+            }),
+            false,
+            false,
+        );
+
+        assert!(script
+            .contains("docker-publish-ready image=alpine:3.22 host_port=18080 guest_port=8080"));
+        assert!(
+            script.contains("docker-publish-ok image=alpine:3.22 host_port=18080 guest_port=8080")
+        );
+        assert!(script.contains("agentvm-container-publish-ok"));
+        assert!(script.contains("-p 8080:8080"));
+    }
+
+    #[test]
     fn hostile_self_test_payload_covers_escape_and_denied_network_probes() {
         let root = frontend_test_root();
         let config = FrontendConfig::from_artifact_manifest_file(
@@ -3897,14 +4892,25 @@ mod tests {
         )
         .expect("config");
 
-        let script = self_test_payload_script(&config, "alpine:3.22", true);
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            true,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+        );
 
         assert!(script.contains("self-test: hostile-start"));
         assert!(script.contains("mitm-ca.key"));
         assert!(script.contains(".agentvm-self-test-key-link"));
         assert!(script.contains("169.254.169.254"));
         assert!(script.contains("127.0.0.1"));
-        assert!(script.contains("dns-deny-unexpected"));
+        assert!(script.contains("dns-deny-ok example.com"));
+        assert!(script.contains("dns-deny-unexpected example.com"));
         assert!(script.contains("self-test: hostile-ok"));
         assert!(script.contains("self-test: payload-ok"));
     }
@@ -3923,19 +4929,51 @@ mod tests {
     }
 
     #[test]
-    fn guest_http_smoke_requires_fresh_artifact() {
+    fn appliance_source_hashes_accept_current_files() {
+        let root = unique_temp_dir();
+        std::fs::create_dir_all(root.join("docker/out")).expect("out");
+        write_frontend_manifest(&root);
+
+        ensure_appliance_sources_fresh(&root.join("docker/out/artifact-manifest.json"))
+            .expect("fresh sources");
+    }
+
+    #[test]
+    fn appliance_source_hashes_reject_changed_guest_assets() {
+        for source in [
+            "docker/guest-init.sh",
+            "docker/guest-payload-server.py",
+            "docker/guest-socket-bridge.py",
+        ] {
+            let root = unique_temp_dir();
+            std::fs::create_dir_all(root.join("docker/out")).expect("out");
+            write_frontend_manifest(&root);
+            std::fs::write(root.join(source), b"changed\n").expect("change source");
+
+            let error =
+                ensure_appliance_sources_fresh(&root.join("docker/out/artifact-manifest.json"))
+                    .expect_err("stale artifact");
+
+            assert!(error.contains("stale appliance artifacts"), "{error}");
+            assert!(error.contains(source), "{error}");
+            assert!(
+                error.contains("rerun sudo ./docker/build-appliance.sh"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn appliance_source_hashes_require_manifest_entries_before_live_boot() {
         let root = unique_temp_dir();
         std::fs::create_dir_all(root.join("docker/out")).expect("out");
         std::fs::write(root.join("docker/out/artifact-manifest.json"), b"{}").expect("manifest");
-        std::fs::write(root.join("docker/out/rootfs.raw"), b"rootfs").expect("rootfs");
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        std::fs::write(root.join("docker/guest-init.sh"), b"#!/bin/sh\n").expect("guest init");
 
-        let error =
-            ensure_smoke_hook_artifact_fresh(&root.join("docker/out/artifact-manifest.json"))
-                .expect_err("stale artifact");
+        let error = ensure_appliance_sources_fresh(&root.join("docker/out/artifact-manifest.json"))
+            .expect_err("missing source hashes");
 
-        assert!(error.contains("requires rebuilt appliance artifacts"));
+        assert!(error.contains("does not record appliance source hashes"));
+        assert!(error.contains("rerun sudo ./docker/build-appliance.sh"));
     }
 
     #[test]
@@ -3964,6 +5002,49 @@ mod tests {
                 .tempdir()
                 .expect("temp dir"),
         }
+    }
+
+    fn write_frontend_manifest(root: &Path) {
+        let mut source_json = String::new();
+        for (index, source) in REQUIRED_APPLIANCE_SOURCE_INPUTS.iter().enumerate() {
+            let path = root.join(source);
+            if !path.exists() {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).expect("source parent");
+                }
+                std::fs::write(&path, format!("test source {source}\n")).expect("source");
+            }
+            let hash = sha256_file_hex(&path).expect("source hash");
+            if index > 0 {
+                source_json.push_str(",\n");
+            }
+            source_json.push_str(&format!(
+                "                {{ \"path\": \"{source}\", \"sha256\": \"{hash}\" }}"
+            ));
+        }
+        std::fs::write(
+            root.join("docker/out/artifact-manifest.json"),
+            format!(
+                r#"{{
+              "schema_version": 1,
+              "artifacts": {{
+                "kernel": "docker/out/vmlinuz",
+                "initrd": "docker/out/initrd.img",
+                "rootfs": "docker/out/rootfs.raw"
+              }},
+              "source_inputs": [
+{source_json}
+              ],
+              "vm": {{
+                "cpus": 2,
+                "memory_bytes": 2147483648,
+                "virtiofs_tag": "agentvm",
+                "kernel_cmdline": "console=hvc0 root=/dev/vda"
+              }}
+            }}"#
+            ),
+        )
+        .expect("manifest");
     }
 
     fn frontend_test_root() -> TestTempDir {

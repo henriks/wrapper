@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -88,7 +88,13 @@ where
         C::Connection: Read + Write,
     {
         let mut events = Vec::new();
-        for active in gateway.active_tcp_sessions() {
+        let active_sessions = gateway.active_tcp_sessions();
+        let active_handles = active_sessions
+            .iter()
+            .filter(|active| active.session.state == tcp::State::Established)
+            .map(|active| active.handle)
+            .collect::<HashSet<_>>();
+        for active in active_sessions {
             if active.session.state != tcp::State::Established {
                 continue;
             }
@@ -216,11 +222,16 @@ where
                 flush_pending_upstream_bytes(session, active.handle, &mut events);
             }
             if readiness.readable(active.handle) {
-                let Some(upstream_bytes) =
-                    read_available(&mut session.connection, &mut events, active.handle)
-                else {
-                    continue;
-                };
+                let upstream_bytes =
+                    match read_available(&mut session.connection, &mut events, active.handle) {
+                        UpstreamRead::Data(bytes) => bytes,
+                        UpstreamRead::WouldBlock => continue,
+                        UpstreamRead::Closed | UpstreamRead::Failed => {
+                            let _guest_frames = gateway.close_tcp_session(active.handle, now);
+                            self.sessions.remove(&active.handle);
+                            continue;
+                        }
+                    };
                 let guest_bytes = if session.decision.action == TcpAction::InterceptHttps {
                     let upstream_read = match session
                         .upstream_tls
@@ -312,6 +323,8 @@ where
                 );
             }
         }
+        self.sessions
+            .retain(|handle, _session| active_handles.contains(handle));
         events
     }
 
@@ -876,25 +889,52 @@ fn write_buffered_best_effort(
     Ok(written)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpstreamRead {
+    Data(Vec<u8>),
+    WouldBlock,
+    Closed,
+    Failed,
+}
+
 fn read_available(
     connection: &mut impl Read,
     events: &mut Vec<TcpProxyEvent>,
     handle: SocketHandle,
-) -> Option<Vec<u8>> {
-    let mut buffer = vec![0; 64 * 1024];
-    match connection.read(&mut buffer) {
-        Ok(0) => None,
-        Ok(count) => {
-            buffer.truncate(count);
-            Some(buffer)
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
-        Err(error) => {
-            events.push(TcpProxyEvent::UpstreamReadFailed {
-                handle,
-                error: error.to_string(),
-            });
-            None
+) -> UpstreamRead {
+    let mut collected = Vec::new();
+    loop {
+        let mut buffer = vec![0; 64 * 1024];
+        match connection.read(&mut buffer) {
+            Ok(0) => {
+                return if collected.is_empty() {
+                    UpstreamRead::Closed
+                } else {
+                    UpstreamRead::Data(collected)
+                };
+            }
+            Ok(count) => {
+                buffer.truncate(count);
+                collected.extend_from_slice(&buffer);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                return if collected.is_empty() {
+                    UpstreamRead::WouldBlock
+                } else {
+                    UpstreamRead::Data(collected)
+                };
+            }
+            Err(error) => {
+                events.push(TcpProxyEvent::UpstreamReadFailed {
+                    handle,
+                    error: error.to_string(),
+                });
+                return if collected.is_empty() {
+                    UpstreamRead::Failed
+                } else {
+                    UpstreamRead::Data(collected)
+                };
+            }
         }
     }
 }
@@ -1001,6 +1041,34 @@ mod tests {
                 ..
             } if *bytes > 0 && !guest_frames.is_empty()
         )));
+    }
+
+    #[test]
+    fn upstream_readiness_drains_response_until_would_block() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n\r\n".to_vec();
+        response.extend(vec![b'R'; 70_000]);
+        let mut bridge = TcpProxyBridge::new(FakeConnector {
+            response,
+            write_would_block_count: 0,
+        });
+
+        establish_http_session(&mut gateway);
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::UpstreamPayload { bytes, .. } if *bytes > 0
+        )));
+        let session = bridge.sessions.values().next().expect("session");
+        assert!(
+            session.connection.response.is_empty(),
+            "one readiness event should drain all immediately available upstream bytes"
+        );
     }
 
     #[test]
@@ -1145,6 +1213,30 @@ mod tests {
     }
 
     #[test]
+    fn guest_close_removes_proxy_session_and_interest() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(FakeConnector {
+            response: Vec::new(),
+            write_would_block_count: 0,
+        });
+
+        establish_http_session(&mut gateway);
+        bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+        let handle = bridge.session_handles().pop().expect("proxy session");
+        assert!(bridge.session_interest(handle).is_some());
+
+        gateway.close_tcp_session(handle, Instant::from_millis(6));
+        bridge.process_gateway(&mut gateway, Instant::from_millis(7));
+
+        assert!(bridge.session_handles().is_empty());
+        assert_eq!(bridge.session_interest(handle), None);
+    }
+
+    #[test]
     fn upstream_connect_failure_is_reported_without_creating_session() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
@@ -1164,6 +1256,42 @@ mod tests {
             }
         )));
         assert!(bridge.sessions.is_empty());
+    }
+
+    #[test]
+    fn upstream_eof_closes_guest_session_and_removes_proxy_session() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(EofConnector);
+
+        establish_http_session(&mut gateway);
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::UpstreamReadFailed { .. })));
+        assert!(bridge.session_handles().is_empty());
+    }
+
+    #[test]
+    fn upstream_read_error_closes_guest_session_and_removes_proxy_session() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(ReadErrorConnector);
+
+        establish_http_session(&mut gateway);
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::UpstreamReadFailed { .. })));
+        assert!(bridge.session_handles().is_empty());
     }
 
     #[test]
@@ -1327,6 +1455,34 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct EofConnector;
+
+    impl TcpUpstreamConnector for EofConnector {
+        type Connection = EofConnection;
+
+        fn connect(
+            &self,
+            _destination: &TcpDestination,
+        ) -> Result<Self::Connection, TcpConnectError> {
+            Ok(EofConnection)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReadErrorConnector;
+
+    impl TcpUpstreamConnector for ReadErrorConnector {
+        type Connection = ReadErrorConnection;
+
+        fn connect(
+            &self,
+            _destination: &TcpDestination,
+        ) -> Result<Self::Connection, TcpConnectError> {
+            Ok(ReadErrorConnection)
+        }
+    }
+
     #[derive(Debug)]
     struct MemoryConnection {
         response: Vec<u8>,
@@ -1353,6 +1509,44 @@ mod tests {
                 return Err(io::Error::from(ErrorKind::WouldBlock));
             }
             self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct EofConnection;
+
+    impl Read for EofConnection {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for EofConnection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct ReadErrorConnection;
+
+    impl Read for ReadErrorConnection {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(ErrorKind::ConnectionReset, "upstream reset"))
+        }
+    }
+
+    impl Write for ReadErrorConnection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             Ok(buf.len())
         }
 

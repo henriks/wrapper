@@ -214,12 +214,9 @@ pub fn serve_vmnet_gateway(
         let ready_events = poller.poll(poll_timeout)?;
         let now = smoltcp_now(started);
         let mut gateway_events = Vec::new();
-        let mut proxy_readable = Vec::new();
-        let mut proxy_writable = Vec::new();
-        let mut host_readable = Vec::new();
-        let mut host_writable = Vec::new();
         let mut host_events = Vec::new();
         let mut poll_all_host_ingress = false;
+        let dispatch = RuntimeReadyDispatch::from_events(&ready_events);
 
         if ready_events.is_empty() {
             let guest_frames = gateway.poll_tcp(now);
@@ -235,88 +232,64 @@ pub fn serve_vmnet_gateway(
             poll_all_host_ingress = true;
         }
 
-        for ready in ready_events {
-            match ready.source {
-                VmnetEventSource::QemuStream => {
-                    if ready.read_closed {
-                        return Ok(stats);
-                    }
-                    if ready.readable {
-                        loop {
-                            match frame_io.try_read_frame()? {
-                                FrameRead::Frame(frame) => {
-                                    stats.guest_frames_read += 1;
-                                    poll_all_host_ingress = true;
-                                    capture_frame(pcap.as_mut(), &frame)?;
-                                    let result = gateway.handle_guest_frame(frame, now);
-                                    if let Some(event) = gateway_event_from_outcome(&result.outcome)
-                                    {
-                                        gateway_events.push(event);
-                                    }
-                                    let mut frame_stats = VmnetRuntimeStats::default();
-                                    write_guest_frames(
-                                        &mut frame_io,
-                                        &result.guest_frames,
-                                        &mut frame_stats,
-                                        pcap.as_mut(),
-                                    )?;
-                                    stats.guest_frames_written += frame_stats.guest_frames_written;
-                                }
-                                FrameRead::WouldBlock => break,
-                                FrameRead::Eof => return Ok(stats),
-                            }
+        if dispatch.qemu_read_closed {
+            return Ok(stats);
+        }
+        if dispatch.qemu_readable {
+            loop {
+                match frame_io.try_read_frame()? {
+                    FrameRead::Frame(frame) => {
+                        stats.guest_frames_read += 1;
+                        poll_all_host_ingress = true;
+                        capture_frame(pcap.as_mut(), &frame)?;
+                        let result = gateway.handle_guest_frame(frame, now);
+                        if let Some(event) = gateway_event_from_outcome(&result.outcome) {
+                            gateway_events.push(event);
                         }
+                        let mut frame_stats = VmnetRuntimeStats::default();
+                        write_guest_frames(
+                            &mut frame_io,
+                            &result.guest_frames,
+                            &mut frame_stats,
+                            pcap.as_mut(),
+                        )?;
+                        stats.guest_frames_written += frame_stats.guest_frames_written;
                     }
+                    FrameRead::WouldBlock => break,
+                    FrameRead::Eof => return Ok(stats),
                 }
-                VmnetEventSource::HostListener(index) => {
-                    if ready.readable {
-                        for accepted in host_listeners.accept_ready(index) {
-                            let accepted = accepted?;
-                            match host_ingress.open_session(
-                                &mut gateway,
-                                accepted.guest_port,
-                                accepted.connection,
-                                now,
-                            ) {
-                                Ok(open) => {
-                                    let mut frame_stats = VmnetRuntimeStats::default();
-                                    write_guest_frames(
-                                        &mut frame_io,
-                                        &open.guest_frames,
-                                        &mut frame_stats,
-                                        pcap.as_mut(),
-                                    )?;
-                                    stats.guest_frames_written += frame_stats.guest_frames_written;
-                                    host_events.push(HostIngressEvent::Opened {
-                                        handle: open.handle,
-                                        guest_port: open.guest_port,
-                                        purpose: accepted.purpose,
-                                    });
-                                }
-                                Err(error) => host_events.push(HostIngressEvent::OpenFailed {
-                                    guest_port: accepted.guest_port,
-                                    purpose: accepted.purpose,
-                                    error: format!("{error:?}"),
-                                }),
-                            }
-                        }
+            }
+        }
+
+        for index in dispatch.host_listeners {
+            for accepted in host_listeners.accept_ready(index) {
+                let accepted = accepted?;
+                match host_ingress.open_session(
+                    &mut gateway,
+                    accepted.guest_port,
+                    accepted.connection,
+                    now,
+                ) {
+                    Ok(open) => {
+                        let mut frame_stats = VmnetRuntimeStats::default();
+                        write_guest_frames(
+                            &mut frame_io,
+                            &open.guest_frames,
+                            &mut frame_stats,
+                            pcap.as_mut(),
+                        )?;
+                        stats.guest_frames_written += frame_stats.guest_frames_written;
+                        host_events.push(HostIngressEvent::Opened {
+                            handle: open.handle,
+                            guest_port: open.guest_port,
+                            purpose: accepted.purpose,
+                        });
                     }
-                }
-                VmnetEventSource::HostSession(handle) => {
-                    if ready.readable || ready.read_closed || ready.error {
-                        host_readable.push(handle);
-                    }
-                    if ready.writable || ready.write_closed || ready.error {
-                        host_writable.push(handle);
-                    }
-                }
-                VmnetEventSource::UpstreamSession(handle) => {
-                    if ready.readable || ready.read_closed || ready.error {
-                        proxy_readable.push(handle);
-                    }
-                    if ready.writable || ready.write_closed || ready.error {
-                        proxy_writable.push(handle);
-                    }
+                    Err(error) => host_events.push(HostIngressEvent::OpenFailed {
+                        guest_port: accepted.guest_port,
+                        purpose: accepted.purpose,
+                        error: format!("{error:?}"),
+                    }),
                 }
             }
         }
@@ -326,7 +299,7 @@ pub fn serve_vmnet_gateway(
             &mut gateway,
             &mut proxy,
             now,
-            TcpProxyReadiness::selected(proxy_readable, proxy_writable),
+            TcpProxyReadiness::selected(dispatch.proxy_readable, dispatch.proxy_writable),
             pcap.as_mut(),
         )?;
         stats.guest_frames_written += proxy_pump.guest_frames_written;
@@ -339,7 +312,7 @@ pub fn serve_vmnet_gateway(
             if poll_all_host_ingress {
                 HostIngressReadiness::all()
             } else {
-                HostIngressReadiness::selected(host_readable, host_writable)
+                HostIngressReadiness::selected(dispatch.host_readable, dispatch.host_writable)
             },
             pcap.as_mut(),
         )?;
@@ -355,6 +328,53 @@ pub fn serve_vmnet_gateway(
         stats.gateway_events.extend(gateway_events);
         stats.proxy_events.extend(proxy_pump.events);
         stats.host_ingress_events.extend(host_events);
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RuntimeReadyDispatch {
+    qemu_readable: bool,
+    qemu_read_closed: bool,
+    host_listeners: Vec<usize>,
+    host_readable: Vec<smoltcp::iface::SocketHandle>,
+    host_writable: Vec<smoltcp::iface::SocketHandle>,
+    proxy_readable: Vec<smoltcp::iface::SocketHandle>,
+    proxy_writable: Vec<smoltcp::iface::SocketHandle>,
+}
+
+impl RuntimeReadyDispatch {
+    fn from_events(events: &[crate::vmnet_poller::VmnetReadyEvent]) -> Self {
+        let mut dispatch = Self::default();
+        for ready in events {
+            match ready.source {
+                VmnetEventSource::QemuStream => {
+                    dispatch.qemu_read_closed |= ready.read_closed;
+                    dispatch.qemu_readable |= ready.readable;
+                }
+                VmnetEventSource::HostListener(index) => {
+                    if ready.readable {
+                        dispatch.host_listeners.push(index);
+                    }
+                }
+                VmnetEventSource::HostSession(handle) => {
+                    if ready.readable || ready.read_closed || ready.error {
+                        dispatch.host_readable.push(handle);
+                    }
+                    if ready.writable || ready.write_closed || ready.error {
+                        dispatch.host_writable.push(handle);
+                    }
+                }
+                VmnetEventSource::UpstreamSession(handle) => {
+                    if ready.readable || ready.read_closed || ready.error {
+                        dispatch.proxy_readable.push(handle);
+                    }
+                    if ready.writable || ready.write_closed || ready.error {
+                        dispatch.proxy_writable.push(handle);
+                    }
+                }
+            }
+        }
+        dispatch
     }
 }
 
@@ -914,6 +934,50 @@ mod tests {
     const PUBLIC_IP: Ipv4Address = Ipv4Address::new(93, 184, 216, 34);
 
     #[test]
+    fn runtime_ready_dispatch_classifies_simultaneous_sources() {
+        let handle = smoltcp::iface::SocketHandle::default();
+        let dispatch = RuntimeReadyDispatch::from_events(&[
+            ready(VmnetEventSource::QemuStream).readable(),
+            ready(VmnetEventSource::HostListener(2)).readable(),
+            ready(VmnetEventSource::HostSession(handle)).readable(),
+            ready(VmnetEventSource::UpstreamSession(handle)).writable(),
+        ]);
+
+        assert!(dispatch.qemu_readable);
+        assert!(!dispatch.qemu_read_closed);
+        assert_eq!(dispatch.host_listeners, vec![2]);
+        assert_eq!(dispatch.host_readable, vec![handle]);
+        assert!(dispatch.host_writable.is_empty());
+        assert!(dispatch.proxy_readable.is_empty());
+        assert_eq!(dispatch.proxy_writable, vec![handle]);
+    }
+
+    #[test]
+    fn runtime_ready_dispatch_treats_close_and_error_as_session_readiness() {
+        let handle = smoltcp::iface::SocketHandle::default();
+        let dispatch = RuntimeReadyDispatch::from_events(&[
+            ready(VmnetEventSource::QemuStream).read_closed(),
+            ready(VmnetEventSource::HostSession(handle)).error(),
+            ready(VmnetEventSource::UpstreamSession(handle)).read_closed(),
+            ready(VmnetEventSource::UpstreamSession(handle)).write_closed(),
+        ]);
+
+        assert!(dispatch.qemu_read_closed);
+        assert_eq!(dispatch.host_readable, vec![handle]);
+        assert_eq!(dispatch.host_writable, vec![handle]);
+        assert_eq!(dispatch.proxy_readable, vec![handle]);
+        assert_eq!(dispatch.proxy_writable, vec![handle]);
+    }
+
+    #[test]
+    fn runtime_ready_dispatch_empty_events_drive_timer_only_poll() {
+        assert_eq!(
+            RuntimeReadyDispatch::from_events(&[]),
+            RuntimeReadyDispatch::default()
+        );
+    }
+
+    #[test]
     fn stream_runtime_pumps_gateway_and_http_proxy_until_eof() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
@@ -1272,6 +1336,46 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    fn ready(source: VmnetEventSource) -> ReadyEventBuilder {
+        ReadyEventBuilder(crate::vmnet_poller::VmnetReadyEvent {
+            source,
+            readable: false,
+            writable: false,
+            error: false,
+            read_closed: false,
+            write_closed: false,
+        })
+    }
+
+    struct ReadyEventBuilder(crate::vmnet_poller::VmnetReadyEvent);
+
+    impl ReadyEventBuilder {
+        fn readable(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
+            self.0.readable = true;
+            self.0
+        }
+
+        fn writable(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
+            self.0.writable = true;
+            self.0
+        }
+
+        fn error(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
+            self.0.error = true;
+            self.0
+        }
+
+        fn read_closed(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
+            self.0.read_closed = true;
+            self.0
+        }
+
+        fn write_closed(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
+            self.0.write_closed = true;
+            self.0
         }
     }
 
