@@ -155,10 +155,14 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
 
 Expected behavior:
 
-- A startup dialog appears because no tool was selected by argv0 or `--tool`.
+- On an unconfigured project, a startup dialog appears because no tool was
+  selected by argv0, `--tool`, or `.sandbox/config.json`.
 - Accepting the default initializes Codex and the generated
   `.sandbox/docker-vm/run/composed-fs-manifest.json` contains a writable
   `$HOME/.codex` tool-state mount backed by the same host path.
+- The accepted setup is persisted to `.sandbox/config.json`; rerunning the same
+  wrapper command starts the configured default command without showing the
+  startup dialog.
 - The guest payload renders inside the terminal viewport, with a
   one-line wrapper status/prompt area below it.
 - Typed input in guest focus reaches the guest payload.
@@ -188,6 +192,24 @@ Expected behavior:
 - No startup dialog or alternate-screen TUI appears.
 - Payload output streams directly to stdout.
 - The process exits with the guest payload exit status.
+
+Verify the command override path:
+
+```sh
+cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  wrap \
+  --project "$PWD" \
+  --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
+  --qemu /usr/bin/qemu-system-x86_64 \
+  --command bash \
+  -- -l
+```
+
+Expected behavior:
+
+- The configured project is not reprompted.
+- The guest starts an interactive `bash -l` payload while preserving configured
+  Codex state mounts.
 
 On failure, collect `.sandbox/docker-vm/run/state.json`,
 `.sandbox/docker-vm/run/qemu.log`, `.sandbox/docker-vm/run/vmnet-events.log`,

@@ -31,6 +31,7 @@ use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
 };
+use serde::{Deserialize, Serialize};
 
 mod tui;
 
@@ -246,13 +247,17 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
             "--tls-generate-per-host-certs".to_string(),
         ]);
     }
+    let project = wrapper.project.clone();
     let ui_mode = wrapper.ui_mode;
-    let needs_startup_dialog = ui_mode == WrapperUiMode::Tui && !wrapper.tool_selected;
+    let needs_startup_dialog = ui_mode == WrapperUiMode::Tui
+        && !wrapper.tool_selected
+        && wrapper.command_override.is_none();
     let mut launch_args = vec!["launch".to_string()];
     launch_args.extend(wrapper.into_launch_args());
     if needs_startup_dialog {
         let selection = tui::run_startup_dialog().map_err(|error| error.to_string())?;
         if selection.enable_codex {
+            write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())?;
             launch_args.extend(["--tool".to_string(), "codex".to_string()]);
         } else {
             return Err("startup dialog did not select a payload".to_string());
@@ -271,6 +276,7 @@ struct WrapperArgs {
     launch_args: Vec<String>,
     ui_mode: WrapperUiMode,
     tool_selected: bool,
+    command_override: Option<String>,
     tls_bootstrap: bool,
     reset: bool,
     help: bool,
@@ -294,6 +300,76 @@ impl WrapperArgs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WrapperSandboxConfig {
+    schema_version: u32,
+    codex_enabled: bool,
+    default_command: String,
+}
+
+impl WrapperSandboxConfig {
+    fn codex_default() -> Self {
+        Self {
+            schema_version: 1,
+            codex_enabled: true,
+            default_command: "codex".to_string(),
+        }
+    }
+}
+
+fn wrapper_sandbox_config_path(project: &PathBuf) -> PathBuf {
+    project.join(".sandbox/config.json")
+}
+
+fn read_wrapper_sandbox_config(project: &PathBuf) -> Result<Option<WrapperSandboxConfig>, String> {
+    let path = wrapper_sandbox_config_path(project);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read sandbox config {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    let config: WrapperSandboxConfig = serde_json::from_str(&text)
+        .map_err(|error| format!("failed to parse sandbox config {}: {error}", path.display()))?;
+    if config.schema_version != 1 {
+        return Err(format!(
+            "unsupported sandbox config schema_version {} in {}",
+            config.schema_version,
+            path.display()
+        ));
+    }
+    if config.default_command.trim().is_empty() {
+        return Err(format!(
+            "sandbox config {} has an empty default_command",
+            path.display()
+        ));
+    }
+    Ok(Some(config))
+}
+
+fn write_wrapper_sandbox_config(
+    project: &PathBuf,
+    config: &WrapperSandboxConfig,
+) -> Result<(), String> {
+    let path = wrapper_sandbox_config_path(project);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create sandbox config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let text = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("failed to serialize sandbox config: {error}"))?;
+    fs::write(&path, format!("{text}\n"))
+        .map_err(|error| format!("failed to write sandbox config {}: {error}", path.display()))
+}
+
 fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, String> {
     parse_wrapper_args_with_terminal(
         program,
@@ -312,6 +388,7 @@ fn parse_wrapper_args_with_terminal(
     let mut launch_args = Vec::new();
     let mut project = env::current_dir().map_err(|error| error.to_string())?;
     let mut tool = None;
+    let mut command_override = None;
     let mut reset = false;
     let mut help = false;
     let mut no_net = false;
@@ -335,6 +412,13 @@ fn parse_wrapper_args_with_terminal(
                 selected.parse::<GuestTool>()?;
                 tool = Some(selected.clone());
                 launch_args.extend(["--tool".to_string(), selected]);
+            }
+            "--command" => {
+                let command = value(args, &mut index, "--command")?;
+                if command.trim().is_empty() {
+                    return Err("--command must not be empty".to_string());
+                }
+                command_override = Some(command);
             }
             "--no-net" => {
                 no_net = true;
@@ -382,6 +466,19 @@ fn parse_wrapper_args_with_terminal(
             launch_args,
             ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
             tool_selected: false,
+            command_override,
+            tls_bootstrap,
+            reset,
+            help,
+        });
+    }
+    if reset {
+        return Ok(WrapperArgs {
+            project,
+            launch_args,
+            ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
+            tool_selected: false,
+            command_override,
             tls_bootstrap,
             reset,
             help,
@@ -391,15 +488,33 @@ fn parse_wrapper_args_with_terminal(
         launch_args.extend(["--project".to_string(), project.display().to_string()]);
     }
     let ui_mode = wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty);
+    let sandbox_config = read_wrapper_sandbox_config(&project)?;
     let mut tool_selected = launch_args.iter().any(|arg| arg == "--tool");
     if !tool_selected {
-        if let Some(tool) = tool {
+        if let Some(tool) = tool.clone() {
             launch_args.extend(["--tool".to_string(), tool]);
             tool_selected = true;
-        } else if ui_mode == WrapperUiMode::Plain {
+        } else if sandbox_config
+            .as_ref()
+            .is_some_and(|config| config.codex_enabled)
+        {
+            launch_args.extend(["--tool".to_string(), "codex".to_string()]);
+            tool_selected = true;
+        } else if ui_mode == WrapperUiMode::Plain
+            && command_override.is_none()
+            && sandbox_config.is_none()
+        {
             return Err(
-                "no tool selected; use --tool codex|copilot or interactive TUI setup".to_string(),
+                "no tool selected; use --tool codex|copilot, --command CMD, or interactive TUI setup".to_string(),
             );
+        }
+    }
+    if let Some(command) = command_override.as_ref() {
+        apply_wrapper_command(&mut launch_args, command);
+    } else if tool.is_none() {
+        if let Some(config) = sandbox_config.as_ref() {
+            apply_configured_default_command(&mut launch_args, config);
+            tool_selected = true;
         }
     }
     if !no_net
@@ -415,10 +530,58 @@ fn parse_wrapper_args_with_terminal(
         launch_args,
         ui_mode,
         tool_selected,
+        command_override,
         tls_bootstrap,
         reset,
         help,
     })
+}
+
+fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
+    if config.codex_enabled && config.default_command.trim() == "codex" {
+        return;
+    }
+    apply_wrapper_command(launch_args, &config.default_command);
+}
+
+fn apply_wrapper_command(launch_args: &mut Vec<String>, command: &str) {
+    let mut tool_args = Vec::new();
+    let mut filtered = Vec::with_capacity(launch_args.len());
+    let mut index = 0;
+    while index < launch_args.len() {
+        if launch_args[index] == "--tool-arg" && index + 1 < launch_args.len() {
+            tool_args.push(launch_args[index + 1].clone());
+            index += 2;
+        } else {
+            filtered.push(launch_args[index].clone());
+            index += 1;
+        }
+    }
+    *launch_args = filtered;
+
+    let script = payload_script_from_command(command, &tool_args);
+    upsert_launch_arg(launch_args, "--payload-script", script);
+}
+
+fn payload_script_from_command(command: &str, args: &[String]) -> String {
+    let mut script = format!("exec {}", command.trim());
+    for arg in args {
+        script.push(' ');
+        script.push_str(&shell_quote(arg));
+    }
+    script
+}
+
+fn upsert_launch_arg(launch_args: &mut Vec<String>, flag: &str, value: String) {
+    let mut index = 0;
+    while index < launch_args.len() {
+        if launch_args[index] == flag && index + 1 < launch_args.len() {
+            launch_args[index + 1] = value;
+            return;
+        }
+        index += 1;
+    }
+    launch_args.extend([flag.to_string(), value]);
 }
 
 fn wrapper_ui_mode(no_tui: bool, stdin_is_tty: bool, stdout_is_tty: bool) -> WrapperUiMode {
@@ -536,7 +699,7 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
 
 fn print_wrapper_usage() {
     eprintln!(
-        "usage: agentvm-frontend wrap [--project PATH] [--tool codex|copilot] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- EXTRA_ARGS...]"
+        "usage: agentvm-frontend wrap [--project PATH] [--tool codex|copilot] [--command CMD] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- EXTRA_ARGS...]"
     );
 }
 
@@ -2239,8 +2402,17 @@ mod tests {
 
     #[test]
     fn interactive_wrap_without_tool_defers_to_startup_dialog() {
-        let args =
-            parse_wrapper_args_with_terminal("agentvm-frontend", &[], true, true).expect("wrapper");
+        let root = frontend_test_root();
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
 
         assert_eq!(args.ui_mode, WrapperUiMode::Tui);
         assert!(!args.tool_selected);
@@ -2248,13 +2420,125 @@ mod tests {
     }
 
     #[test]
+    fn configured_codex_project_skips_startup_dialog() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--artifact-manifest".to_string(),
+                root.join("docker/out/artifact-manifest.json")
+                    .display()
+                    .to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Tui);
+        assert!(args.tool_selected);
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+        assert!(!args.launch_args.contains(&"--payload-script".to_string()));
+    }
+
+    #[test]
+    fn wrapper_command_override_runs_payload_script_and_keeps_configured_codex_state() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--command".to_string(),
+                "bash".to_string(),
+                "--".to_string(),
+                "-l".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert!(args.tool_selected);
+        assert_eq!(args.command_override.as_deref(), Some("bash"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
+        assert!(!args.launch_args.contains(&"--tool-arg".to_string()));
+    }
+
+    #[test]
+    fn configured_default_command_can_be_arbitrary_payload() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig {
+                schema_version: 1,
+                codex_enabled: false,
+                default_command: "bash".to_string(),
+            },
+        )
+        .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+                "--".to_string(),
+                "-l".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert_eq!(args.ui_mode, WrapperUiMode::Plain);
+        assert!(args.tool_selected);
+        assert!(!args.launch_args.contains(&"--tool".to_string()));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
+    }
+
+    #[test]
     fn plain_wrap_without_tool_still_requires_explicit_tool() {
-        let error = parse_wrapper_args_with_terminal("agentvm-frontend", &[], false, true)
-            .expect_err("missing tool");
+        let root = frontend_test_root();
+        let error = parse_wrapper_args_with_terminal(
+            "agentvm-frontend",
+            &[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+            ],
+            false,
+            true,
+        )
+        .expect_err("missing tool");
 
         assert_eq!(
             error,
-            "no tool selected; use --tool codex|copilot or interactive TUI setup"
+            "no tool selected; use --tool codex|copilot, --command CMD, or interactive TUI setup"
         );
     }
 
@@ -2389,8 +2673,17 @@ mod tests {
             "unknown command: --tool"
         );
 
-        let args =
-            parse_wrapper_args_with_terminal("codex-wrap", &[], true, true).expect("wrapper args");
+        let root = frontend_test_root();
+        let args = parse_wrapper_args_with_terminal(
+            "codex-wrap",
+            &[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper args");
         assert!(!args.tool_selected);
         assert!(!args.launch_args.contains(&"--tool".to_string()));
     }

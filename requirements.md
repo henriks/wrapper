@@ -25,12 +25,15 @@ The executable name is not part of wrapper behavior. `codex-wrap` and
 come from explicit flags or the interactive TUI startup flow.
 
 Wrapper arguments after `--` are passed to the selected tool as tool arguments.
+When `--command CMD` is supplied, `CMD` is run as the guest payload for that
+launch instead; arguments after `--` are shell-quoted and appended to `CMD`.
 
 ## Supported Wrapper Flags
 
 ```text
 --project PATH
 --tool codex|copilot
+--command CMD
 --no-net
 --docker-publish HOST:GUEST
 --ro PATH
@@ -58,6 +61,7 @@ All mutable state is project-local under `.sandbox/`:
 
 ```text
 .sandbox/
+  config.json
   home/
   docker-vm/
     docker-data.raw
@@ -84,6 +88,9 @@ natural home path. The sparse `docker-data.raw` disk is mounted in the guest at
 diagnostic logs.
 
 `--reset` removes `.sandbox/` unless the project VM lock is held.
+`.sandbox/config.json` records project-level wrapper setup, including whether
+Codex state is enabled and the default command to run. A project configured
+through the TUI startup flow is not prompted again on subsequent wrapper starts.
 
 ## Guest Filesystem Contract
 
