@@ -23,13 +23,13 @@ where
     }
 
     pub fn handle_udp_payload(&self, payload: &[u8]) -> DnsProxyResult {
-        if payload_has_resource_records(payload) {
+        if payload_has_answer_or_authority_records(payload) {
             return DnsProxyResult {
                 response: None,
                 log: DnsLogEntry {
                     domain: None,
                     decision: DnsDecision::Malformed,
-                    detail: "DNS query payload must not contain resource record sections"
+                    detail: "DNS query payload must not contain answer or authority records"
                         .to_string(),
                 },
             };
@@ -217,13 +217,12 @@ fn query_domain(query: &Message) -> Option<String> {
     )
 }
 
-fn payload_has_resource_records(payload: &[u8]) -> bool {
+fn payload_has_answer_or_authority_records(payload: &[u8]) -> bool {
     if payload.len() < 12 {
         return false;
     }
     u16::from_be_bytes([payload[6], payload[7]]) != 0
         || u16::from_be_bytes([payload[8], payload[9]]) != 0
-        || u16::from_be_bytes([payload[10], payload[11]]) != 0
 }
 
 fn parse_message(payload: &[u8]) -> Result<Message, String> {
@@ -550,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_resource_record_payload_is_rejected_before_parser() {
+    fn dns_answer_or_authority_record_payload_is_rejected_before_parser() {
         let policy = policy_allowing("example.com");
         let proxy = DnsProxy::new(
             &policy,
@@ -569,7 +568,26 @@ mod tests {
         assert_eq!(result.log.decision, DnsDecision::Malformed);
         assert_eq!(
             result.log.detail,
-            "DNS query payload must not contain resource record sections"
+            "DNS query payload must not contain answer or authority records"
+        );
+    }
+
+    #[test]
+    fn forwards_query_with_edns_additional_record() {
+        let policy = policy_allowing("example.com");
+        let upstream = RecordingUpstream::new(empty_success_response(0x1234, "example.com"));
+        let proxy = DnsProxy::new(&policy, &upstream);
+        let mut payload = query("example.com");
+        payload[10] = 0;
+        payload[11] = 1;
+        payload.extend_from_slice(&[0, 0, 41, 16, 0, 0, 0, 0, 0, 0, 0]);
+
+        let result = proxy.handle_udp_payload(&payload);
+
+        assert_eq!(result.log.decision, DnsDecision::Allowed);
+        assert_eq!(
+            *upstream.calls.borrow(),
+            vec![("example.com".to_string(), RecordType::A)]
         );
     }
 

@@ -267,6 +267,7 @@ mirror_log_to_workspace "${GUEST_PAYLOAD_SERVER_LOG}" "${HOST_PAYLOAD_SERVER_LOG
 
 modprobe overlay || true
 load_kernel_module virtio_net
+ip link set lo up || true
 
 if [ -n "${GUEST_IP}" ] && [ -n "${GATEWAY_IP}" ] && [ -n "${PREFIX_LEN}" ] && [ -n "${GUEST_MAC}" ]; then
   IFACE=$(find_iface_by_mac "${GUEST_MAC}" || true)

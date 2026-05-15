@@ -27,3 +27,11 @@ Host ingress listener accepts and host session read/write progress are driven by
 **2026-05-15T09:44:36Z**
 
 Moved host ingress toward readiness dispatch. HostIngressListenerSet now exposes listener fds and accept_ready(index). HostIngressBridge has HostIngressReadiness, per-session interests, raw fd access for TcpStream sessions, and pending host-write buffering so guest payload is not dropped when the host socket is not writable. vmnet_runtime registers/deregisters host sessions through RuntimePoller. Added readiness_buffers_guest_payload_until_host_socket_is_writable regression coverage.
+
+**2026-05-15T10:06:33Z**
+
+Live validation exposed a host-ingress readiness gap after the mio rewrite: the readiness path read at most one host chunk per readable notification. With payload control, that could consume only the 5-byte frame header and leave the JSON body buffered, causing repeated ping success but wait_for_payload_ready timeout. Fixed HostIngressBridge::process_gateway_with_readiness to drain host reads until WouldBlock and added readiness_drains_multiple_host_reads_until_would_block regression coverage.
+
+**2026-05-15T10:30:16Z**
+
+Full live validation after the mio rewrite exposed additional contracts beyond the first host-read drain bug: (1) host payload data can arrive before a newly established host-ingress session is registered with mio, so vmnet_runtime now polls all host-ingress sessions after QEMU-side TCP progress; (2) guest responses should be written opportunistically when available and only buffered on WouldBlock; (3) rebuilt appliance artifacts were required because docker/guest-payload-server.py was newer than docker/out; (4) guest-init must bring lo up so guest DOCKER_HOST=tcp://127.0.0.1:1075 stays inside the guest instead of hitting vmnet loopback-deny policy; (5) Docker resolver sends EDNS additional OPT records, so dns_proxy now allows additional records while still rejecting answer/authority records in queries. Live validation passes after these fixes.

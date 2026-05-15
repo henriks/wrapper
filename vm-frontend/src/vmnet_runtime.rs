@@ -219,6 +219,7 @@ pub fn serve_vmnet_gateway(
         let mut host_readable = Vec::new();
         let mut host_writable = Vec::new();
         let mut host_events = Vec::new();
+        let mut poll_all_host_ingress = false;
 
         if ready_events.is_empty() {
             let guest_frames = gateway.poll_tcp(now);
@@ -231,6 +232,7 @@ pub fn serve_vmnet_gateway(
             )?;
             stats.guest_frames_written += frame_stats.guest_frames_written;
             let _ = captured;
+            poll_all_host_ingress = true;
         }
 
         for ready in ready_events {
@@ -244,6 +246,7 @@ pub fn serve_vmnet_gateway(
                             match frame_io.try_read_frame()? {
                                 FrameRead::Frame(frame) => {
                                     stats.guest_frames_read += 1;
+                                    poll_all_host_ingress = true;
                                     capture_frame(pcap.as_mut(), &frame)?;
                                     let result = gateway.handle_guest_frame(frame, now);
                                     if let Some(event) = gateway_event_from_outcome(&result.outcome)
@@ -333,7 +336,11 @@ pub fn serve_vmnet_gateway(
             &mut gateway,
             &mut host_ingress,
             now,
-            HostIngressReadiness::selected(host_readable, host_writable),
+            if poll_all_host_ingress {
+                HostIngressReadiness::all()
+            } else {
+                HostIngressReadiness::selected(host_readable, host_writable)
+            },
             pcap.as_mut(),
         )?;
         stats.guest_frames_written += host_pump.guest_frames_written;
