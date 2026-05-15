@@ -7,8 +7,13 @@ FUZZ_RSS_MB ?= 4096
 FUZZ_TIMEOUT ?= 10
 FUZZ_ARGS ?=
 export FUZZ_TOOLCHAIN ?= nightly
+BUILD_PROFILE ?= dev
+BUILD_BIN ?= agentvm
 
-.PHONY: fuzz-help fuzz-check fuzz-smoke fuzz-target fuzz-extended fuzz-repro fuzz-minimize
+.PHONY: build-binary fuzz-help fuzz-check fuzz-smoke fuzz-target fuzz-extended fuzz-repro fuzz-minimize
+
+build-binary:
+	cargo build --manifest-path vm-frontend/Cargo.toml --bin $(BUILD_BIN) $(if $(filter release,$(BUILD_PROFILE)),--release,)
 
 fuzz-help:
 	@vm-frontend/fuzz/run.sh --help

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use serde::Serialize;
 
@@ -63,58 +62,6 @@ impl RuntimeMount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GuestTool {
-    Codex,
-    Copilot,
-}
-
-impl GuestTool {
-    pub fn cli(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Copilot => "github-copilot-cli",
-        }
-    }
-
-    pub fn auto_flags(self) -> &'static [&'static str] {
-        match self {
-            Self::Codex => &["--dangerously-bypass-approvals-and-sandbox"],
-            Self::Copilot => &["--allow-all", "--no-auto-update"],
-        }
-    }
-
-    pub fn npm_package(self) -> &'static str {
-        match self {
-            Self::Codex => "@openai/codex",
-            Self::Copilot => "@github/copilot",
-        }
-    }
-
-    fn state_dirs(self) -> &'static [&'static str] {
-        match self {
-            Self::Codex => CODEX_TOOL_STATE_DIRS,
-            Self::Copilot => &[
-                ".copilot",
-                ".config/github-copilot",
-                ".cache/github-copilot",
-            ],
-        }
-    }
-}
-
-impl FromStr for GuestTool {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "copilot" => Ok(Self::Copilot),
-            _ => Err(format!("unknown tool: {value}")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolStateMounts {
     pub codex: bool,
@@ -129,13 +76,6 @@ impl ToolStateMounts {
         }
     }
 
-    pub fn from_guest_tool(tool: Option<GuestTool>) -> Self {
-        Self {
-            codex: tool == Some(GuestTool::Codex),
-            pi: false,
-        }
-    }
-
     pub fn union(self, other: Self) -> Self {
         Self {
             codex: self.codex || other.codex,
@@ -146,7 +86,6 @@ impl ToolStateMounts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestShareSpec {
-    pub tool: Option<GuestTool>,
     pub tool_state: ToolStateMounts,
     pub host_home: PathBuf,
     pub gh: bool,
@@ -157,7 +96,6 @@ pub struct GuestShareSpec {
 impl GuestShareSpec {
     pub fn minimal(host_home: impl Into<PathBuf>) -> Self {
         Self {
-            tool: None,
             tool_state: ToolStateMounts::default(),
             host_home: host_home.into(),
             gh: false,
@@ -244,7 +182,7 @@ pub fn guest_runtime_mounts(
     ];
     let mut next_id = 3;
 
-    if spec.tool_state.codex || spec.tool == Some(GuestTool::Codex) {
+    if spec.tool_state.codex {
         for rel_dir in CODEX_TOOL_STATE_DIRS {
             mounts.push(home_mount(
                 next_id,
@@ -270,20 +208,6 @@ pub fn guest_runtime_mounts(
             next_id += 1;
         }
     }
-    if spec.tool == Some(GuestTool::Copilot) {
-        for rel_dir in GuestTool::Copilot.state_dirs() {
-            mounts.push(home_mount(
-                next_id,
-                &spec.host_home,
-                &guest_home,
-                rel_dir,
-                false,
-                ManifestSourceClass::ToolState,
-            ));
-            next_id += 1;
-        }
-    }
-
     mounts.push(home_mount(
         next_id,
         &spec.host_home,
@@ -741,8 +665,7 @@ mod tests {
         let mounts = guest_runtime_mounts(
             project.clone(),
             &GuestShareSpec {
-                tool: Some(GuestTool::Codex),
-                tool_state: ToolStateMounts::from_guest_tool(Some(GuestTool::Codex)),
+                tool_state: ToolStateMounts::codex(),
                 host_home: home.clone(),
                 gh: true,
                 extra_ro: vec![extra_ro.clone()],
@@ -785,7 +708,6 @@ mod tests {
         let mounts = guest_runtime_mounts(
             project.clone(),
             &GuestShareSpec {
-                tool: None,
                 tool_state: ToolStateMounts::codex(),
                 host_home: home.clone(),
                 gh: false,
@@ -800,45 +722,6 @@ mod tests {
                 && !mount.readonly
                 && mount.source_class == ManifestSourceClass::ToolState
         }));
-    }
-
-    #[test]
-    fn guest_runtime_mounts_cover_copilot_state_and_gh_opt_in() {
-        let root = unique_temp_dir();
-        let project = root.join("repo");
-        let home = root.join("host-home");
-        let mounts = guest_runtime_mounts(
-            project.clone(),
-            &GuestShareSpec {
-                tool: Some(GuestTool::Copilot),
-                tool_state: ToolStateMounts::from_guest_tool(Some(GuestTool::Copilot)),
-                host_home: home.clone(),
-                gh: false,
-                extra_ro: Vec::new(),
-                extra_rw: Vec::new(),
-            },
-        );
-
-        assert!(mounts.iter().any(|mount| mount.guest_path == project));
-        for rel in [
-            ".copilot",
-            ".config/github-copilot",
-            ".cache/github-copilot",
-            ".docker",
-        ] {
-            assert!(
-                mounts.iter().any(|mount| {
-                    mount.host_path == home.join(rel)
-                        && mount.guest_path == home.join(rel)
-                        && !mount.readonly
-                        && mount.source_class == ManifestSourceClass::ToolState
-                }),
-                "missing copilot/tool-state mount for {rel}"
-            );
-        }
-        assert!(!mounts
-            .iter()
-            .any(|mount| mount.guest_path.ends_with(".config/gh")));
     }
 
     #[test]

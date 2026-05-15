@@ -53,10 +53,9 @@ The automatic non-TTY fallback is required so CI, shell pipelines, and scripted
 payload launches do not enter raw mode or require dialog interaction.
 
 The user-facing wrapper path is `agentvm`. `agentvm-frontend wrap` remains a
-compatibility/development path. Tool setup comes from `--setup-tool` recipes,
-structured startup configuration, explicit compatibility flags, or the TUI
-initialization dialog; legacy `codex-wrap`/`copilot-wrap` executable-name
-inference remains unsupported.
+development path. Tool setup comes from `--setup-tool` recipes, structured
+startup configuration, or the TUI initialization dialog; legacy
+`codex-wrap`/`copilot-wrap` executable-name inference remains unsupported.
 
 ## Dependencies
 

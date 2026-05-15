@@ -77,12 +77,6 @@ in `wrapper-ux-contract.md`.
 - `--reset`
 - command override after `--`
 
-Compatibility flags:
-
-- `--tool codex|copilot`
-- `--tool-arg ARG`
-- `--command CMD`
-
 ### Flags That Change Meaning
 
 - `--no-net`

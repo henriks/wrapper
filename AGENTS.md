@@ -6,6 +6,11 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 * when working on a ticket, if encountering details relevant to other tickets, document them in said other tickets
 * when done with a ticket, remember to close it
 
+
+# On compatability
+
+Only care about compatability for the config file. Never keep things like command line argument "for compatability", or do excessively defensive coding.
+
 # More code is a liability
 
 Always consider carefully whether a problem can be solved by removing and combining code, and introducing abstractions. We can't keep on tacking on more code ad infinitum.

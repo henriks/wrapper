@@ -24,7 +24,7 @@ use agentvm_frontend::payload_client::{
     PayloadRequest,
 };
 use agentvm_frontend::runtime_manifest::{
-    guest_runtime_mounts, GuestShareSpec, GuestTool, RuntimeMount, ToolStateMounts,
+    guest_runtime_mounts, GuestShareSpec, RuntimeMount, ToolStateMounts,
 };
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeConfig};
@@ -305,8 +305,10 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
     if needs_startup_dialog {
         let selection = tui::run_startup_dialog().map_err(|error| error.to_string())?;
         if selection.enable_codex {
-            write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())?;
-            launch_args.extend(["--tool".to_string(), "codex".to_string()]);
+            let config = WrapperSandboxConfig::codex_default();
+            write_wrapper_sandbox_config(&project, &config)?;
+            apply_configured_launch_defaults(&mut launch_args, &config, false, false)?;
+            apply_configured_default_command(&mut launch_args, &config);
         } else {
             return Err("startup dialog did not select a payload".to_string());
         }
@@ -341,23 +343,12 @@ enum WrapperUiMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WrapperCommandOverride {
     Argv(ConfigCommand),
-    Shell { command: String, args: Vec<String> },
 }
 
 impl WrapperCommandOverride {
-    fn append_args(&mut self, args: &[String]) {
-        match self {
-            Self::Argv(command) => command.args.extend(args.iter().cloned()),
-            Self::Shell {
-                args: shell_args, ..
-            } => shell_args.extend(args.iter().cloned()),
-        }
-    }
-
     fn script(&self) -> String {
         match self {
             Self::Argv(command) => payload_script_from_config_command(command),
-            Self::Shell { command, args } => payload_script_from_shell_command(command, args),
         }
     }
 }
@@ -433,6 +424,13 @@ impl SetupTool {
         match self {
             Self::Codex => "codex",
             Self::Pi => "pi",
+        }
+    }
+
+    fn auto_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Codex => &["--dangerously-bypass-approvals-and-sandbox"],
+            Self::Pi => &[],
         }
     }
 
@@ -800,16 +798,6 @@ fn parse_wrapper_args_with_terminal(
         .map(|path| absolute_cli_path(&path.display().to_string()))
         .transpose()?
         .unwrap_or(env::current_dir().map_err(|error| error.to_string())?);
-    let tool = matches.get_one::<String>("tool").cloned();
-    if let Some(selected) = tool.as_ref() {
-        selected.parse::<GuestTool>()?;
-        launch_args.extend(["--tool".to_string(), selected.clone()]);
-    }
-    if let Some(args) = matches.get_many::<String>("tool_arg") {
-        for arg in args {
-            launch_args.extend(["--tool-arg".to_string(), arg.clone()]);
-        }
-    }
     let mut command_override: Option<WrapperCommandOverride> = None;
     let setup_tool = matches
         .get_one::<String>("setup_tool")
@@ -824,27 +812,11 @@ fn parse_wrapper_args_with_terminal(
     let saw_network_override =
         no_net || matches.contains_id("allow_ip") || matches.contains_id("allow_domain");
 
-    if let Some(command) = matches.get_one::<String>("command") {
-        if command.trim().is_empty() {
-            return Err("--command must not be empty".to_string());
-        }
-        command_override = Some(WrapperCommandOverride::Shell {
-            command: command.clone(),
-            args: Vec::new(),
-        });
-    }
     if let Some((command, command_args)) = payload_command_values.split_first() {
-        if let Some(existing) = command_override.as_mut() {
-            let mut all_args = Vec::with_capacity(1 + command_args.len());
-            all_args.push(command.clone());
-            all_args.extend(command_args.iter().cloned());
-            existing.append_args(&all_args);
-        } else {
-            command_override = Some(WrapperCommandOverride::Argv(ConfigCommand {
-                command: command.clone(),
-                args: command_args.to_vec(),
-            }));
-        }
+        command_override = Some(WrapperCommandOverride::Argv(ConfigCommand {
+            command: command.clone(),
+            args: command_args.to_vec(),
+        }));
     }
 
     if let Some(path) = matches.get_one::<PathBuf>("project") {
@@ -925,30 +897,17 @@ fn parse_wrapper_args_with_terminal(
     if let Some(config) = sandbox_config.as_ref() {
         apply_configured_launch_defaults(&mut launch_args, config, saw_network_override, no_net)?;
     }
-    let mut tool_selected = launch_args.iter().any(|arg| arg == "--tool");
-    if !tool_selected {
-        if let Some(tool) = tool.clone() {
-            launch_args.extend(["--tool".to_string(), tool]);
-            tool_selected = true;
-        } else if sandbox_config.as_ref().is_some_and(config_uses_codex_tool) {
-            launch_args.extend(["--tool".to_string(), "codex".to_string()]);
-            tool_selected = true;
-        } else if ui_mode == WrapperUiMode::Plain
-            && command_override.is_none()
-            && sandbox_config.is_none()
-        {
-            return Err(
-                "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup".to_string(),
-            );
-        }
+    let mut tool_selected = sandbox_config.is_some();
+    if ui_mode == WrapperUiMode::Plain && command_override.is_none() && sandbox_config.is_none() {
+        return Err(
+            "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup".to_string(),
+        );
     }
     if let Some(command) = command_override.as_ref() {
         apply_wrapper_command_override(&mut launch_args, command);
-    } else if tool.is_none() {
-        if let Some(config) = sandbox_config.as_ref() {
-            apply_configured_default_command(&mut launch_args, config);
-            tool_selected = true;
-        }
+    } else if let Some(config) = sandbox_config.as_ref() {
+        apply_configured_default_command(&mut launch_args, config);
+        tool_selected = true;
     }
     if !no_net
         && !launch_args.iter().any(|arg| arg == "--no-net")
@@ -1003,26 +962,6 @@ fn wrapper_clap_command() -> ClapCommand {
                 .value_name("codex|pi"),
         )
         .arg(Arg::new("config").long("config").action(ArgAction::SetTrue))
-        .arg(
-            Arg::new("tool")
-                .long("tool")
-                .value_name("codex|copilot")
-                .help("Compatibility: select a launch-time tool without persisting config"),
-        )
-        .arg(
-            Arg::new("tool_arg")
-                .long("tool-arg")
-                .value_name("ARG")
-                .action(ArgAction::Append)
-                .allow_hyphen_values(true)
-                .help("Compatibility: pass one argument to --tool"),
-        )
-        .arg(
-            Arg::new("command")
-                .long("command")
-                .value_name("CMD")
-                .help("Compatibility: one-run shell command override"),
-        )
         .arg(Arg::new("no_net").long("no-net").action(ArgAction::SetTrue))
         .arg(
             Arg::new("allow_ip")
@@ -1089,12 +1028,6 @@ fn append_many(matches: &ArgMatches, id: &str) -> Vec<String> {
         .get_many::<String>(id)
         .map(|values| values.cloned().collect())
         .unwrap_or_default()
-}
-
-fn config_uses_codex_tool(config: &WrapperSandboxConfig) -> bool {
-    config.setup_tool == Some(SetupTool::Codex)
-        && config.default_command.command == "codex"
-        && config.default_command.args.is_empty()
 }
 
 fn apply_configured_launch_defaults(
@@ -1175,18 +1108,16 @@ fn apply_configured_launch_defaults(
 }
 
 fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
-    if config_uses_codex_tool(config) {
-        return;
-    }
-    if config.setup_tool == Some(SetupTool::Pi)
-        && config.default_command.command == SetupTool::Pi.cli()
-        && !launch_args.iter().any(|arg| arg == "--payload-script")
-    {
-        apply_payload_script(
-            launch_args,
-            setup_tool_payload_script(SetupTool::Pi, &config.default_command.args),
-        );
-        return;
+    if !launch_args.iter().any(|arg| arg == "--payload-script") {
+        if let Some(tool) = config.setup_tool {
+            if config.default_command.command == tool.cli() {
+                apply_payload_script(
+                    launch_args,
+                    setup_tool_payload_script(tool, &config.default_command.args),
+                );
+                return;
+            }
+        }
     }
     apply_payload_script(
         launch_args,
@@ -1199,48 +1130,12 @@ fn apply_wrapper_command_override(launch_args: &mut Vec<String>, command: &Wrapp
 }
 
 fn apply_payload_script(launch_args: &mut Vec<String>, script: String) {
-    let mut tool_args = Vec::new();
-    let mut filtered = Vec::with_capacity(launch_args.len());
-    let mut index = 0;
-    while index < launch_args.len() {
-        if launch_args[index] == "--tool-arg" && index + 1 < launch_args.len() {
-            tool_args.push(launch_args[index + 1].clone());
-            index += 2;
-        } else {
-            filtered.push(launch_args[index].clone());
-            index += 1;
-        }
-    }
-    *launch_args = filtered;
-
-    let script = if tool_args.is_empty() {
-        script
-    } else {
-        format!(
-            "{} {}",
-            script.trim_end(),
-            tool_args
-                .iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    };
     upsert_launch_arg(launch_args, "--payload-script", script);
 }
 
 fn payload_script_from_config_command(command: &ConfigCommand) -> String {
     let mut script = format!("exec {}", shell_quote(&command.command));
     for arg in &command.args {
-        script.push(' ');
-        script.push_str(&shell_quote(arg));
-    }
-    script
-}
-
-fn payload_script_from_shell_command(command: &str, args: &[String]) -> String {
-    let mut script = format!("exec {}", command.trim());
-    for arg in args {
         script.push(' ');
         script.push_str(&shell_quote(arg));
     }
@@ -1633,9 +1528,7 @@ struct PolicyArgs {
     tls_generate_per_host_certs: bool,
     pcap_path: Option<PathBuf>,
     payload: Option<PayloadLaunchArgs>,
-    tool: Option<GuestTool>,
     tool_state: ToolStateMounts,
-    tool_args: Vec<String>,
     gh: bool,
     aws_profile: Option<String>,
     extra_ro: Vec<PathBuf>,
@@ -1676,7 +1569,6 @@ struct SelfTestConfig {
     dns_check: bool,
     docker_net_check: bool,
     fs_check: bool,
-    tool: GuestTool,
 }
 
 fn run_self_test(args: &[String]) -> Result<(), String> {
@@ -1698,7 +1590,6 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
     let mut policy_args = PolicyArgs {
         allow_public: !self_test.no_net,
         no_net: self_test.no_net,
-        tool: Some(self_test.tool),
         ..PolicyArgs::default()
     };
     let ca = ensure_wrapper_mitm_ca(&self_test.project)?;
@@ -2033,11 +1924,6 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
         dns_check: matches.get_flag("dns_check"),
         docker_net_check: matches.get_flag("docker_net_check"),
         fs_check: matches.get_flag("fs_check"),
-        tool: matches
-            .get_one::<String>("tool")
-            .map(|value| value.parse().map_err(|error: String| error))
-            .transpose()?
-            .unwrap_or(GuestTool::Codex),
     };
 
     if !config.project.is_absolute() {
@@ -2102,7 +1988,6 @@ fn self_test_clap_command() -> ClapCommand {
                 .long("fs-check")
                 .action(ArgAction::SetTrue),
         )
-        .arg(Arg::new("tool").long("tool").value_name("codex|copilot"))
 }
 
 fn self_test_payload_script(
@@ -2437,9 +2322,6 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("qemu-system-x86_64"));
     let mut policy = PolicyArgs::default();
-    if let Some(tool) = matches.get_one::<String>("tool") {
-        policy.tool = Some(tool.parse().map_err(|error: String| error)?);
-    }
     for tool_state in append_many(&matches, "tool_state") {
         match tool_state.as_str() {
             "codex" => policy.tool_state.codex = true,
@@ -2447,7 +2329,6 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
             value => return Err(format!("unknown --tool-state: {value}")),
         }
     }
-    policy.tool_args = append_many(&matches, "tool_arg");
     policy.gh = matches.get_flag("gh");
     policy.aws_profile = matches.get_one::<String>("aws").cloned();
     for path in append_many(&matches, "ro") {
@@ -2562,9 +2443,6 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
     {
         return Err("--payload-script must not be empty".to_string());
     }
-    if !policy.tool_args.is_empty() && policy.tool.is_none() {
-        return Err("--tool-arg requires --tool".to_string());
-    }
     Ok((config, policy))
 }
 
@@ -2578,19 +2456,11 @@ fn frontend_clap_command() -> ClapCommand {
                 .value_name("PATH"),
         )
         .arg(Arg::new("qemu").long("qemu").value_name("PATH"))
-        .arg(Arg::new("tool").long("tool").value_name("codex|copilot"))
         .arg(
             Arg::new("tool_state")
                 .long("tool-state")
                 .value_name("codex|pi")
                 .action(ArgAction::Append),
-        )
-        .arg(
-            Arg::new("tool_arg")
-                .long("tool-arg")
-                .value_name("ARG")
-                .action(ArgAction::Append)
-                .allow_hyphen_values(true),
         )
         .arg(Arg::new("gh").long("gh").action(ArgAction::SetTrue))
         .arg(Arg::new("aws").long("aws").value_name("PROFILE"))
@@ -2727,24 +2597,10 @@ fn payload_launch_args(policy: &mut PolicyArgs) -> &mut PayloadLaunchArgs {
 }
 
 fn launch_payload_args(
-    config: &FrontendConfig,
+    _config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<Option<PayloadLaunchArgs>, String> {
-    if let Some(payload) = policy.payload.clone() {
-        return Ok(Some(payload));
-    }
-    let Some(tool) = policy.tool else {
-        return Ok(None);
-    };
-    let (rows, cols) = terminal_size();
-    Ok(Some(PayloadLaunchArgs {
-        script: tool_payload_script(tool, &policy.tool_args),
-        cwd: config.project.display().to_string(),
-        env: BTreeMap::new(),
-        rows,
-        cols,
-        no_stdin: false,
-    }))
+    Ok(policy.payload.clone())
 }
 
 fn runtime_mounts(
@@ -2757,8 +2613,7 @@ fn runtime_mounts(
     let mut mounts = guest_runtime_mounts(
         config.project.clone(),
         &GuestShareSpec {
-            tool: policy.tool,
-            tool_state: ToolStateMounts::from_guest_tool(policy.tool).union(policy.tool_state),
+            tool_state: policy.tool_state,
             host_home,
             gh: policy.gh,
             extra_ro: policy.extra_ro.clone(),
@@ -2808,10 +2663,10 @@ fn guest_payload_env(
             "/run/agentvm-ca-bundle.pem".to_string(),
         );
     }
-    if policy.tool.is_none()
-        && policy.payload.is_none()
+    if policy.payload.is_none()
         && !policy.gh
         && policy.aws_profile.is_none()
+        && policy.tls_ca_cert.is_none()
     {
         return Ok(env_vars);
     }
@@ -2899,35 +2754,8 @@ fn merged_payload_env(
     base
 }
 
-fn tool_payload_script(tool: GuestTool, tool_args: &[String]) -> String {
-    let mut command = Vec::new();
-    command.push(shell_quote(tool.cli()));
-    command.extend(tool.auto_flags().iter().map(|flag| shell_quote(flag)));
-    command.extend(tool_args.iter().map(|arg| shell_quote(arg)));
-    let npm_package = format!("{}@latest", tool.npm_package());
-    let install_message = format!(
-        "agentvm: installing {} CLI in guest HOME (first run only)...",
-        tool.cli()
-    );
-    [
-        r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
-        r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
-        format!(
-            "if ! command -v {} >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
-            shell_quote(tool.cli()),
-            shell_quote(&format!("agentvm: npm is required to install {} CLI", tool.cli())),
-            shell_quote(&install_message),
-            shell_quote(&npm_package)
-        ),
-        "hash -r 2>/dev/null || true".to_string(),
-        r#"export MISE_TRUSTED_CONFIG_PATHS="$PWD""#.to_string(),
-        format!("exec {}", command.join(" ")),
-    ]
-    .join(" && ")
-}
-
 fn setup_tool_payload_script(tool: SetupTool, tool_args: &[String]) -> String {
-    tool_bootstrap_payload_script(tool.cli(), tool.package(), &[], tool_args)
+    tool_bootstrap_payload_script(tool.cli(), tool.package(), tool.auto_flags(), tool_args)
 }
 
 fn tool_bootstrap_payload_script(
@@ -3322,8 +3150,8 @@ fn validate_no_net_args(
 fn print_usage() {
     eprintln!(
         "usage: agentvm-frontend <prepare|launch|self-test|vmnet-gateway|payload-client> [options]\n\
-         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--tool codex|copilot] [--tool-arg ARG] [--gh] [--aws PROFILE] [--ro PATH] [--rw PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--payload-script SCRIPT] [--payload-cwd PATH] [--payload-env KEY=VALUE] [--payload-no-stdin] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
-         self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net] [--hostile]\n\
+         prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--gh] [--aws PROFILE] [--ro PATH] [--rw PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--payload-script SCRIPT] [--payload-cwd PATH] [--payload-env KEY=VALUE] [--payload-no-stdin] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
+         self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--no-net] [--hostile]\n\
          vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
          payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin]"
     );
@@ -3331,7 +3159,7 @@ fn print_usage() {
 
 fn print_self_test_usage() {
     eprintln!(
-        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--tool codex|copilot] [--no-net] [--hostile]"
+        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--no-net] [--hostile]"
     );
 }
 
@@ -3546,7 +3374,7 @@ mod tests {
     }
 
     #[test]
-    fn frontend_parses_tool_guest_share_options() {
+    fn frontend_parses_payload_guest_share_options() {
         let root = frontend_test_root();
         let ro = root.join("readonly");
         let rw = root.join("writable");
@@ -3562,10 +3390,10 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool".to_string(),
+            "--tool-state".to_string(),
             "codex".to_string(),
-            "--tool-arg".to_string(),
-            "--model".to_string(),
+            "--payload-script".to_string(),
+            "exec codex --model gpt-5".to_string(),
             "--gh".to_string(),
             "--aws".to_string(),
             "dev".to_string(),
@@ -3577,45 +3405,40 @@ mod tests {
         .expect("config");
 
         assert_eq!(config.project, root.join("repo"));
-        assert_eq!(policy.tool, Some(GuestTool::Codex));
-        assert_eq!(policy.tool_args, vec!["--model"]);
+        assert!(policy.tool_state.codex);
         assert!(policy.gh);
         assert_eq!(policy.aws_profile.as_deref(), Some("dev"));
         assert_eq!(policy.extra_ro, vec![ro]);
         assert_eq!(policy.extra_rw, vec![rw]);
         let payload = launch_payload_args(&config, &policy)
             .expect("payload")
-            .expect("tool payload");
-        assert!(payload
-            .script
-            .contains("agentvm: installing codex CLI in guest HOME"));
-        assert!(payload
-            .script
-            .contains("npm install --global --no-progress @openai/codex@latest"));
-        assert!(payload
-            .script
-            .contains("codex --dangerously-bypass-approvals-and-sandbox --model"));
+            .expect("payload script");
+        assert_eq!(payload.script, "exec codex --model gpt-5");
     }
 
     #[test]
-    fn tool_arg_requires_tool() {
+    fn frontend_rejects_removed_tool_flags() {
         let root = frontend_test_root();
 
-        let error = frontend_config_from_args(&[
-            "--project".to_string(),
-            root.join("repo").display().to_string(),
-            "--run-dir".to_string(),
-            root.join(".sandbox/docker-vm/run").display().to_string(),
-            "--artifact-manifest".to_string(),
-            root.join("docker/out/artifact-manifest.json")
-                .display()
-                .to_string(),
-            "--tool-arg".to_string(),
-            "--model".to_string(),
-        ])
-        .expect_err("tool arg rejected");
-
-        assert_eq!(error, "--tool-arg requires --tool");
+        for flag in ["--tool", "--tool-arg"] {
+            let error = frontend_config_from_args(&[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+                "--run-dir".to_string(),
+                root.join(".sandbox/docker-vm/run").display().to_string(),
+                "--artifact-manifest".to_string(),
+                root.join("docker/out/artifact-manifest.json")
+                    .display()
+                    .to_string(),
+                flag.to_string(),
+                "codex".to_string(),
+            ])
+            .expect_err("removed flag rejected");
+            assert!(
+                error.contains(&format!("unexpected argument '{flag}'")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -3630,8 +3453,6 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool".to_string(),
-            "codex".to_string(),
             "--tls-ca-cert".to_string(),
             root.join("repo/.sandbox/docker-vm/ca/mitm-ca.crt")
                 .display()
@@ -3671,8 +3492,6 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool".to_string(),
-            "copilot".to_string(),
             "--tls-ca-cert".to_string(),
             root.join("repo/.sandbox/docker-vm/ca/mitm-ca.crt")
                 .display()
@@ -3732,24 +3551,18 @@ mod tests {
         let args = parse_wrapper_args(
             "agentvm-frontend",
             &[
-                "--tool".to_string(),
-                "codex".to_string(),
                 "--project".to_string(),
                 "/tmp/project".to_string(),
                 "--no-net".to_string(),
                 "--docker-publish".to_string(),
                 "18080:8080".to_string(),
-                "--tool-arg".to_string(),
-                "--model".to_string(),
-                "--tool-arg".to_string(),
-                "gpt-5".to_string(),
+                "--".to_string(),
+                "true".to_string(),
             ],
         )
         .expect("wrapper args");
 
         assert!(!args.reset);
-        assert!(args.launch_args.contains(&"--tool".to_string()));
-        assert!(args.launch_args.contains(&"codex".to_string()));
         assert!(args.launch_args.contains(&"--no-net".to_string()));
         assert!(!args
             .launch_args
@@ -3757,21 +3570,23 @@ mod tests {
         assert!(!args.tls_bootstrap);
         assert!(args.launch_args.contains(&"--publish".to_string()));
         assert!(args.launch_args.contains(&"18080:8080".to_string()));
-        assert_eq!(
-            args.launch_args
-                .windows(2)
-                .filter(|window| window[0] == "--tool-arg")
-                .map(|window| window[1].clone())
-                .collect::<Vec<_>>(),
-            vec!["--model".to_string(), "gpt-5".to_string()]
-        );
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--payload-script" && window[1] == "exec true"));
     }
 
     #[test]
-    fn wrapper_defaults_to_public_egress_for_tool_install() {
+    fn setup_tool_defaults_to_public_egress_for_tool_install() {
+        let root = frontend_test_root();
         let args = parse_wrapper_args(
             "agentvm-frontend",
-            &["--tool".to_string(), "codex".to_string()],
+            &[
+                "--project".to_string(),
+                root.join("repo").display().to_string(),
+                "--setup-tool".to_string(),
+                "codex".to_string(),
+            ],
         )
         .expect("wrapper args");
 
@@ -3783,9 +3598,13 @@ mod tests {
 
     #[test]
     fn wrapper_selects_tui_for_interactive_terminals_by_default() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
-            &["--tool".to_string(), "codex".to_string()],
+            &["--project".to_string(), project.display().to_string()],
             true,
             true,
         )
@@ -3796,11 +3615,15 @@ mod tests {
 
     #[test]
     fn wrapper_no_tui_selects_plain_mode() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
         let args = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
             &[
-                "--tool".to_string(),
-                "codex".to_string(),
+                "--project".to_string(),
+                project.display().to_string(),
                 "--no-tui".to_string(),
             ],
             true,
@@ -3814,16 +3637,20 @@ mod tests {
 
     #[test]
     fn wrapper_non_tty_selects_plain_mode() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
         let stdin_plain = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
-            &["--tool".to_string(), "codex".to_string()],
+            &["--project".to_string(), project.display().to_string()],
             false,
             true,
         )
         .expect("stdin");
         let stdout_plain = parse_wrapper_args_with_terminal(
             "agentvm-frontend",
-            &["--tool".to_string(), "codex".to_string()],
+            &["--project".to_string(), project.display().to_string()],
             true,
             false,
         )
@@ -3879,8 +3706,12 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
-        assert!(!args.launch_args.contains(&"--payload-script".to_string()));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--payload-script"
+                && window[1].contains("@openai/codex@latest")
+                && window[1].contains("exec codex --dangerously-bypass-approvals-and-sandbox")
+        }));
     }
 
     #[test]
@@ -3931,9 +3762,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_tool_bootstrap_script_uses_expected_package_flags_and_args() {
-        let script = tool_payload_script(
-            GuestTool::Codex,
+    fn codex_setup_tool_bootstrap_script_uses_expected_package_flags_and_args() {
+        let script = setup_tool_payload_script(
+            SetupTool::Codex,
             &["--profile".to_string(), "work account".to_string()],
         );
 
@@ -4012,7 +3843,7 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
         assert!(args
             .launch_args
             .windows(2)
@@ -4112,8 +3943,9 @@ mod tests {
                 "--project".to_string(),
                 project.display().to_string(),
                 "--no-tui".to_string(),
-                "--command".to_string(),
-                "bash -l".to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "-l".to_string(),
             ],
             false,
             false,
@@ -4124,10 +3956,10 @@ mod tests {
         assert!(!args.tool_selected);
         assert_eq!(
             args.command_override,
-            Some(WrapperCommandOverride::Shell {
-                command: "bash -l".to_string(),
-                args: Vec::new(),
-            })
+            Some(WrapperCommandOverride::Argv(ConfigCommand {
+                command: "bash".to_string(),
+                args: vec!["-l".to_string()],
+            }))
         );
         assert!(args
             .launch_args
@@ -4163,8 +3995,8 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
-        assert!(!args.launch_args.contains(&"--payload-script".to_string()));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+        assert!(args.launch_args.contains(&"--payload-script".to_string()));
     }
 
     #[test]
@@ -4200,7 +4032,7 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
     }
 
     #[test]
@@ -4309,7 +4141,7 @@ mod tests {
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
     }
 
     #[test]
@@ -4324,9 +4156,8 @@ mod tests {
             &[
                 "--project".to_string(),
                 project.display().to_string(),
-                "--command".to_string(),
-                "bash".to_string(),
                 "--".to_string(),
+                "bash".to_string(),
                 "-l".to_string(),
             ],
             true,
@@ -4337,20 +4168,19 @@ mod tests {
         assert!(args.tool_selected);
         assert_eq!(
             args.command_override,
-            Some(WrapperCommandOverride::Shell {
+            Some(WrapperCommandOverride::Argv(ConfigCommand {
                 command: "bash".to_string(),
                 args: vec!["-l".to_string()],
-            })
+            }))
         );
         assert!(args
             .launch_args
             .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
         assert!(args
             .launch_args
             .windows(2)
             .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
-        assert!(!args.launch_args.contains(&"--tool-arg".to_string()));
     }
 
     #[test]
@@ -4417,50 +4247,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_copilot_tool_defaults_to_vm_tool_install_and_public_egress() {
-        let root = frontend_test_root();
-        let args = parse_wrapper_args(
-            "agentvm-frontend",
-            &[
-                "--tool".to_string(),
-                "copilot".to_string(),
-                "--project".to_string(),
-                root.join("repo").display().to_string(),
-                "--artifact-manifest".to_string(),
-                root.join("docker/out/artifact-manifest.json")
-                    .display()
-                    .to_string(),
-                "--tool-arg".to_string(),
-                "suggest".to_string(),
-            ],
-        )
-        .expect("wrapper args");
-
-        assert!(args.tls_bootstrap);
-        assert!(args
-            .launch_args
-            .contains(&"--allow-public-internet".to_string()));
-        assert!(args
-            .launch_args
-            .windows(2)
-            .any(|window| window[0] == "--tool" && window[1] == "copilot"));
-        let (config, policy) = frontend_config_from_args(&args.launch_args).expect("config");
-        let payload = launch_payload_args(&config, &policy)
-            .expect("payload")
-            .expect("tool payload");
-        assert!(payload
-            .script
-            .contains("agentvm: installing github-copilot-cli CLI in guest HOME"));
-        assert!(payload
-            .script
-            .contains("npm install --global --no-progress @github/copilot@latest"));
-        assert!(payload
-            .script
-            .contains("github-copilot-cli --allow-all --no-auto-update suggest"));
-        assert_eq!(payload.cwd, root.join("repo").display().to_string());
-    }
-
-    #[test]
     fn wrapper_mitm_ca_is_generated_and_loadable() {
         let root = frontend_test_root();
         let paths = ensure_wrapper_mitm_ca(&root.join("repo")).expect("ca");
@@ -4505,8 +4291,6 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool".to_string(),
-            "codex".to_string(),
         ])
         .expect("config");
 
@@ -4531,8 +4315,6 @@ mod tests {
             root.join("docker/out/artifact-manifest.json")
                 .display()
                 .to_string(),
-            "--tool".to_string(),
-            "codex".to_string(),
         ])
         .expect("config");
 
@@ -4574,6 +4356,19 @@ mod tests {
             .expect_err("pass env"),
             "--pass-env has been removed; use explicit VM guest shares/auth options instead"
         );
+    }
+
+    #[test]
+    fn wrapper_rejects_removed_tool_and_command_flags() {
+        for flag in ["--tool", "--tool-arg", "--command"] {
+            let error =
+                parse_wrapper_args("agentvm-frontend", &[flag.to_string(), "codex".to_string()])
+                    .expect_err("removed wrapper flag");
+            assert!(
+                error.contains(&format!("unexpected argument '{flag}'")),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -4630,8 +4425,6 @@ mod tests {
             "--dns-check".to_string(),
             "--docker-net-check".to_string(),
             "--fs-check".to_string(),
-            "--tool".to_string(),
-            "copilot".to_string(),
         ])
         .expect("self-test config");
 
@@ -4651,7 +4444,6 @@ mod tests {
         assert!(config.dns_check);
         assert!(config.docker_net_check);
         assert!(config.fs_check);
-        assert_eq!(config.tool, GuestTool::Copilot);
     }
 
     #[test]

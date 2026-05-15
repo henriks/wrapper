@@ -239,8 +239,8 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
   --project "$PWD" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
-  --tool codex \
-  --tool-arg --help
+  --setup-tool codex \
+  -- --help
 ```
 
 Expected behavior:

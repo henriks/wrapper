@@ -91,9 +91,7 @@ agentvm -- sh -lc 'npm test'
 Arguments after `--` are the full payload command for that launch. They do not
 modify `config.json`.
 
-When no command follows `--`, the configured default command is used. Legacy
-`--command CMD` can remain temporarily as compatibility, but new examples should
-use `--`.
+When no command follows `--`, the configured default command is used.
 
 ## One-Run Overrides
 
@@ -156,7 +154,7 @@ runtime logs, and tool state. It must refuse while a project VM lock is held.
 
 - The exact TUI editor layout is still open, but it must write the same
   structured config schema used by CLI setup recipes.
-- Legacy `--tool` and `--command` should be kept only as compatibility paths
-  until the replacement UX is proven.
+- Removed wrapper flags `--tool`, `--tool-arg`, and `--command` must stay removed;
+  setup belongs in `--setup-tool` or config, and one-run commands belong after `--`.
 - The final package manager command for guest tool bootstrap should be verified
   per recipe; current recipes use npm package metadata.

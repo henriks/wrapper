@@ -43,9 +43,7 @@ The executable name is not part of wrapper behavior. `codex-wrap` and
 come from explicit flags or the interactive TUI startup flow.
 
 Arguments after `--` are the full guest payload command for that launch. They do
-not persist to `.sandbox/config.json`. Legacy `--command CMD` remains a
-compatibility path for one-run payload overrides. Tool arguments for legacy
-`--tool` launches use `--tool-arg ARG`.
+not persist to `.sandbox/config.json`.
 
 ## Supported Wrapper Flags
 
@@ -63,14 +61,6 @@ compatibility path for one-run payload overrides. Tool arguments for legacy
 --aws PROFILE
 --reset
 -- COMMAND [ARG...]
-```
-
-Compatibility flags:
-
-```text
---tool codex|copilot
---tool-arg ARG
---command CMD
 ```
 
 Removed flags:

@@ -10,7 +10,7 @@ Each mode was run once with a sleeping payload so `.sandbox/docker-vm/run/state.
 could be read while the VM was still running:
 
 ```sh
-sandbox-wrap --project /home/hsaksela/ai/wrapper --tool codex --docker ... \
+agentvm --project /home/hsaksela/ai/wrapper --setup-tool codex -- ... \
   -- sh -lc 'sleep 20'
 ```
 
