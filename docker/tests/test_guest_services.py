@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import socket
 import struct
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -172,6 +174,17 @@ class GuestPayloadServerTests(unittest.TestCase):
     def test_payload_identity_requires_uid_and_gid_together(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires both"):
             payload_server.payload_identity({"AGENTVM_UID": "1000"})
+
+    def test_ensure_home_chowns_existing_home_with_wrong_owner(self) -> None:
+        home = "/home/test"
+        fake_stat = mock.Mock(st_uid=os.getuid() + 1, st_gid=os.getgid() + 1)
+        with mock.patch.object(payload_server.os, "makedirs") as makedirs, mock.patch.object(
+            payload_server.os, "stat", return_value=fake_stat
+        ), mock.patch.object(payload_server.os, "chown") as chown:
+            payload_server.ensure_home({"HOME": home}, os.getuid(), os.getgid())
+
+        makedirs.assert_called_once_with(home, exist_ok=True)
+        chown.assert_called_once_with(home, os.getuid(), os.getgid())
 
 
 class GuestSocketBridgeTests(unittest.TestCase):

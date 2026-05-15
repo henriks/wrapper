@@ -119,9 +119,8 @@ Layout:
 ```text
 .sandbox/
   config.json
-  home/
   docker-vm/
-    docker-data.raw
+    state.raw
     lock
     run/
       state.json
@@ -141,17 +140,16 @@ Layout:
 
 Rules:
 
-- `.sandbox/home/` is the project-local backing store for the guest user's
-  natural home path.
-- `.sandbox/docker-vm/docker-data.raw` is the persistent sparse disk mounted in
-  the guest at `/var/lib/docker`.
+- `.sandbox/docker-vm/state.raw` is the persistent sparse ext4 disk backing the
+  guest root overlay. Normal guest writes, including `$HOME`, `/usr/local`,
+  package caches, and `/var/lib/docker`, persist there.
 - `.sandbox/config.json` is the durable project sandbox configuration for setup
   recipe, default command, network mode/allowlists, auth sharing, extra shares,
   and published ports. Its schema and compatibility rules are documented in
   `vm-frontend/config-json.md`.
 - `.sandbox/docker-vm/run/` is per-launch runtime and diagnostic state.
-- `--reset` removes the entire `.sandbox/` tree, including guest home, Docker
-  data, config, and all runtime logs, unless an active lock is held.
+- `--reset` removes the entire `.sandbox/` tree, including root overlay state,
+  config, and all runtime logs, unless an active lock is held.
 
 ## Required Guest Shares
 
@@ -161,11 +159,10 @@ The VM-only contract assumes a deliberately small set of host inputs:
   - shared via `virtio-fs`
   - mounted inside the guest at the original absolute project path
   - optionally also available at `/workspace` as a compatibility alias
-- persistent guest home
-  - sourced from `.sandbox/home/`
-  - mounted inside the guest at the host user's natural home path
-  - hidden from the guest as an implementation path; `$HOME` must not point at
-    `.sandbox/home`
+- guest home
+  - `$HOME` is the host user's natural home path inside the VM
+  - it lives on the persistent root overlay unless an explicit configured share
+    covers that path or one of its children
 - tool/auth/config material
   - only the minimum required host-backed inputs should be exposed
   - examples include tool auth state, Docker client config, GitHub auth, and
@@ -175,8 +172,8 @@ The VM-only contract assumes a deliberately small set of host inputs:
     absolute path
   - `--rw PATH` exposes a host path read-write inside the guest at the same
     absolute path
-  - configured read-write shares may shadow selected guest-relative child paths
-    with project-local `.sandbox/share-shadows/` backing directories; the more
+  - configured shares may shadow selected guest-relative child paths with
+    writable project-local backing derived from the full guest path; the more
     specific child mount wins while the parent host share remains visible
     elsewhere
   - these are supported because arbitrary path mounts are a real requirement,
@@ -220,15 +217,15 @@ Transitions:
 Required sequence:
 
 1. Resolve project and selected tool.
-2. Ensure `.sandbox/`, `.sandbox/home/`, and `.sandbox/docker-vm/` exist.
+2. Ensure `.sandbox/` and `.sandbox/docker-vm/` exist.
 3. Acquire an exclusive non-blocking lock on `.sandbox/docker-vm/lock`.
 4. Remove stale `.sandbox/docker-vm/run/` from a previous failed or aborted run.
-5. Ensure `docker-data.raw` exists and is formatted.
+5. Ensure `state.raw` exists and is formatted.
 6. Create `.sandbox/docker-vm/run/`.
 7. Start embedded composed-fs servers for workspace and config sharing.
 8. Start QEMU with:
-   - read-only root disk
-   - persistent Docker data disk
+   - read-only lower root disk
+   - persistent root overlay state disk
    - `virtio-fs` workspace sharing
    - QEMU stream networking
    - the guest control path needed to launch the payload

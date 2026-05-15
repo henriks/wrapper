@@ -14,7 +14,6 @@ pub const PI_TOOL_STATE_DIRS: &[&str] = &[".pi"];
 #[serde(rename_all = "kebab-case")]
 pub enum ManifestSourceClass {
     Workspace,
-    PersistentHome,
     ToolState,
     AuthConfig,
     SystemRo,
@@ -42,20 +41,6 @@ impl RuntimeMount {
             guest_path: project,
             readonly: false,
             source_class: ManifestSourceClass::Workspace,
-            required: true,
-            bind: true,
-        }
-    }
-
-    pub fn persistent_home(project: impl Into<PathBuf>, host_home: impl Into<PathBuf>) -> Self {
-        let project = project.into();
-        let host_home = host_home.into();
-        Self {
-            id: "m0002_home".to_string(),
-            host_path: project.join(".sandbox/home"),
-            guest_path: host_home,
-            readonly: false,
-            source_class: ManifestSourceClass::PersistentHome,
             required: true,
             bind: true,
         }
@@ -176,11 +161,8 @@ pub fn guest_runtime_mounts(
 ) -> Vec<RuntimeMount> {
     let project = project.into();
     let guest_home = spec.host_home.clone();
-    let mut mounts = vec![
-        RuntimeMount::persistent_home(project.clone(), guest_home.clone()),
-        RuntimeMount::workspace(project),
-    ];
-    let mut next_id = 3;
+    let mut mounts = vec![RuntimeMount::workspace(project)];
+    let mut next_id = 2;
 
     if spec.tool_state.codex {
         for rel_dir in CODEX_TOOL_STATE_DIRS {
@@ -655,7 +637,6 @@ mod tests {
         let extra_ro = root.join("extra-ro");
         let extra_rw = root.join("extra-rw");
         fs::create_dir_all(&project).expect("repo");
-        fs::create_dir_all(project.join(".sandbox/home")).expect("persistent home backing");
         fs::create_dir_all(home.join(".codex")).expect("codex");
         fs::create_dir_all(home.join(".docker")).expect("docker");
         fs::create_dir_all(home.join(".config/gh")).expect("gh");
@@ -678,18 +659,11 @@ mod tests {
         let host_manifest =
             fs::read_to_string(&config.runtime.composed_fs_manifest).expect("host manifest");
         assert!(host_manifest.contains("\"guest_path\": \""));
-        assert!(host_manifest.contains(&format!(
-            "\"host_path\": \"{}\"",
-            project.join(".sandbox/home").display()
-        )));
-        assert!(host_manifest.contains(&format!("\"guest_path\": \"{}\"", home.display())));
-        assert!(host_manifest.contains("\"source_class\": \"persistent-home\""));
+        assert!(!host_manifest.contains("\"source_class\": \"persistent-home\""));
+        assert!(!host_manifest.contains(&project.join(".sandbox/home").display().to_string()));
         assert!(host_manifest.contains(&home.join(".codex").display().to_string()));
         assert!(host_manifest.contains(&home.join(".docker").display().to_string()));
         assert!(host_manifest.contains(&home.join(".config/gh").display().to_string()));
-        assert!(
-            !host_manifest.contains(&project.join(".sandbox/home/.codex").display().to_string())
-        );
         assert!(host_manifest.contains("\"source_class\": \"tool-state\""));
         assert!(host_manifest.contains("\"source_class\": \"auth-config\""));
         assert!(host_manifest.contains("\"source_class\": \"user-ro\""));

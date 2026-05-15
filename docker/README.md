@@ -74,9 +74,9 @@ automating the lookup against Alpine's official package indexes.
 
 ## Guest Layout
 
-The guest boots with `init=/usr/local/sbin/agentvm-init`. That init:
+The guest boots with an immutable lower rootfs and project-local persistent root
+state disk. `agentvm-init` assembles the writable root overlay and then:
 
-- mounts the Docker data disk at `/var/lib/docker`
 - mounts the Rust composed-fs workspace/config shares at the original absolute
   project path and keeps `/workspace` as a compatibility alias
 - configures the guest NIC for the Rust userspace vmnet gateway
@@ -86,5 +86,6 @@ The guest boots with `init=/usr/local/sbin/agentvm-init`. That init:
 - starts `docker/guest-payload-server.py` so the host frontend can launch the
   requested payload inside the guest
 
-Persistent Docker state belongs only on the separate sparse Docker data disk.
-The rootfs stays read-only at runtime.
+Persistent guest state, including Docker's `/var/lib/docker`, lives on the
+sparse root overlay state disk. The appliance rootfs remains the immutable lower
+layer at runtime.

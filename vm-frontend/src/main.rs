@@ -215,9 +215,10 @@ fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
 
 fn frontend_artifact_summary(config: &FrontendConfig) -> String {
     format!(
-        "artifacts: run_dir={} state={} qemu_log={} console_log={} vmnet_event_log={}",
+        "artifacts: run_dir={} state={} state_disk={} qemu_log={} console_log={} vmnet_event_log={}",
         config.runtime.run_dir.display(),
         config.runtime.state_json.display(),
+        config.runtime.state_disk.display(),
         config.runtime.run_dir.join("qemu.log").display(),
         config.runtime.console_log.display(),
         config.runtime.vmnet_event_log.display()
@@ -1655,6 +1656,8 @@ struct SelfTestConfig {
     dns_check: bool,
     docker_net_check: bool,
     fs_check: bool,
+    root_persistence_check: bool,
+    expect_root_persistence: bool,
 }
 
 fn run_self_test(args: &[String]) -> Result<(), String> {
@@ -1741,6 +1744,7 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("failed to create sqlite concurrency dir: {error}"))?;
         }
+        reset_sqlite_concurrency_db(&sqlite_concurrency_host_db)?;
         guest_env.insert(
             "AGENTVM_SQLITE_CONCURRENCY_DB".to_string(),
             sqlite_concurrency_host_db.display().to_string(),
@@ -1778,6 +1782,8 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
             self_test.docker_net_check,
             self_test.publish_container_port,
             self_test.fs_check,
+            self_test.root_persistence_check,
+            self_test.expect_root_persistence,
             skip_sqlite_concurrency,
         ),
         cwd: config.project.display().to_string(),
@@ -2010,6 +2016,8 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
         dns_check: matches.get_flag("dns_check"),
         docker_net_check: matches.get_flag("docker_net_check"),
         fs_check: matches.get_flag("fs_check"),
+        root_persistence_check: matches.get_flag("root_persistence_check"),
+        expect_root_persistence: matches.get_flag("expect_root_persistence"),
     };
 
     if !config.project.is_absolute() {
@@ -2074,6 +2082,16 @@ fn self_test_clap_command() -> ClapCommand {
                 .long("fs-check")
                 .action(ArgAction::SetTrue),
         )
+        .arg(
+            Arg::new("root_persistence_check")
+                .long("root-persistence-check")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("expect_root_persistence")
+                .long("expect-root-persistence")
+                .action(ArgAction::SetTrue),
+        )
 }
 
 fn self_test_payload_script(
@@ -2085,6 +2103,8 @@ fn self_test_payload_script(
     docker_net_check: bool,
     publish_container_port: Option<PortPair>,
     fs_check: bool,
+    root_persistence_check: bool,
+    expect_root_persistence: bool,
     skip_sqlite_concurrency: bool,
 ) -> String {
     let sqlite_smoke = r#"import os, sqlite3
@@ -2231,6 +2251,19 @@ expected = f"{os.getuid()}:{os.getgid()}"
 assert uid_gid == expected, (uid_gid, expected)
 print("self-test: fs-live-ok")
 "#;
+    let persistence_marker = "/var/tmp/agentvm-root-persistence/marker";
+    let root_persistence_script = if expect_root_persistence {
+        format!(
+            "test \"$(cat {marker})\" = root-persistence-ok; echo self-test: root-persistence-present",
+            marker = shell_quote(persistence_marker)
+        )
+    } else {
+        format!(
+            "mkdir -p {dir}; printf root-persistence-ok > {marker}; test \"$(cat {marker})\" = root-persistence-ok; sync; echo self-test: root-persistence-written",
+            dir = shell_quote("/var/tmp/agentvm-root-persistence"),
+            marker = shell_quote(persistence_marker)
+        )
+    };
     let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
@@ -2242,6 +2275,10 @@ print("self-test: fs-live-ok")
         "echo self-test: gid-ok".to_string(),
         "test -d \"$HOME\"".to_string(),
         "echo self-test: home-dir-ok".to_string(),
+        "printf home-write-ok > \"$HOME/.agentvm-self-test-home-write\"".to_string(),
+        "test \"$(cat \"$HOME/.agentvm-self-test-home-write\")\" = home-write-ok".to_string(),
+        "rm -f \"$HOME/.agentvm-self-test-home-write\"".to_string(),
+        "echo self-test: home-write-ok".to_string(),
         "test \"$PWD\" = \"$AGENTVM_SELF_TEST_PROJECT\"".to_string(),
         "echo self-test: cwd-ok".to_string(),
         "test -f /run/agentvm-config/mitm-ca.crt".to_string(),
@@ -2262,14 +2299,8 @@ print("self-test: fs-live-ok")
         "echo self-test: sqlite-home-smoke".to_string(),
         format!("python3 -c {}", shell_quote(sqlite_smoke)),
         "printf bind-ok > .agentvm-self-test-bind".to_string(),
-        "docker version >/tmp/agentvm-docker-version".to_string(),
-        "docker info >/tmp/agentvm-docker-info".to_string(),
-        format!(
-            "docker run --rm -v \"$PWD:/work:ro\" {} sh -c {}",
-            shell_quote(image),
-            shell_quote("echo docker-run-ok; cat /work/.agentvm-self-test-bind")
-        ),
         "rm -f .agentvm-self-test-workspace .agentvm-self-test-bind".to_string(),
+        "sync".to_string(),
         "echo self-test: payload-ok".to_string(),
     ];
     if hostile {
@@ -2285,6 +2316,24 @@ print("self-test: fs-live-ok")
             [
                 "echo self-test: sqlite-concurrency-smoke".to_string(),
                 format!("python3 -c {}", shell_quote(sqlite_concurrency)),
+            ],
+        );
+    }
+    if !root_persistence_check {
+        let cleanup_index = steps
+            .iter()
+            .position(|step| step == "rm -f .agentvm-self-test-workspace .agentvm-self-test-bind")
+            .expect("cleanup step");
+        steps.splice(
+            cleanup_index..cleanup_index,
+            [
+                "docker version >/tmp/agentvm-docker-version".to_string(),
+                "docker info >/tmp/agentvm-docker-info".to_string(),
+                format!(
+                    "docker run --rm -v \"$PWD:/work:ro\" {} sh -c {}",
+                    shell_quote(image),
+                    shell_quote("echo docker-run-ok; cat /work/.agentvm-self-test-bind")
+                ),
             ],
         );
     }
@@ -2306,6 +2355,9 @@ print("self-test: fs-live-ok")
             format!("python3 -c {}", shell_quote(fs_check_script)),
         );
     }
+    if root_persistence_check {
+        steps.insert(steps.len() - 1, root_persistence_script);
+    }
     if payload_stress {
         steps.insert(
             steps.len() - 1,
@@ -2313,6 +2365,28 @@ print("self-test: fs-live-ok")
         );
     }
     steps.join("; ")
+}
+
+fn reset_sqlite_concurrency_db(db: &Path) -> Result<(), String> {
+    let mut paths = vec![db.to_path_buf()];
+    for suffix in ["-wal", "-shm"] {
+        let mut path = db.as_os_str().to_os_string();
+        path.push(suffix);
+        paths.push(PathBuf::from(path));
+    }
+    for path in paths {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove stale sqlite self-test file {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn spawn_host_sqlite_concurrency(db: &PathBuf) -> Result<Child, String> {
@@ -2705,8 +2779,6 @@ fn runtime_mounts(
     config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<Vec<RuntimeMount>, String> {
-    std::fs::create_dir_all(config.project.join(".sandbox/home"))
-        .map_err(|error| format!("failed to create persistent guest HOME backing dir: {error}"))?;
     let host_home = host_home_dir()?;
     let mut mounts = guest_runtime_mounts(
         config.project.clone(),
@@ -4574,10 +4646,12 @@ mod tests {
 
         assert!(summary.contains("artifacts: run_dir="));
         assert!(summary.contains("state="));
+        assert!(summary.contains("state_disk="));
         assert!(summary.contains("qemu_log="));
         assert!(summary.contains("console_log="));
         assert!(summary.contains("vmnet_event_log="));
         assert!(summary.contains("state.json"));
+        assert!(summary.contains("state.raw"));
         assert!(summary.contains("qemu.log"));
     }
 
@@ -4598,19 +4672,23 @@ mod tests {
             config.runtime.composed_bind_manifest,
             root.join("repo/.sandbox/docker-vm/run/guest-config/composed-binds.json")
         );
+        assert_eq!(
+            config.runtime.state_disk,
+            root.join("repo/.sandbox/docker-vm/state.raw")
+        );
         assert!(config.runtime.composed_bind_manifest.is_absolute());
+        assert!(config.runtime.state_disk.is_absolute());
     }
 
     #[test]
     fn reset_project_removes_project_local_sandbox_state() {
         let root = frontend_test_root();
         let project = root.join("repo");
-        let codex_state = project.join(".sandbox/home/.codex/auth.json");
+        let overlay_state = project.join(".sandbox/docker-vm/state.raw");
         let runtime_state = project.join(".sandbox/docker-vm/run/state.json");
-        std::fs::create_dir_all(codex_state.parent().expect("codex parent")).expect("codex dir");
         std::fs::create_dir_all(runtime_state.parent().expect("runtime parent"))
             .expect("runtime dir");
-        std::fs::write(&codex_state, "{}").expect("codex state");
+        std::fs::write(&overlay_state, "state").expect("overlay state");
         std::fs::write(&runtime_state, "{}").expect("runtime state");
 
         reset_project(&project).expect("reset");
@@ -4743,6 +4821,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(script.contains("self-test: payload-start"));
@@ -4753,6 +4833,8 @@ mod tests {
         assert!(script.contains("NODE_EXTRA_CA_CERTS"));
         assert!(script.contains("NPM_CONFIG_CAFILE"));
         assert!(script.contains("agentvm-config-ro"));
+        assert!(script.contains("agentvm-self-test-home-write"));
+        assert!(script.contains("self-test: home-write-ok"));
         assert!(script.contains("agentvm-self-test-state"));
         assert!(script.contains("dns.lookup"));
         assert!(script.contains(".agentvm-self-test-workspace"));
@@ -4788,6 +4870,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(script.contains("AGENTVM_PAYLOAD_STRESS_BLOB"));
@@ -4815,6 +4899,8 @@ mod tests {
             true,
             false,
             None,
+            false,
+            false,
             false,
             false,
         );
@@ -4845,6 +4931,8 @@ mod tests {
             None,
             false,
             false,
+            false,
+            false,
         );
 
         assert!(script.contains("docker-egress-ok image=alpine:3.22 policy=allow"));
@@ -4852,6 +4940,21 @@ mod tests {
         assert!(script.contains("docker-deny-ok image=alpine:3.22 policy=deny"));
         assert!(script.contains("docker-deny-unexpected image=alpine:3.22 policy=deny"));
         assert!(script.contains("phase=container-egress"));
+    }
+
+    #[test]
+    fn reset_sqlite_concurrency_db_removes_stale_db_wal_and_shm() {
+        let root = frontend_test_root();
+        let db = root.join("state.sqlite");
+        std::fs::write(&db, "db").expect("db");
+        std::fs::write(root.join("state.sqlite-wal"), "wal").expect("wal");
+        std::fs::write(root.join("state.sqlite-shm"), "shm").expect("shm");
+
+        reset_sqlite_concurrency_db(&db).expect("reset sqlite db");
+
+        assert!(!db.exists());
+        assert!(!root.join("state.sqlite-wal").exists());
+        assert!(!root.join("state.sqlite-shm").exists());
     }
 
     #[test]
@@ -4873,6 +4976,8 @@ mod tests {
             false,
             true,
             None,
+            false,
+            false,
             false,
             true,
         );
@@ -4903,6 +5008,8 @@ mod tests {
             None,
             true,
             false,
+            false,
+            false,
         );
 
         assert!(script.contains("self-test: fs-live-ok"));
@@ -4912,6 +5019,51 @@ mod tests {
         assert!(script.contains("host-visible-ok"));
         assert!(script.contains("key-link"));
         assert!(script.contains("stat"));
+    }
+
+    #[test]
+    fn self_test_payload_root_persistence_check_writes_and_verifies_marker() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let write_script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert!(write_script.contains("root-persistence-written"));
+        assert!(write_script.contains("/var/tmp/agentvm-root-persistence/marker"));
+        assert!(!write_script.contains("docker run --rm"));
+
+        let verify_script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            true,
+            true,
+            false,
+        );
+        assert!(verify_script.contains("root-persistence-present"));
+        assert!(!verify_script.contains("root-persistence-written"));
     }
 
     #[test]
@@ -4936,6 +5088,8 @@ mod tests {
                 host: 18080,
                 guest: 8080,
             }),
+            false,
+            false,
             false,
             false,
         );
@@ -4968,6 +5122,8 @@ mod tests {
             false,
             false,
             None,
+            false,
+            false,
             false,
             false,
         );

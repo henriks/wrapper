@@ -34,9 +34,8 @@ sudo docker/build-appliance.sh
 
 ```text
 .sandbox/
-  home/
   docker-vm/
-    docker-data.raw
+    state.raw
     lock
     run/
       state.json
@@ -56,10 +55,9 @@ sudo docker/build-appliance.sh
 
 Meaning:
 
-- `.sandbox/home/` backs the guest user's natural home path; the guest-visible
-  `$HOME` is the host home path, not `.sandbox/home`.
-- `docker-data.raw` is the persistent sparse ext4 disk mounted at
-  `/var/lib/docker`.
+- `state.raw` is the persistent sparse ext4 disk backing the guest root
+  overlay. Guest writes under normal paths, including `$HOME`, `/usr/local`,
+  package caches, and `/var/lib/docker`, persist there.
 - `lock` prevents concurrent VM launches for the same project.
 - `run/` contains the current launch's manifests, sockets, state, and logs.
 
@@ -69,14 +67,13 @@ Normal flow:
 
 1. The Rust frontend resolves the project, tool, policy, and guest shares.
 2. It acquires `.sandbox/docker-vm/lock`.
-3. It creates `.sandbox/home/`, `.sandbox/docker-vm/`, and the selected
-   run directory.
-4. It creates and formats `docker-data.raw` on first use.
+3. It creates `.sandbox/docker-vm/` and the selected run directory.
+4. It creates and formats `state.raw` on first use.
 5. It writes composed-fs and config-fs manifests.
 6. It starts embedded composed-fs servers for workspace/config sharing.
 7. It starts the Rust vmnet gateway and any requested host listeners.
-8. It starts QEMU with microvm, read-only rootfs, Docker data disk,
-   virtio-fs devices, and stream networking.
+8. It starts QEMU with microvm, read-only lower rootfs, root overlay state
+   disk, virtio-fs devices, and stream networking.
 9. It waits for the guest payload control path.
 10. It launches the requested payload in the guest.
 11. It forwards stdio, signals, terminal resize events, and guest exit status.

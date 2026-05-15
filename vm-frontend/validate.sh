@@ -29,6 +29,8 @@ tiers:
   live-dns    Run allowed and denied DNS resolver KVM scenarios.
   live-docker Run Docker bridge container egress and no-net denial KVM scenarios.
   live-fs     Run composed-fs live/adversarial KVM scenarios twice with the same run-dir.
+  live-persistence
+              Run root overlay persistence KVM scenarios across relaunches.
   live-full   Run all named live scenarios.
   live        Alias for live-smoke. Requires /dev/kvm and built appliance artifacts.
   host-live   Alias for live-smoke, emphasizing that this tier must run on the KVM host.
@@ -151,6 +153,7 @@ run_self_test_scenario() {
 
 live_smoke() {
   require_kvm
+  rm -f "${ROOT}/.sandbox/docker-vm/state.raw"
   local publish_port="${PUBLISH_PAYLOAD_PORT:-12079}"
   run_self_test_scenario \
     "live-smoke self-test: publish-payload-port=${publish_port}" \
@@ -203,6 +206,7 @@ live_dns() {
 
 live_docker() {
   require_kvm
+  rm -f "${ROOT}/.sandbox/docker-vm/state.raw"
   local saved_image="${IMAGE-}"
   IMAGE="${DOCKER_IMAGE:-${IMAGE:-alpine:3.22}}"
   run_self_test_scenario \
@@ -239,6 +243,21 @@ live_fs() {
     --fs-check
 }
 
+live_persistence() {
+  require_kvm
+  local run_dir="${ROOT}/.sandbox/root-overlay-self-test/run"
+  local state_disk="${ROOT}/.sandbox/root-overlay-self-test/state.raw"
+  rm -f "${state_disk}"
+  run_self_test_scenario \
+    "live-persistence self-test: write root overlay marker" \
+    "${run_dir}" \
+    --root-persistence-check
+  run_self_test_scenario \
+    "live-persistence self-test: verify root overlay marker after relaunch" \
+    "${run_dir}" \
+    --root-persistence-check --expect-root-persistence
+}
+
 live_full() {
   live_smoke
   live_hostile
@@ -246,6 +265,7 @@ live_full() {
   live_dns
   live_docker
   live_fs
+  live_persistence
 }
 
 required() {
@@ -279,6 +299,7 @@ case "${1:-}" in
   live-dns) live_dns ;;
   live-docker) live_docker ;;
   live-fs) live_fs ;;
+  live-persistence) live_persistence ;;
   live-full) live_full ;;
   -h|--help|"")
     usage

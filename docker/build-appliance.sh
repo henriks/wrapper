@@ -217,7 +217,7 @@ $(source_inputs_json)  ],
     "cpus": 2,
     "memory_bytes": 2147483648,
     "root_disk_device": "/dev/vda",
-    "docker_data_device": "/dev/vdb",
+    "state_disk_device": "/dev/vdb",
     "virtiofs_tag": "${VIRTIOFS_TAG}",
     "kernel_cmdline": "console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
   },
@@ -226,7 +226,7 @@ $(source_inputs_json)  ],
     "docker_tcp_port": ${DOCKER_TCP_PORT},
     "payload_tcp_port": ${PAYLOAD_TCP_PORT},
     "workspace_mount": "/workspace",
-    "docker_data_mount": "/var/lib/docker"
+    "state_disk_role": "root-overlay"
   },
   "versions": {
     "alpine_version": "${ALPINE_VERSION}",

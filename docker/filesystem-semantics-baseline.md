@@ -31,7 +31,7 @@ The baseline is driven by these wrapper workflows:
 - guest init creates `.sandbox/docker-vm/run/` under the shared workspace and
   writes mirrored logs there
 - Codex/Copilot install or run from the host user's natural `$HOME` path in the
-  guest, backed by project-local `.sandbox/home` storage where no more specific
+  guest, backed by the persistent VM root overlay where no more specific
   host-backed mount overrides it
 - npm, mise, shell startup, and tool caches write under `$HOME/.local`,
   `$HOME/.cache`, `$HOME/.config`, and `$HOME/.local/state`
@@ -49,8 +49,6 @@ The baseline is driven by these wrapper workflows:
 The backend should distinguish these source classes from the manifest:
 
 - `workspace`: writable project tree
-- `persistent-home`: project-local backing store mounted at the guest-visible
-  host home path
 - `tool-state`: writable tool state such as `.codex`, `.copilot`, and
   `.docker` when present
 - `auth-config`: readonly host auth/config such as `.config/gh`

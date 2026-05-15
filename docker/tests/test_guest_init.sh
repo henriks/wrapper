@@ -35,6 +35,11 @@ if get_cmdline_value missing_key >/tmp/agentvm-missing-value; then
   fail "missing cmdline key unexpectedly succeeded"
 fi
 
+AGENTVM_ROOT_OVERLAY_READY=1
+mount() { fail "setup_root_overlay should not mount when overlay is already ready"; }
+setup_root_overlay
+unset AGENTVM_ROOT_OVERLAY_READY
+
 # Mock mutating commands for bind_composed_entry. The function should reject
 # invalid absolute-path contracts before trying to create or mount anything.
 mkdir() { fail "mkdir should not be called for invalid bind"; }

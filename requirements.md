@@ -82,9 +82,8 @@ All mutable state is project-local under `.sandbox/`:
 ```text
 .sandbox/
   config.json
-  home/
   docker-vm/
-    docker-data.raw
+    state.raw
     lock
     run/
       state.json
@@ -102,10 +101,10 @@ All mutable state is project-local under `.sandbox/`:
       guest-config/composed-binds.json
 ```
 
-`.sandbox/home/` is the project-local backing store for the guest user's
-natural home path. The sparse `docker-data.raw` disk is mounted in the guest at
-`/var/lib/docker`. `run/` contains per-launch sockets, manifests, state, and
-diagnostic logs.
+The sparse `docker-vm/state.raw` disk is the persistent writable overlay for
+the guest root filesystem. Guest paths such as `$HOME`, `/usr/local`, package
+caches, and `/var/lib/docker` persist through that root overlay. `run/` contains
+per-launch sockets, manifests, state, and diagnostic logs.
 
 `--reset` removes `.sandbox/` unless the project VM lock is held.
 `.sandbox/config.json` records project-level wrapper setup: setup recipe,
@@ -125,8 +124,8 @@ Required/default guest shares:
 
 - The project workspace is mounted read-write at its original absolute path.
 - `/workspace` is a compatibility alias for the project path.
-- `.sandbox/home/` is mounted at the host user's natural home path in the guest;
-  the guest does not see `.sandbox/home` as `$HOME`.
+- Guest `$HOME` is the host user's natural home path inside the VM and lives on
+  the persistent root overlay unless a more specific configured share covers it.
 - Selected tool state is shared deliberately, not by mounting broad host `$HOME`.
 - Enabling Codex in the wrapper/TUI setup exposes Codex state, currently
   `~/.codex`, as writable tool state at the same absolute path in the guest.

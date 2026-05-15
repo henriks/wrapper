@@ -25,7 +25,7 @@ use crate::{FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, 
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_WAIT_STEP: Duration = Duration::from_millis(20);
-const DATA_DISK_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const STATE_DISK_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum LaunchError {
@@ -232,7 +232,7 @@ pub fn start_frontend_with_policy(
     mounts: Vec<RuntimeMount>,
     policy: VmnetPolicy,
 ) -> Result<RunningFrontend, LaunchError> {
-    ensure_data_disk(&config.runtime.data_disk)?;
+    ensure_state_disk(&config.runtime.state_disk)?;
     validate_launch_inputs(&config)?;
     write_launch_state(&config, "starting", None, None, Some(&policy))?;
     prepare_frontend_launch_with_policy(&config, &mounts, &policy)?;
@@ -358,16 +358,16 @@ fn wait_for_qemu(
 }
 
 fn validate_launch_inputs(config: &FrontendConfig) -> Result<(), LaunchError> {
-    if !config.runtime.data_disk.exists() {
+    if !config.runtime.state_disk.exists() {
         return Err(LaunchError::Artifact(format!(
-            "Docker data disk is missing: {}",
-            config.runtime.data_disk.display()
+            "VM state disk is missing: {}",
+            config.runtime.state_disk.display()
         )));
     }
     Ok(())
 }
 
-fn ensure_data_disk(path: &Path) -> Result<(), LaunchError> {
+fn ensure_state_disk(path: &Path) -> Result<(), LaunchError> {
     if path.exists() {
         return Ok(());
     }
@@ -375,7 +375,7 @@ fn ensure_data_disk(path: &Path) -> Result<(), LaunchError> {
         fs::create_dir_all(parent)?;
     }
     let disk = File::create(path)?;
-    disk.set_len(DATA_DISK_SIZE_BYTES)?;
+    disk.set_len(STATE_DISK_SIZE_BYTES)?;
     let status = Command::new("mkfs.ext4")
         .arg("-F")
         .arg(path)
@@ -406,6 +406,7 @@ struct LaunchState<'a> {
     composed_fs_socket: String,
     config_fs_socket: String,
     docker_socket: Option<String>,
+    state_disk: String,
     qemu_log: String,
     console_log: String,
     vmnet_event_log: String,
@@ -440,6 +441,7 @@ fn write_launch_state(
         docker_socket: policy
             .and_then(|policy| docker_listener_tcp_port(policy))
             .map(|_| config.runtime.docker_sock.display().to_string()),
+        state_disk: config.runtime.state_disk.display().to_string(),
         qemu_log: config
             .runtime
             .run_dir
@@ -861,6 +863,7 @@ mod tests {
         assert!(state.contains("\"egress_default_action\": \"Deny\""));
         assert!(state.contains("guest-config.sock"));
         assert!(state.contains("docker.sock"));
+        assert!(state.contains("state.raw"));
         assert!(state.contains("qemu.log"));
         assert!(state.contains("console.log"));
         assert!(state.contains("vmnet-events.log"));

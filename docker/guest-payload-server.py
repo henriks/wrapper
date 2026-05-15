@@ -70,6 +70,18 @@ def payload_identity(env: dict[str, str]) -> tuple[int | None, int | None]:
     return int(uid), int(gid)
 
 
+def ensure_home(env: dict[str, str], uid: int | None, gid: int | None) -> None:
+    home = env.get("HOME")
+    if not home or not os.path.isabs(home):
+        return
+    os.makedirs(home, exist_ok=True)
+    if uid is None or gid is None:
+        return
+    home_stat = os.stat(home)
+    if home_stat.st_uid != uid or home_stat.st_gid != gid:
+        os.chown(home, uid, gid)
+
+
 def payload_preexec(uid: int | None, gid: int | None):
     def preexec() -> None:
         os.setsid()
@@ -92,6 +104,7 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in dict(request.get("env") or {}).items()})
     uid, gid = payload_identity(env)
+    ensure_home(env, uid, gid)
     rows = int(request.get("rows") or 24)
     cols = int(request.get("cols") or 80)
 

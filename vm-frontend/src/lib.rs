@@ -41,7 +41,7 @@ pub struct RuntimePaths {
     pub console_log: PathBuf,
     pub state_json: PathBuf,
     pub lock: PathBuf,
-    pub data_disk: PathBuf,
+    pub state_disk: PathBuf,
     pub composed_fs_manifest: PathBuf,
     pub composed_fs_sock: PathBuf,
     pub config_fs_manifest: PathBuf,
@@ -64,7 +64,7 @@ impl RuntimePaths {
             console_log: run_dir.join("console.log"),
             state_json: run_dir.join("state.json"),
             lock: root_dir.join("lock"),
-            data_disk: root_dir.join("docker-data.raw"),
+            state_disk: root_dir.join("state.raw"),
             composed_fs_manifest: run_dir.join("composed-fs-manifest.json"),
             composed_fs_sock: run_dir.join("virtiofs.sock"),
             config_fs_manifest: run_dir.join("config-fs-manifest.json"),
@@ -258,11 +258,11 @@ impl FrontendConfig {
             "virtio-blk-device,drive=rootfs".to_string(),
             "-drive".to_string(),
             format!(
-                "if=none,file={},format=raw,id=dockerdata",
-                self.runtime.data_disk.display()
+                "if=none,file={},format=raw,id=statedisk",
+                self.runtime.state_disk.display()
             ),
             "-device".to_string(),
-            "virtio-blk-device,drive=dockerdata".to_string(),
+            "virtio-blk-device,drive=statedisk".to_string(),
             "-object".to_string(),
             "rng-random,id=rng0,filename=/dev/urandom".to_string(),
             "-device".to_string(),
@@ -418,6 +418,9 @@ mod tests {
         assert!(joined.contains("-machine microvm,acpi=off,memory-backend=mem,isa-serial=on"));
         assert!(joined.contains("-device virtio-net-device,netdev=net0,mac=02:fc:12:34:56:78"));
         assert!(joined.contains("-netdev stream,id=net0,server=off,addr.type=unix,addr.path=/repo/.sandbox/docker-vm/run/vmnet.sock,reconnect-ms=250"));
+        assert!(joined
+            .contains("if=none,file=/repo/.sandbox/docker-vm/state.raw,format=raw,id=statedisk"));
+        assert!(joined.contains("virtio-blk-device,drive=statedisk"));
         assert!(joined.contains("vhost-user-fs-device,chardev=charfs,tag=agentvm"));
         assert!(joined.contains("vhost-user-fs-device,chardev=charcfg,tag=agentvm-config"));
         assert!(!joined.contains("hostfwd="));

@@ -132,9 +132,10 @@ relative path inside a read-write share that should be backed by project-local
 CLI `--ro PATH` and `--rw PATH` expose the path at the same absolute guest path
 for one launch.
 
-The default guest home is project-local `.sandbox/home/` mounted at the host
-user's natural home path inside the guest. Tool state is shared deliberately by
-recipe/config, not by exposing the whole host home.
+The default guest home is the host user's natural home path inside the guest and
+lives on the persistent VM root overlay unless a configured share covers that
+path or one of its children. Tool state is shared deliberately by recipe/config,
+not by exposing the whole host home.
 
 ## TUI Contract
 

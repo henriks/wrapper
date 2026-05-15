@@ -6,20 +6,76 @@ if [ "${AGENTVM_GUEST_INIT_SOURCE_ONLY:-0}" = "1" ] && [ ! -f /etc/agentvm.env ]
   PAYLOAD_TCP_PORT=1076
   VIRTIOFS_TAG=workspace
   CONFIG_VIRTIOFS_TAG=agentvm-config
+  ROOT_OVERLAY_LOWER_DEVICE=/dev/vda
+  ROOT_OVERLAY_STATE_DEVICE=/dev/vdb
 else
   . /etc/agentvm.env
 fi
+
+ROOT_OVERLAY_LOWER_DEVICE=${ROOT_OVERLAY_LOWER_DEVICE:-/dev/vda}
+ROOT_OVERLAY_STATE_DEVICE=${ROOT_OVERLAY_STATE_DEVICE:-/dev/vdb}
 
 readonly DOCKER_TCP_PORT
 readonly PAYLOAD_TCP_PORT
 readonly VIRTIOFS_TAG
 readonly CONFIG_VIRTIOFS_TAG
+readonly ROOT_OVERLAY_LOWER_DEVICE
+readonly ROOT_OVERLAY_STATE_DEVICE
 readonly GUEST_DOCKERD_LOG=/run/dockerd.log
 readonly GUEST_SOCKET_BRIDGE_LOG=/run/socket-bridge.log
 readonly GUEST_PAYLOAD_SERVER_LOG=/run/payload-server.log
 
 log() {
   echo "agentvm-init: $*"
+}
+
+wait_for_block_device() {
+  device="$1"
+  attempts=0
+  while [ ! -b "${device}" ]; do
+    attempts=$((attempts + 1))
+    if [ "${attempts}" -ge 50 ]; then
+      log "error: block device did not appear: ${device}"
+      exit 1
+    fi
+    sleep 0.1
+  done
+}
+
+setup_root_overlay() {
+  [ "${AGENTVM_ROOT_OVERLAY_READY:-0}" = "1" ] && return 0
+
+  log "setting up persistent root overlay using ${ROOT_OVERLAY_STATE_DEVICE}"
+  mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+  mount -t tmpfs tmpfs /run 2>/dev/null || true
+  wait_for_block_device "${ROOT_OVERLAY_LOWER_DEVICE}"
+  wait_for_block_device "${ROOT_OVERLAY_STATE_DEVICE}"
+  mkdir -p /run/agentvm-lower /run/agentvm-state /run/agentvm-newroot
+
+  if ! mount -o ro "${ROOT_OVERLAY_LOWER_DEVICE}" /run/agentvm-lower; then
+    log "warning: failed to mount immutable root ${ROOT_OVERLAY_LOWER_DEVICE}; using current root as overlay lower"
+    mount --bind / /run/agentvm-lower || {
+      log "error: failed to bind current root as overlay lower"
+      exit 1
+    }
+  fi
+  mount "${ROOT_OVERLAY_STATE_DEVICE}" /run/agentvm-state || {
+    log "error: failed to mount root overlay state ${ROOT_OVERLAY_STATE_DEVICE}"
+    exit 1
+  }
+  mkdir -p /run/agentvm-state/root/upper /run/agentvm-state/root/work
+  modprobe overlay 2>/dev/null || true
+  mount -t overlay overlay \
+    -o lowerdir=/run/agentvm-lower,upperdir=/run/agentvm-state/root/upper,workdir=/run/agentvm-state/root/work \
+    /run/agentvm-newroot || {
+    log "error: failed to mount persistent root overlay"
+    exit 1
+  }
+  mkdir -p /run/agentvm-newroot/proc
+  mount -t proc proc /run/agentvm-newroot/proc 2>/dev/null || true
+
+  exec env AGENTVM_ROOT_OVERLAY_READY=1 \
+    chroot /run/agentvm-newroot /usr/local/sbin/agentvm-init
 }
 
 get_cmdline_value() {
@@ -205,6 +261,7 @@ teardown() {
 
 main() {
 trap teardown INT TERM HUP
+setup_root_overlay
 
 PROJECT_PATH=$(get_cmdline_value agentvm_project || true)
 GUEST_IP=$(get_cmdline_value agentvm_guest_ip || true)
@@ -233,8 +290,6 @@ ln -sf /dev/pts/ptmx /dev/ptmx
 mount -t cgroup2 none /sys/fs/cgroup || true
 mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
-mount -t tmpfs tmpfs /home || true
-mount /dev/vdb /var/lib/docker
 mkdir -p /run/agentvm-config /run/agentvm-share-mnts
 mount -t virtiofs "${CONFIG_VIRTIOFS_TAG}" /run/agentvm-config
 

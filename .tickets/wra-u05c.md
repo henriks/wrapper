@@ -1,6 +1,6 @@
 ---
 id: wra-u05c
-status: in_progress
+status: closed
 deps: [wra-wrv7]
 links: [wra-brsl, wra-wrv7]
 created: 2026-05-15T18:24:20Z
@@ -37,3 +37,7 @@ Implemented generic configured share shadows. .sandbox/config.json shares now ac
 **2026-05-15T19:20:17Z**
 
 Follow-up documentation hardening: added vm-frontend/config-json.md as the detailed .sandbox/config.json format reference, linked it from requirements.md, docker/runtime-contract.md, and wrapper-ux-contract.md, and updated AGENTS.md to require keeping that document and tests in sync with config parsing/serialization/default/migration changes. Validation rerun: ./vm-frontend/validate.sh required passed, including live-smoke.
+
+**2026-05-15T19:43:39Z**
+
+Reopened briefly during design discussion, but the follow-up work is now tracked under epic wra-bjlw rather than mutating this closed ticket further. User clarified the intended shadow model: shadows should be string arrays, parent shares can be ro or rw, shadows are always rw project-local substitutions, backing should be derived from the full guest path under .sandbox/root, and setup recipes should emit explicit share templates. See child tickets wra-71xw, wra-cr8p, wra-ieju, wra-q5lm, and wra-mur9.

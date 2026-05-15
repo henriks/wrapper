@@ -78,20 +78,6 @@ Example:
       }
     },
     {
-      "id": "m0002_home",
-      "guest_path": "/home/user",
-      "host_path": "/home/user/project/.sandbox/home",
-      "kind": "dir",
-      "access": "rw",
-      "source_class": "persistent-home",
-      "required": true,
-      "bind": true,
-      "metadata": {
-        "uid_gid": "host",
-        "permissions": "host"
-      }
-    },
-    {
       "id": "m0003_codex",
       "guest_path": "/home/user/.codex",
       "host_path": "/home/user/.codex",
@@ -213,8 +199,8 @@ Required mount fields:
 - `host_path`: absolute normalized host source path
 - `kind`: `dir` or `file`
 - `access`: `rw` or `ro`
-- `source_class`: `workspace`, `persistent-home`, `tool-state`, `auth-config`,
-  `system-ro`, `user-ro`, or `user-rw`
+- `source_class`: `workspace`, `tool-state`, `auth-config`, `system-ro`,
+  `user-ro`, or `user-rw`
 - `required`: whether missing source fails startup
 - `bind`: whether guest init should bind this path into its final location
 - `metadata.uid_gid`: `host` for v1
@@ -277,13 +263,6 @@ Workspace:
 - `host_path` is the resolved project absolute path
 - `access` is `rw`
 - `source_class` is `workspace`
-
-Persistent guest home:
-- required
-- `guest_path` is the host user's natural home path
-- `host_path` is `<project>/.sandbox/home`
-- `access` is `rw`
-- `source_class` is `persistent-home`
 
 Tool state:
 - optional unless the current wrapper treats the source as required
