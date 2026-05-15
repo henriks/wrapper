@@ -1,6 +1,6 @@
 ---
 id: wra-293p
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T08:07:53Z
@@ -26,3 +26,7 @@ Product decisions from UX review: the primary user-facing command should be agen
 **2026-05-15T08:19:02Z**
 
 Additional UX decision: replace the current launch-time --tool concept with explicit setup recipes. A setup recipe such as --setup-tool codex or --setup-tool pi should mutate config.json intentionally: set the default entrypoint, required writable tool-state shares, install/bootstrap recipe, environment defaults, and any known package metadata. Current --tool should become a compatibility/transient override or be retired after migration. Candidate recipes include codex and pi for @mariozechner/pi-coding-agent.
+
+**2026-05-15T08:35:09Z**
+
+Implemented the UX epic end to end. Added wrapper-ux-contract.md, made agentvm the primary entrypoint, expanded config.json to schema_version 2 for durable command/network/auth/share/port/setup state, converted post--- to payload command override, added --setup-tool codex|pi recipes, added an initial TUI config editor via --config, aligned docs, and added/updated tests. Validation: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed; cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check passed. Remaining product hardening is richer free-form TUI editing, but the coherent config-driven contract is implemented and covered.

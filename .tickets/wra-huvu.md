@@ -1,6 +1,6 @@
 ---
 id: wra-huvu
-status: open
+status: closed
 deps: [wra-4bi6]
 links: []
 created: 2026-05-15T08:12:26Z
@@ -17,3 +17,9 @@ Design and implement .sandbox/config.json as the durable source of truth for con
 
 A versioned config schema is documented and implemented. Wrapper launch builds its launch config from config.json plus one-run CLI overrides. Existing flags remain overrides unless an explicit config-edit command is used. Tests cover config loading defaults, schema validation, network allowlists, mounts, auth options, default command, and CLI override precedence.
 
+
+## Notes
+
+**2026-05-15T08:33:31Z**
+
+Implemented schema_version 2 for .sandbox/config.json. The config now models setup_tool, default_command, tool_state, network mode plus domain/host/IP allowlists, auth sharing, structured extra shares, and published ports. Legacy schema_version 1 configs are upgraded in memory. Wrapper parsing applies config as durable defaults and CLI flags as one-run overrides; frontend launch parsing gained --tool-state and internal --share-ro/--share-rw support for config shares with distinct guest paths. Tests cover config-driven network/auth/shares/ports and Pi tool state.

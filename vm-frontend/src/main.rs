@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, TcpListener};
 use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,6 +48,15 @@ fn run_cli(argv: Vec<String>) -> Result<(), String> {
         .cloned()
         .unwrap_or_else(|| "agentvm-frontend".to_string());
     let args: Vec<String> = argv.into_iter().skip(1).collect();
+    if is_agentvm_program(&program) {
+        return match args.first().map(String::as_str) {
+            Some("prepare" | "launch" | "vmnet-gateway" | "payload-client" | "self-test") => {
+                run(args)
+            }
+            Some("wrap") => run_wrapper(program, args[1..].to_vec()),
+            _ => run_wrapper(program, args),
+        };
+    }
     match args.first().map(String::as_str) {
         Some("prepare" | "launch" | "vmnet-gateway" | "payload-client" | "self-test")
         | Some("-h" | "--help")
@@ -55,6 +64,13 @@ fn run_cli(argv: Vec<String>) -> Result<(), String> {
         Some("wrap") => run_wrapper(program, args[1..].to_vec()),
         Some(command) => Err(format!("unknown command: {command}")),
     }
+}
+
+fn is_agentvm_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        == Some("agentvm")
 }
 
 fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
@@ -237,6 +253,19 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
         reset_project(&wrapper.project)?;
         return Ok(());
     }
+    if let Some(setup_tool) = wrapper.setup_tool {
+        write_wrapper_sandbox_config(
+            &wrapper.project,
+            &WrapperSandboxConfig::setup_tool(setup_tool),
+        )?;
+    }
+    if wrapper.edit_config {
+        let config = read_wrapper_sandbox_config(&wrapper.project)?
+            .unwrap_or_else(WrapperSandboxConfig::codex_default);
+        let edited = tui::run_config_editor(config).map_err(|error| error.to_string())?;
+        write_wrapper_sandbox_config(&wrapper.project, &edited)?;
+        return Ok(());
+    }
     if wrapper.tls_bootstrap {
         let ca = ensure_wrapper_mitm_ca(&wrapper.project)?;
         wrapper.launch_args.extend([
@@ -276,9 +305,11 @@ struct WrapperArgs {
     launch_args: Vec<String>,
     ui_mode: WrapperUiMode,
     tool_selected: bool,
-    command_override: Option<String>,
+    command_override: Option<WrapperCommandOverride>,
+    setup_tool: Option<SetupTool>,
     tls_bootstrap: bool,
     reset: bool,
+    edit_config: bool,
     help: bool,
 }
 
@@ -286,6 +317,30 @@ struct WrapperArgs {
 enum WrapperUiMode {
     Tui,
     Plain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WrapperCommandOverride {
+    Argv(ConfigCommand),
+    Shell { command: String, args: Vec<String> },
+}
+
+impl WrapperCommandOverride {
+    fn append_args(&mut self, args: &[String]) {
+        match self {
+            Self::Argv(command) => command.args.extend(args.iter().cloned()),
+            Self::Shell {
+                args: shell_args, ..
+            } => shell_args.extend(args.iter().cloned()),
+        }
+    }
+
+    fn script(&self) -> String {
+        match self {
+            Self::Argv(command) => payload_script_from_config_command(command),
+            Self::Shell { command, args } => payload_script_from_shell_command(command, args),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -300,20 +355,228 @@ impl WrapperArgs {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SetupTool {
+    Codex,
+    Pi,
+}
+
+impl SetupTool {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
+            _ => Err(format!("unknown setup tool: {value}")),
+        }
+    }
+
+    fn default_command(self) -> ConfigCommand {
+        match self {
+            Self::Codex => ConfigCommand::new("codex"),
+            Self::Pi => ConfigCommand::new("pi"),
+        }
+    }
+
+    fn package(self) -> &'static str {
+        match self {
+            Self::Codex => "@openai/codex",
+            Self::Pi => "@mariozechner/pi-coding-agent",
+        }
+    }
+
+    fn cli(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Pi => "pi",
+        }
+    }
+
+    fn tool_state(self) -> ConfigToolState {
+        match self {
+            Self::Codex => ConfigToolState {
+                codex: true,
+                pi: false,
+            },
+            Self::Pi => ConfigToolState {
+                codex: false,
+                pi: true,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigCommand {
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+impl ConfigCommand {
+    fn new(command: impl Into<String>) -> Self {
+        Self {
+            command: command.into(),
+            args: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.command.trim().is_empty() {
+            Err("default command must not be empty".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Default for ConfigCommand {
+    fn default() -> Self {
+        Self::new("codex")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ConfigNetworkMode {
+    Public,
+    None,
+    Allowlist,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigNetwork {
+    #[serde(default = "default_network_mode")]
+    mode: ConfigNetworkMode,
+    #[serde(default)]
+    allowed_domains: Vec<String>,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
+}
+
+impl Default for ConfigNetwork {
+    fn default() -> Self {
+        Self {
+            mode: ConfigNetworkMode::Public,
+            allowed_domains: Vec::new(),
+            allowed_hosts: Vec::new(),
+            allowed_ips: Vec::new(),
+        }
+    }
+}
+
+fn default_network_mode() -> ConfigNetworkMode {
+    ConfigNetworkMode::Public
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct ConfigAuth {
+    #[serde(default)]
+    github: bool,
+    #[serde(default)]
+    aws_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ConfigShareAccess {
+    Ro,
+    Rw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigShare {
+    host_path: String,
+    #[serde(default)]
+    guest_path: Option<String>,
+    access: ConfigShareAccess,
+    #[serde(default = "default_required_share")]
+    required: bool,
+}
+
+fn default_required_share() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ConfigPort {
+    host: u16,
+    guest: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+struct ConfigToolState {
+    #[serde(default)]
+    codex: bool,
+    #[serde(default)]
+    pi: bool,
+}
+
+impl From<ConfigToolState> for ToolStateMounts {
+    fn from(value: ConfigToolState) -> Self {
+        Self {
+            codex: value.codex,
+            pi: value.pi,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WrapperSandboxConfig {
     schema_version: u32,
-    codex_enabled: bool,
-    default_command: String,
+    #[serde(default)]
+    setup_tool: Option<SetupTool>,
+    #[serde(default)]
+    default_command: ConfigCommand,
+    #[serde(default)]
+    tool_state: ConfigToolState,
+    #[serde(default)]
+    network: ConfigNetwork,
+    #[serde(default)]
+    auth: ConfigAuth,
+    #[serde(default)]
+    shares: Vec<ConfigShare>,
+    #[serde(default)]
+    published_ports: Vec<ConfigPort>,
 }
 
 impl WrapperSandboxConfig {
-    fn codex_default() -> Self {
+    fn setup_tool(tool: SetupTool) -> Self {
         Self {
-            schema_version: 1,
-            codex_enabled: true,
-            default_command: "codex".to_string(),
+            schema_version: 2,
+            setup_tool: Some(tool),
+            default_command: tool.default_command(),
+            tool_state: tool.tool_state(),
+            network: ConfigNetwork::default(),
+            auth: ConfigAuth::default(),
+            shares: Vec::new(),
+            published_ports: Vec::new(),
         }
+    }
+
+    fn codex_default() -> Self {
+        Self::setup_tool(SetupTool::Codex)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.schema_version != 2 {
+            return Err(format!(
+                "unsupported sandbox config schema_version {}",
+                self.schema_version
+            ));
+        }
+        self.default_command.validate()?;
+        for share in &self.shares {
+            if share.host_path.trim().is_empty() {
+                return Err("sandbox config share host_path must not be empty".to_string());
+            }
+            if share.guest_path.as_deref().is_some_and(str::is_empty) {
+                return Err("sandbox config share guest_path must not be empty".to_string());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -333,22 +596,72 @@ fn read_wrapper_sandbox_config(project: &PathBuf) -> Result<Option<WrapperSandbo
             ));
         }
     };
-    let config: WrapperSandboxConfig = serde_json::from_str(&text)
+    let config = parse_wrapper_sandbox_config_text(&text)
         .map_err(|error| format!("failed to parse sandbox config {}: {error}", path.display()))?;
-    if config.schema_version != 1 {
-        return Err(format!(
-            "unsupported sandbox config schema_version {} in {}",
-            config.schema_version,
-            path.display()
-        ));
-    }
-    if config.default_command.trim().is_empty() {
-        return Err(format!(
-            "sandbox config {} has an empty default_command",
-            path.display()
-        ));
-    }
+    config
+        .validate()
+        .map_err(|error| format!("invalid sandbox config {}: {error}", path.display()))?;
     Ok(Some(config))
+}
+
+fn parse_wrapper_sandbox_config_text(text: &str) -> Result<WrapperSandboxConfig, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "missing schema_version".to_string())?;
+    if schema_version == 1 {
+        return parse_legacy_wrapper_sandbox_config(value);
+    }
+    if schema_version != 2 {
+        return Err(format!("unsupported schema_version {schema_version}"));
+    }
+    normalize_default_command_value(&mut value)?;
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn parse_legacy_wrapper_sandbox_config(
+    value: serde_json::Value,
+) -> Result<WrapperSandboxConfig, String> {
+    let codex_enabled = value
+        .get("codex_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let command = value
+        .get("default_command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("codex")
+        .to_string();
+    let mut config = if codex_enabled {
+        WrapperSandboxConfig::codex_default()
+    } else {
+        WrapperSandboxConfig {
+            schema_version: 2,
+            setup_tool: None,
+            default_command: ConfigCommand::new(command.clone()),
+            tool_state: ConfigToolState::default(),
+            network: ConfigNetwork::default(),
+            auth: ConfigAuth::default(),
+            shares: Vec::new(),
+            published_ports: Vec::new(),
+        }
+    };
+    config.default_command = ConfigCommand::new(command);
+    Ok(config)
+}
+
+fn normalize_default_command_value(value: &mut serde_json::Value) -> Result<(), String> {
+    let Some(command_value) = value.get_mut("default_command") else {
+        return Ok(());
+    };
+    if let Some(command) = command_value.as_str() {
+        *command_value = serde_json::json!({
+            "command": command,
+            "args": [],
+        });
+    }
+    Ok(())
 }
 
 fn write_wrapper_sandbox_config(
@@ -388,18 +701,31 @@ fn parse_wrapper_args_with_terminal(
     let mut launch_args = Vec::new();
     let mut project = env::current_dir().map_err(|error| error.to_string())?;
     let mut tool = None;
-    let mut command_override = None;
+    let mut command_override: Option<WrapperCommandOverride> = None;
+    let mut setup_tool = None;
     let mut reset = false;
     let mut help = false;
     let mut no_net = false;
     let mut no_tui = false;
     let mut tls_bootstrap = false;
+    let mut edit_config = false;
+    let mut saw_network_override = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--" => {
-                for arg in &args[index + 1..] {
-                    launch_args.extend(["--tool-arg".to_string(), arg.clone()]);
+                if let Some((command, command_args)) = args[index + 1..].split_first() {
+                    if let Some(existing) = command_override.as_mut() {
+                        let mut all_args = Vec::with_capacity(1 + command_args.len());
+                        all_args.push(command.clone());
+                        all_args.extend(command_args.iter().cloned());
+                        existing.append_args(&all_args);
+                    } else {
+                        command_override = Some(WrapperCommandOverride::Argv(ConfigCommand {
+                            command: command.clone(),
+                            args: command_args.to_vec(),
+                        }));
+                    }
                 }
                 break;
             }
@@ -413,18 +739,36 @@ fn parse_wrapper_args_with_terminal(
                 tool = Some(selected.clone());
                 launch_args.extend(["--tool".to_string(), selected]);
             }
+            "--tool-arg" => {
+                let arg = value(args, &mut index, "--tool-arg")?;
+                launch_args.extend(["--tool-arg".to_string(), arg]);
+            }
+            "--setup-tool" => {
+                setup_tool = Some(SetupTool::parse(&value(args, &mut index, "--setup-tool")?)?);
+            }
             "--command" => {
                 let command = value(args, &mut index, "--command")?;
                 if command.trim().is_empty() {
                     return Err("--command must not be empty".to_string());
                 }
-                command_override = Some(command);
+                command_override = Some(WrapperCommandOverride::Shell {
+                    command,
+                    args: Vec::new(),
+                });
             }
             "--no-net" => {
                 no_net = true;
+                saw_network_override = true;
                 launch_args.push(args[index].clone());
             }
+            "--allow-ip" | "--allow-domain" => {
+                saw_network_override = true;
+                let flag = args[index].clone();
+                let val = value(args, &mut index, &flag)?;
+                launch_args.extend([flag, val]);
+            }
             "--no-tui" => no_tui = true,
+            "--config" => edit_config = true,
             "--gh" => launch_args.push(args[index].clone()),
             "--aws" | "--ro" | "--rw" | "--qemu" | "--artifact-manifest" => {
                 let flag = args[index].clone();
@@ -456,7 +800,11 @@ fn parse_wrapper_args_with_terminal(
                 help = true;
             }
             arg if arg.starts_with('-') => return Err(format!("unknown wrapper option: {arg}")),
-            arg => launch_args.extend(["--tool-arg".to_string(), arg.to_string()]),
+            arg => {
+                return Err(format!(
+                    "unexpected argument '{arg}'; use '-- {arg} ...' to override the configured command"
+                ));
+            }
         }
         index += 1;
     }
@@ -467,8 +815,10 @@ fn parse_wrapper_args_with_terminal(
             ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
             tool_selected: false,
             command_override,
+            setup_tool,
             tls_bootstrap,
             reset,
+            edit_config,
             help,
         });
     }
@@ -479,8 +829,10 @@ fn parse_wrapper_args_with_terminal(
             ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
             tool_selected: false,
             command_override,
+            setup_tool,
             tls_bootstrap,
             reset,
+            edit_config,
             help,
         });
     }
@@ -488,16 +840,20 @@ fn parse_wrapper_args_with_terminal(
         launch_args.extend(["--project".to_string(), project.display().to_string()]);
     }
     let ui_mode = wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty);
-    let sandbox_config = read_wrapper_sandbox_config(&project)?;
+    let sandbox_config = if let Some(setup_tool) = setup_tool {
+        Some(WrapperSandboxConfig::setup_tool(setup_tool))
+    } else {
+        read_wrapper_sandbox_config(&project)?
+    };
+    if let Some(config) = sandbox_config.as_ref() {
+        apply_configured_launch_defaults(&mut launch_args, config, saw_network_override, no_net)?;
+    }
     let mut tool_selected = launch_args.iter().any(|arg| arg == "--tool");
     if !tool_selected {
         if let Some(tool) = tool.clone() {
             launch_args.extend(["--tool".to_string(), tool]);
             tool_selected = true;
-        } else if sandbox_config
-            .as_ref()
-            .is_some_and(|config| config.codex_enabled)
-        {
+        } else if sandbox_config.as_ref().is_some_and(config_uses_codex_tool) {
             launch_args.extend(["--tool".to_string(), "codex".to_string()]);
             tool_selected = true;
         } else if ui_mode == WrapperUiMode::Plain
@@ -505,12 +861,12 @@ fn parse_wrapper_args_with_terminal(
             && sandbox_config.is_none()
         {
             return Err(
-                "no tool selected; use --tool codex|copilot, --command CMD, or interactive TUI setup".to_string(),
+                "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup".to_string(),
             );
         }
     }
     if let Some(command) = command_override.as_ref() {
-        apply_wrapper_command(&mut launch_args, command);
+        apply_wrapper_command_override(&mut launch_args, command);
     } else if tool.is_none() {
         if let Some(config) = sandbox_config.as_ref() {
             apply_configured_default_command(&mut launch_args, config);
@@ -518,11 +874,18 @@ fn parse_wrapper_args_with_terminal(
         }
     }
     if !no_net
+        && !launch_args.iter().any(|arg| arg == "--no-net")
+        && !launch_args.iter().any(|arg| arg == "--allow-ip")
+        && !launch_args.iter().any(|arg| arg == "--allow-domain")
         && !launch_args
             .iter()
             .any(|arg| arg == "--allow-public-internet")
     {
         launch_args.push("--allow-public-internet".to_string());
+        tls_bootstrap = true;
+    } else if launch_args.iter().any(|arg| {
+        arg == "--allow-public-internet" || arg == "--allow-ip" || arg == "--allow-domain"
+    }) {
         tls_bootstrap = true;
     }
     Ok(WrapperArgs {
@@ -531,20 +894,122 @@ fn parse_wrapper_args_with_terminal(
         ui_mode,
         tool_selected,
         command_override,
+        setup_tool,
         tls_bootstrap,
         reset,
+        edit_config,
         help,
     })
 }
 
-fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
-    if config.codex_enabled && config.default_command.trim() == "codex" {
-        return;
-    }
-    apply_wrapper_command(launch_args, &config.default_command);
+fn config_uses_codex_tool(config: &WrapperSandboxConfig) -> bool {
+    config.setup_tool == Some(SetupTool::Codex)
+        && config.default_command.command == "codex"
+        && config.default_command.args.is_empty()
 }
 
-fn apply_wrapper_command(launch_args: &mut Vec<String>, command: &str) {
+fn apply_configured_launch_defaults(
+    launch_args: &mut Vec<String>,
+    config: &WrapperSandboxConfig,
+    saw_network_override: bool,
+    cli_no_net: bool,
+) -> Result<(), String> {
+    if !launch_args.iter().any(|arg| arg == "--tool-state") {
+        if config.tool_state.codex {
+            launch_args.extend(["--tool-state".to_string(), "codex".to_string()]);
+        }
+        if config.tool_state.pi {
+            launch_args.extend(["--tool-state".to_string(), "pi".to_string()]);
+        }
+    }
+    if !saw_network_override {
+        match config.network.mode {
+            ConfigNetworkMode::Public => {
+                launch_args.push("--allow-public-internet".to_string());
+            }
+            ConfigNetworkMode::None => {
+                launch_args.push("--no-net".to_string());
+            }
+            ConfigNetworkMode::Allowlist => {
+                for domain in &config.network.allowed_domains {
+                    launch_args.extend(["--allow-domain".to_string(), domain.clone()]);
+                }
+                for host in &config.network.allowed_hosts {
+                    launch_args.extend(["--allow-domain".to_string(), host.clone()]);
+                }
+                for ip in &config.network.allowed_ips {
+                    launch_args.extend(["--allow-ip".to_string(), ip.clone()]);
+                }
+            }
+        }
+    }
+    if config.auth.github && !launch_args.iter().any(|arg| arg == "--gh") {
+        launch_args.push("--gh".to_string());
+    }
+    if let Some(profile) = &config.auth.aws_profile {
+        if !launch_args.iter().any(|arg| arg == "--aws") {
+            launch_args.extend(["--aws".to_string(), profile.clone()]);
+        }
+    }
+    for share in &config.shares {
+        let host = absolute_cli_path(&share.host_path)?;
+        let guest = share
+            .guest_path
+            .as_deref()
+            .map(absolute_cli_path)
+            .transpose()?
+            .unwrap_or_else(|| host.clone());
+        let flag = match share.access {
+            ConfigShareAccess::Ro => "--share-ro",
+            ConfigShareAccess::Rw => "--share-rw",
+        };
+        let required = if share.required {
+            "required"
+        } else {
+            "optional"
+        };
+        launch_args.extend([
+            flag.to_string(),
+            format!("{}={}={required}", host.display(), guest.display()),
+        ]);
+    }
+    let config_no_net = !saw_network_override && config.network.mode == ConfigNetworkMode::None;
+    if !cli_no_net && !config_no_net {
+        for port in &config.published_ports {
+            launch_args.extend([
+                "--publish".to_string(),
+                format!("{}:{}", port.host, port.guest),
+            ]);
+        }
+    }
+    Ok(())
+}
+
+fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
+    if config_uses_codex_tool(config) {
+        return;
+    }
+    if config.setup_tool == Some(SetupTool::Pi)
+        && config.default_command.command == SetupTool::Pi.cli()
+        && !launch_args.iter().any(|arg| arg == "--payload-script")
+    {
+        apply_payload_script(
+            launch_args,
+            setup_tool_payload_script(SetupTool::Pi, &config.default_command.args),
+        );
+        return;
+    }
+    apply_payload_script(
+        launch_args,
+        payload_script_from_config_command(&config.default_command),
+    );
+}
+
+fn apply_wrapper_command_override(launch_args: &mut Vec<String>, command: &WrapperCommandOverride) {
+    apply_payload_script(launch_args, command.script());
+}
+
+fn apply_payload_script(launch_args: &mut Vec<String>, script: String) {
     let mut tool_args = Vec::new();
     let mut filtered = Vec::with_capacity(launch_args.len());
     let mut index = 0;
@@ -559,11 +1024,32 @@ fn apply_wrapper_command(launch_args: &mut Vec<String>, command: &str) {
     }
     *launch_args = filtered;
 
-    let script = payload_script_from_command(command, &tool_args);
+    let script = if tool_args.is_empty() {
+        script
+    } else {
+        format!(
+            "{} {}",
+            script.trim_end(),
+            tool_args
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
     upsert_launch_arg(launch_args, "--payload-script", script);
 }
 
-fn payload_script_from_command(command: &str, args: &[String]) -> String {
+fn payload_script_from_config_command(command: &ConfigCommand) -> String {
+    let mut script = format!("exec {}", shell_quote(&command.command));
+    for arg in &command.args {
+        script.push(' ');
+        script.push_str(&shell_quote(arg));
+    }
+    script
+}
+
+fn payload_script_from_shell_command(command: &str, args: &[String]) -> String {
     let mut script = format!("exec {}", command.trim());
     for arg in args {
         script.push(' ');
@@ -699,7 +1185,8 @@ fn reset_project(project: &PathBuf) -> Result<(), String> {
 
 fn print_wrapper_usage() {
     eprintln!(
-        "usage: agentvm-frontend wrap [--project PATH] [--tool codex|copilot] [--command CMD] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- EXTRA_ARGS...]"
+        "usage: agentvm [--project PATH] [--setup-tool codex|pi] [--config] [--no-net] [--no-tui] [--docker-publish HOST:GUEST] [--ro PATH] [--rw PATH] [--gh] [--aws PROFILE] [--reset] [-- COMMAND [ARG...]]\n\
+         compatibility: agentvm-frontend wrap [same options] [--tool codex|copilot] [--command CMD]"
     );
 }
 
@@ -902,11 +1389,13 @@ struct PolicyArgs {
     pcap_path: Option<PathBuf>,
     payload: Option<PayloadLaunchArgs>,
     tool: Option<GuestTool>,
+    tool_state: ToolStateMounts,
     tool_args: Vec<String>,
     gh: bool,
     aws_profile: Option<String>,
     extra_ro: Vec<PathBuf>,
     extra_rw: Vec<PathBuf>,
+    extra_shares: Vec<GuestPathShare>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -917,6 +1406,14 @@ struct PayloadLaunchArgs {
     rows: u16,
     cols: u16,
     no_stdin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GuestPathShare {
+    host_path: PathBuf,
+    guest_path: PathBuf,
+    readonly: bool,
+    required: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1275,6 +1772,11 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
                         .map_err(|error: String| error)?,
                 );
             }
+            "--tool-state" => match value(args, &mut index, "--tool-state")?.as_str() {
+                "codex" => policy.tool_state.codex = true,
+                "pi" => policy.tool_state.pi = true,
+                value => return Err(format!("unknown --tool-state: {value}")),
+            },
             "--tool-arg" => {
                 policy
                     .tool_args
@@ -1295,6 +1797,14 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
                 policy
                     .extra_rw
                     .push(absolute_cli_path(&value(args, &mut index, "--rw")?)?);
+            }
+            "--share-ro" | "--share-rw" => {
+                let flag = args[index].clone();
+                let readonly = flag == "--share-ro";
+                policy.extra_shares.push(parse_guest_path_share(
+                    &value(args, &mut index, &flag)?,
+                    readonly,
+                )?);
             }
             "--guest-http-smoke-url" => {
                 guest_http_smoke_url = Some(value(args, &mut index, "--guest-http-smoke-url")?);
@@ -1470,17 +1980,35 @@ fn runtime_mounts(
     std::fs::create_dir_all(config.project.join(".sandbox/home"))
         .map_err(|error| format!("failed to create persistent guest HOME backing dir: {error}"))?;
     let host_home = host_home_dir()?;
-    Ok(guest_runtime_mounts(
+    let mut mounts = guest_runtime_mounts(
         config.project.clone(),
         &GuestShareSpec {
             tool: policy.tool,
-            tool_state: ToolStateMounts::from_guest_tool(policy.tool),
+            tool_state: ToolStateMounts::from_guest_tool(policy.tool).union(policy.tool_state),
             host_home,
             gh: policy.gh,
             extra_ro: policy.extra_ro.clone(),
             extra_rw: policy.extra_rw.clone(),
         },
-    ))
+    );
+    let mut next_id = mounts.len() + 1;
+    for share in &policy.extra_shares {
+        mounts.push(RuntimeMount {
+            id: format!("m{next_id:04}_config_share"),
+            host_path: share.host_path.clone(),
+            guest_path: share.guest_path.clone(),
+            readonly: share.readonly,
+            source_class: if share.readonly {
+                agentvm_frontend::runtime_manifest::ManifestSourceClass::UserRo
+            } else {
+                agentvm_frontend::runtime_manifest::ManifestSourceClass::UserRw
+            },
+            required: share.required,
+            bind: true,
+        });
+        next_id += 1;
+    }
+    Ok(mounts)
 }
 
 fn guest_payload_env(
@@ -1623,6 +2151,39 @@ fn tool_payload_script(tool: GuestTool, tool_args: &[String]) -> String {
     .join(" && ")
 }
 
+fn setup_tool_payload_script(tool: SetupTool, tool_args: &[String]) -> String {
+    tool_bootstrap_payload_script(tool.cli(), tool.package(), &[], tool_args)
+}
+
+fn tool_bootstrap_payload_script(
+    cli: &str,
+    npm_package: &str,
+    auto_flags: &[&str],
+    tool_args: &[String],
+) -> String {
+    let mut command = Vec::new();
+    command.push(shell_quote(cli));
+    command.extend(auto_flags.iter().map(|flag| shell_quote(flag)));
+    command.extend(tool_args.iter().map(|arg| shell_quote(arg)));
+    let npm_package = format!("{npm_package}@latest");
+    let install_message =
+        format!("agentvm: installing {cli} CLI in guest HOME (first run only)...");
+    [
+        r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
+        r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
+        format!(
+            "if ! command -v {} >/dev/null 2>&1; then printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
+            shell_quote(cli),
+            shell_quote(&install_message),
+            shell_quote(&npm_package)
+        ),
+        "hash -r 2>/dev/null || true".to_string(),
+        r#"export MISE_TRUSTED_CONFIG_PATHS="$PWD""#.to_string(),
+        format!("exec {}", command.join(" ")),
+    ]
+    .join(" && ")
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -1744,6 +2305,29 @@ fn parse_port_pair(value: &str) -> Result<(u16, u16), String> {
             .parse()
             .map_err(|_| format!("invalid guest port in {value}"))?,
     ))
+}
+
+fn parse_guest_path_share(value: &str, readonly: bool) -> Result<GuestPathShare, String> {
+    let mut parts = value.splitn(3, '=');
+    let host = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| "share host path must not be empty".to_string())?;
+    let guest = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| "share must be HOST=GUEST[=required|optional]".to_string())?;
+    let required = match parts.next() {
+        None | Some("required") => true,
+        Some("optional") => false,
+        Some(value) => return Err(format!("invalid share requirement: {value}")),
+    };
+    Ok(GuestPathShare {
+        host_path: absolute_cli_path(host)?,
+        guest_path: absolute_cli_path(guest)?,
+        readonly,
+        required,
+    })
 }
 
 fn start_local_http_smoke_upstream(
@@ -2307,8 +2891,9 @@ mod tests {
                 "--no-net".to_string(),
                 "--docker-publish".to_string(),
                 "18080:8080".to_string(),
-                "--".to_string(),
+                "--tool-arg".to_string(),
                 "--model".to_string(),
+                "--tool-arg".to_string(),
                 "gpt-5".to_string(),
             ],
         )
@@ -2451,6 +3036,183 @@ mod tests {
     }
 
     #[test]
+    fn setup_tool_pi_config_runs_pi_payload_with_recipe_state() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--setup-tool".to_string(),
+                "pi".to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert_eq!(args.setup_tool, Some(SetupTool::Pi));
+        assert!(args.tool_selected);
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool-state" && window[1] == "pi"));
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--payload-script"
+                && window[1].contains("@mariozechner/pi-coding-agent@latest")
+                && window[1].contains("exec pi")
+        }));
+    }
+
+    #[test]
+    fn post_separator_overrides_configured_command_for_one_launch() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--".to_string(),
+                "bash".to_string(),
+                "-l".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert_eq!(
+            args.command_override,
+            Some(WrapperCommandOverride::Argv(ConfigCommand {
+                command: "bash".to_string(),
+                args: vec!["-l".to_string()],
+            }))
+        );
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--payload-script" && window[1] == "exec bash -l"));
+    }
+
+    #[test]
+    fn config_schema_applies_network_auth_shares_and_ports() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        let share = root.join("share");
+        std::fs::create_dir_all(&share).expect("share");
+        write_wrapper_sandbox_config(
+            &project,
+            &WrapperSandboxConfig {
+                schema_version: 2,
+                setup_tool: None,
+                default_command: ConfigCommand::new("bash"),
+                tool_state: ConfigToolState {
+                    codex: true,
+                    pi: false,
+                },
+                network: ConfigNetwork {
+                    mode: ConfigNetworkMode::Allowlist,
+                    allowed_domains: vec!["example.com".to_string()],
+                    allowed_hosts: vec!["api.example.com".to_string()],
+                    allowed_ips: vec!["93.184.216.34".to_string()],
+                },
+                auth: ConfigAuth {
+                    github: true,
+                    aws_profile: Some("dev".to_string()),
+                },
+                shares: vec![ConfigShare {
+                    host_path: share.display().to_string(),
+                    guest_path: Some("/opt/share".to_string()),
+                    access: ConfigShareAccess::Ro,
+                    required: false,
+                }],
+                published_ports: vec![ConfigPort {
+                    host: 18080,
+                    guest: 8080,
+                }],
+            },
+        )
+        .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool-state" && window[1] == "codex"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--allow-domain" && window[1] == "example.com"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--allow-domain" && window[1] == "api.example.com"));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--allow-ip" && window[1] == "93.184.216.34"));
+        assert!(args.launch_args.contains(&"--gh".to_string()));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--aws" && window[1] == "dev"));
+        assert!(args.launch_args.windows(2).any(|window| {
+            window[0] == "--share-ro" && window[1].ends_with("=/opt/share=optional")
+        }));
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--publish" && window[1] == "18080:8080"));
+    }
+
+    #[test]
+    fn agentvm_argv0_uses_wrapper_without_wrap_subcommand() {
+        let root = frontend_test_root();
+        let project = root.join("repo");
+        write_wrapper_sandbox_config(&project, &WrapperSandboxConfig::codex_default())
+            .expect("sandbox config");
+
+        let args = parse_wrapper_args_with_terminal(
+            "agentvm",
+            &[
+                "--project".to_string(),
+                project.display().to_string(),
+                "--no-tui".to_string(),
+            ],
+            true,
+            true,
+        )
+        .expect("wrapper");
+
+        assert!(args.tool_selected);
+        assert!(args
+            .launch_args
+            .windows(2)
+            .any(|window| window[0] == "--tool" && window[1] == "codex"));
+    }
+
+    #[test]
     fn wrapper_command_override_runs_payload_script_and_keeps_configured_codex_state() {
         let root = frontend_test_root();
         let project = root.join("repo");
@@ -2473,7 +3235,13 @@ mod tests {
         .expect("wrapper");
 
         assert!(args.tool_selected);
-        assert_eq!(args.command_override.as_deref(), Some("bash"));
+        assert_eq!(
+            args.command_override,
+            Some(WrapperCommandOverride::Shell {
+                command: "bash".to_string(),
+                args: vec!["-l".to_string()],
+            })
+        );
         assert!(args
             .launch_args
             .windows(2)
@@ -2492,9 +3260,17 @@ mod tests {
         write_wrapper_sandbox_config(
             &project,
             &WrapperSandboxConfig {
-                schema_version: 1,
-                codex_enabled: false,
-                default_command: "bash".to_string(),
+                schema_version: 2,
+                setup_tool: None,
+                default_command: ConfigCommand {
+                    command: "bash".to_string(),
+                    args: vec!["-l".to_string()],
+                },
+                tool_state: ConfigToolState::default(),
+                network: ConfigNetwork::default(),
+                auth: ConfigAuth::default(),
+                shares: Vec::new(),
+                published_ports: Vec::new(),
             },
         )
         .expect("sandbox config");
@@ -2505,8 +3281,6 @@ mod tests {
                 "--project".to_string(),
                 project.display().to_string(),
                 "--no-tui".to_string(),
-                "--".to_string(),
-                "-l".to_string(),
             ],
             true,
             true,
@@ -2538,7 +3312,7 @@ mod tests {
 
         assert_eq!(
             error,
-            "no tool selected; use --tool codex|copilot, --command CMD, or interactive TUI setup"
+            "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup"
         );
     }
 
@@ -2556,7 +3330,7 @@ mod tests {
                 root.join("docker/out/artifact-manifest.json")
                     .display()
                     .to_string(),
-                "--".to_string(),
+                "--tool-arg".to_string(),
                 "suggest".to_string(),
             ],
         )

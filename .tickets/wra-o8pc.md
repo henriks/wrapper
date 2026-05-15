@@ -1,6 +1,6 @@
 ---
 id: wra-o8pc
-status: open
+status: closed
 deps: [wra-huvu, wra-4bi6]
 links: []
 created: 2026-05-15T08:12:26Z
@@ -27,3 +27,7 @@ Correction: shell backticks were expanded during ticket creation. Intended conte
 **2026-05-15T08:13:04Z**
 
 Clean correction: the intended canonical one-run command override is: agentvm -- <command> [args...]. If no command follows the separator, run the configured default command from config.json. The separator should mean payload command override, not tool-argument passthrough. Preserve or deprecate the existing --command flag deliberately. Current code treats separator args as tool args and --command as the payload-script override.
+
+**2026-05-15T08:34:01Z**
+
+Changed wrapper separator semantics: arguments after -- are now the full one-run payload command override. An empty separator leaves the configured default command in place. Legacy --command remains supported and can append args from -- for compatibility. Tool args for compatibility --tool launches are now expressed with --tool-arg. Tests cover post--- bash override while preserving configured Codex tool-state mounts.

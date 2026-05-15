@@ -1,6 +1,6 @@
 ---
 id: wra-28gl
-status: open
+status: closed
 deps: [wra-tqup, wra-huvu, wra-o8pc]
 links: []
 created: 2026-05-15T08:08:15Z
@@ -23,3 +23,7 @@ The primary user entrypoint and help text are coherent and documented. First-run
 **2026-05-15T08:12:54Z**
 
 UX decisions to align with: agentvm should be the default user-facing command centered on the 80% use case; config.json should be the durable source of truth; CLI switches are one-run overrides and should not persist by default; command override should probably use post--- syntax as the canonical path; TUI should eventually edit all relevant config.json fields.
+
+**2026-05-15T08:34:52Z**
+
+Aligned wrapper CLI and docs with the UX contract: agentvm is primary, config.json drives durable behavior, --setup-tool is explicit setup, post--- is command override, --config opens the TUI editor, and compatibility --tool/--command paths are documented as compatibility. Updated requirements.md, docker/runtime-contract.md, vm-frontend/tui-design.md, and vm-frontend/validation-workflow.md. Fast offline validation passes.

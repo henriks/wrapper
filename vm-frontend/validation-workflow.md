@@ -146,8 +146,7 @@ prerequisites above.
 Start the default interactive wrapper path:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
-  wrap \
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
   --project "$PWD" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64
@@ -155,13 +154,13 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
 
 Expected behavior:
 
-- On an unconfigured project, a startup dialog appears because no tool was
-  selected by argv0, `--tool`, or `.sandbox/config.json`.
+- On an unconfigured project, a startup dialog appears because no setup recipe
+  or `.sandbox/config.json` exists.
 - Accepting the default initializes Codex and the generated
   `.sandbox/docker-vm/run/composed-fs-manifest.json` contains a writable
   `$HOME/.codex` tool-state mount backed by the same host path.
 - The accepted setup is persisted to `.sandbox/config.json`; rerunning the same
-  wrapper command starts the configured default command without showing the
+  `agentvm` command starts the configured default command without showing the
   startup dialog.
 - The guest payload renders inside the terminal viewport, with a
   one-line wrapper status/prompt area below it.
@@ -177,14 +176,13 @@ Expected behavior:
 Verify the plain fallback path:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
-  wrap \
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
   --no-tui \
   --project "$PWD" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
   --tool codex \
-  -- --help
+  --tool-arg --help
 ```
 
 Expected behavior:
@@ -196,13 +194,11 @@ Expected behavior:
 Verify the command override path:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
-  wrap \
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
   --project "$PWD" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
-  --command bash \
-  -- -l
+  -- bash -l
 ```
 
 Expected behavior:

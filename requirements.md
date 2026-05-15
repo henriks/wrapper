@@ -3,16 +3,34 @@
 ## Overview
 
 The supported sandbox model is a project-scoped QEMU microvm managed by the
-Rust `agentvm-frontend` binary. The selected agent payload runs inside the
-guest. Docker also runs inside that guest and is available to the payload by
-default.
+Rust frontend. Users normally enter through `agentvm`; the selected agent or
+command payload runs inside the guest. Docker also runs inside that guest and is
+available to the payload by default.
+
+`wrapper-ux-contract.md` is the source of truth for user-facing wrapper
+behavior. This file records the implementation requirements behind that UX.
 
 There is no supported host-side Bubblewrap execution path.
 
 ## Entry Points
 
-The Rust binary supports explicit frontend subcommands and explicit wrapper
-startup through `wrap`:
+The primary user entrypoint is:
+
+```text
+agentvm
+```
+
+`agentvm` starts the configured project sandbox, or runs setup/config flows when
+explicitly requested:
+
+```text
+agentvm --setup-tool codex
+agentvm --setup-tool pi
+agentvm --config
+agentvm -- bash -l
+```
+
+The Rust frontend still supports explicit low-level subcommands:
 
 ```text
 agentvm-frontend launch ...
@@ -24,23 +42,35 @@ The executable name is not part of wrapper behavior. `codex-wrap` and
 `copilot-wrap` aliases are not supported entrypoints, and the selected tool must
 come from explicit flags or the interactive TUI startup flow.
 
-Wrapper arguments after `--` are passed to the selected tool as tool arguments.
-When `--command CMD` is supplied, `CMD` is run as the guest payload for that
-launch instead; arguments after `--` are shell-quoted and appended to `CMD`.
+Arguments after `--` are the full guest payload command for that launch. They do
+not persist to `.sandbox/config.json`. Legacy `--command CMD` remains a
+compatibility path for one-run payload overrides. Tool arguments for legacy
+`--tool` launches use `--tool-arg ARG`.
 
 ## Supported Wrapper Flags
 
 ```text
 --project PATH
---tool codex|copilot
---command CMD
+--setup-tool codex|pi
+--config
 --no-net
+--allow-domain DOMAIN
+--allow-ip IP_OR_CIDR
 --docker-publish HOST:GUEST
 --ro PATH
 --rw PATH
 --gh
 --aws PROFILE
 --reset
+-- COMMAND [ARG...]
+```
+
+Compatibility flags:
+
+```text
+--tool codex|copilot
+--tool-arg ARG
+--command CMD
 ```
 
 Removed flags:
@@ -88,9 +118,11 @@ natural home path. The sparse `docker-data.raw` disk is mounted in the guest at
 diagnostic logs.
 
 `--reset` removes `.sandbox/` unless the project VM lock is held.
-`.sandbox/config.json` records project-level wrapper setup, including whether
-Codex state is enabled and the default command to run. A project configured
-through the TUI startup flow is not prompted again on subsequent wrapper starts.
+`.sandbox/config.json` records project-level wrapper setup: setup recipe,
+default command, tool state, network mode, allowed hosts/domains/IPs, auth
+sharing, extra directory shares, and published ports. A configured project is
+not prompted again on subsequent wrapper starts. CLI switches are one-run
+overrides and do not persist unless a setup/config-editing flow writes them.
 
 ## Guest Filesystem Contract
 
@@ -106,6 +138,8 @@ Required/default guest shares:
 - Selected tool state is shared deliberately, not by mounting broad host `$HOME`.
 - Enabling Codex in the wrapper/TUI setup exposes Codex state, currently
   `~/.codex`, as writable tool state at the same absolute path in the guest.
+- Enabling the Pi setup recipe exposes Pi state, currently `~/.pi`, as writable
+  tool state at the same absolute path in the guest.
 - `~/.docker` is shared as writable tool state when present.
 - `--gh` shares `~/.config/gh` read-only and forwards `GH_TOKEN` when available.
 - `--ro PATH` exposes a required read-only host path at the same guest path.
@@ -149,7 +183,10 @@ guest network boundary in userspace:
 - default policy is deny-by-default unless an allow profile is selected
 - `--allow-public-internet` is used by direct `launch` for public egress
 - wrapper mode enables public egress unless `--no-net` is supplied
+- configured projects can select `public`, `none`, or `allowlist` network mode
+  in `.sandbox/config.json`
 - `--no-net` denies guest egress while preserving frontend control channels
+- `--allow-domain` and `--allow-ip` provide one-run allowlist entries
 - `--docker-publish HOST:GUEST` maps to a frontend-owned host listener, not
   QEMU `hostfwd`
 

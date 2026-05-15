@@ -13,6 +13,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use tui_term::widget::PseudoTerminal;
 
+use super::{
+    ConfigCommand, ConfigNetworkMode, ConfigPort, ConfigShare, ConfigShareAccess, ConfigToolState,
+    SetupTool, WrapperSandboxConfig,
+};
+
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +148,195 @@ pub(crate) fn run_startup_dialog() -> Result<StartupSelection, String> {
                         .map_err(|error| error.to_string())
                         .map(|_| ())?,
                     StartupDialogResult::Ignored => {}
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigEditorResult {
+    Save,
+    Cancel,
+    Redraw,
+    Ignored,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigEditor {
+    config: WrapperSandboxConfig,
+}
+
+impl ConfigEditor {
+    fn new(config: WrapperSandboxConfig) -> Self {
+        Self { config }
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> ConfigEditorResult {
+        if key.kind == KeyEventKind::Release {
+            return ConfigEditorResult::Ignored;
+        }
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Enter => ConfigEditorResult::Save,
+            KeyCode::Esc | KeyCode::Char('q') => ConfigEditorResult::Cancel,
+            KeyCode::Char('c') => {
+                self.cycle_default_command();
+                ConfigEditorResult::Redraw
+            }
+            KeyCode::Char('n') => {
+                self.cycle_network_mode();
+                ConfigEditorResult::Redraw
+            }
+            KeyCode::Char('g') => {
+                self.config.auth.github = !self.config.auth.github;
+                ConfigEditorResult::Redraw
+            }
+            KeyCode::Char('d') => {
+                self.toggle_default_rw_share();
+                ConfigEditorResult::Redraw
+            }
+            KeyCode::Char('p') => {
+                self.toggle_sample_port();
+                ConfigEditorResult::Redraw
+            }
+            _ => ConfigEditorResult::Ignored,
+        }
+    }
+
+    fn cycle_default_command(&mut self) {
+        match self.config.default_command.command.as_str() {
+            "codex" => {
+                self.config.setup_tool = Some(SetupTool::Pi);
+                self.config.default_command = ConfigCommand::new("pi");
+                self.config.tool_state = ConfigToolState {
+                    codex: false,
+                    pi: true,
+                };
+            }
+            "pi" => {
+                self.config.setup_tool = None;
+                self.config.default_command = ConfigCommand::new("bash");
+                self.config.tool_state = ConfigToolState::default();
+            }
+            _ => {
+                self.config.setup_tool = Some(SetupTool::Codex);
+                self.config.default_command = ConfigCommand::new("codex");
+                self.config.tool_state = ConfigToolState {
+                    codex: true,
+                    pi: false,
+                };
+            }
+        }
+    }
+
+    fn cycle_network_mode(&mut self) {
+        self.config.network.mode = match self.config.network.mode {
+            ConfigNetworkMode::Public => ConfigNetworkMode::None,
+            ConfigNetworkMode::None => {
+                if self.config.network.allowed_domains.is_empty() {
+                    self.config
+                        .network
+                        .allowed_domains
+                        .push("example.com".to_string());
+                }
+                ConfigNetworkMode::Allowlist
+            }
+            ConfigNetworkMode::Allowlist => ConfigNetworkMode::Public,
+        };
+    }
+
+    fn toggle_default_rw_share(&mut self) {
+        if let Some(index) = self
+            .config
+            .shares
+            .iter()
+            .position(|share| share.host_path == "/tmp/agentvm-share")
+        {
+            self.config.shares.remove(index);
+        } else {
+            self.config.shares.push(ConfigShare {
+                host_path: "/tmp/agentvm-share".to_string(),
+                guest_path: None,
+                access: ConfigShareAccess::Rw,
+                required: false,
+            });
+        }
+    }
+
+    fn toggle_sample_port(&mut self) {
+        if let Some(index) = self
+            .config
+            .published_ports
+            .iter()
+            .position(|port| port.host == 18080 && port.guest == 8080)
+        {
+            self.config.published_ports.remove(index);
+        } else {
+            self.config.published_ports.push(ConfigPort {
+                host: 18080,
+                guest: 8080,
+            });
+        }
+    }
+
+    fn render(&self, frame: &mut Frame) {
+        let area = centered_rect(frame.area(), 78, 18);
+        let network = match self.config.network.mode {
+            ConfigNetworkMode::Public => "public",
+            ConfigNetworkMode::None => "none",
+            ConfigNetworkMode::Allowlist => "allowlist",
+        };
+        let setup = self
+            .config
+            .setup_tool
+            .map(|tool| match tool {
+                SetupTool::Codex => "codex",
+                SetupTool::Pi => "pi",
+            })
+            .unwrap_or("custom");
+        let body = format!(
+            "Default: {} {}\nSetup: {setup}\nNetwork: {network}\nAllowlist: {}\nGitHub auth: {}\nAWS profile: {}\nShares: {}\nPublished ports: {}\n\n[C] command  [N] network  [G] github  [D] sample rw share  [P] sample port\n[Enter/S] save  [Esc/Q] cancel",
+            self.config.default_command.command,
+            self.config.default_command.args.join(" "),
+            self.config.network.allowed_domains.join(", "),
+            if self.config.auth.github { "on" } else { "off" },
+            self.config.auth.aws_profile.as_deref().unwrap_or("none"),
+            self.config.shares.len(),
+            self.config.published_ports.len(),
+        );
+        let paragraph = Paragraph::new(body)
+            .block(
+                Block::default()
+                    .title(" Sandbox Config ")
+                    .borders(Borders::ALL),
+            )
+            .alignment(Alignment::Left)
+            .wrap(Wrap { trim: true });
+        frame.render_widget(paragraph, area);
+    }
+}
+
+pub(crate) fn run_config_editor(
+    config: WrapperSandboxConfig,
+) -> Result<WrapperSandboxConfig, String> {
+    let mut terminal = ratatui::try_init().map_err(|error| error.to_string())?;
+    let _restore = RestoreTerminal;
+    let mut editor = ConfigEditor::new(config);
+    terminal
+        .draw(|frame| editor.render(frame))
+        .map_err(|error| error.to_string())?;
+    loop {
+        if event::poll(INPUT_POLL_INTERVAL).map_err(|error| error.to_string())? {
+            let event = event::read().map_err(|error| error.to_string())?;
+            if let Event::Key(key) = event {
+                match editor.handle_key(key) {
+                    ConfigEditorResult::Save => return Ok(editor.config),
+                    ConfigEditorResult::Cancel => return Err("config edit cancelled".to_string()),
+                    ConfigEditorResult::Redraw => terminal
+                        .draw(|frame| editor.render(frame))
+                        .map_err(|error| error.to_string())
+                        .map(|_| ())?,
+                    ConfigEditorResult::Ignored => {}
                 }
             }
         }
@@ -701,6 +895,57 @@ mod tests {
         assert_eq!(
             dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             StartupDialogResult::Cancelled
+        );
+    }
+
+    #[test]
+    fn config_editor_model_edits_main_config_fields_before_save() {
+        let mut editor = ConfigEditor::new(WrapperSandboxConfig::setup_tool(SetupTool::Codex));
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert_eq!(editor.config.setup_tool, Some(SetupTool::Pi));
+        assert_eq!(editor.config.default_command.command, "pi");
+        assert!(editor.config.tool_state.pi);
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert_eq!(editor.config.network.mode, ConfigNetworkMode::None);
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert_eq!(editor.config.network.mode, ConfigNetworkMode::Allowlist);
+        assert_eq!(
+            editor.config.network.allowed_domains,
+            vec!["example.com".to_string()]
+        );
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert!(editor.config.auth.github);
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert_eq!(editor.config.shares.len(), 1);
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            ConfigEditorResult::Redraw
+        );
+        assert_eq!(editor.config.published_ports.len(), 1);
+
+        assert_eq!(
+            editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            ConfigEditorResult::Save
         );
     }
 

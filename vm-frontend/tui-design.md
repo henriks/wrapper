@@ -22,7 +22,7 @@ Important existing files:
   - `launch` starts the VM, waits for the payload listener, then calls
     `run_payload_tcp_with_control` with host stdin/stdout.
   - `runtime_mounts`, `guest_payload_env`, and `launch_payload_args` translate
-    selected tool/config state into runtime mounts and payload scripts.
+    selected setup/config state into runtime mounts and payload scripts.
 - `vm-frontend/src/payload_client.rs`
   - Implements the framed payload protocol and direct stdin/stdout forwarding.
   - Already supports payload input (`I`), output (`O`), resize (`W`), signals
@@ -52,10 +52,11 @@ Mode selection:
 The automatic non-TTY fallback is required so CI, shell pipelines, and scripted
 payload launches do not enter raw mode or require dialog interaction.
 
-The user-facing wrapper path is explicit `agentvm-frontend wrap` or a future
-`agentvm-frontend start` style command. Tool selection comes from structured
-startup configuration, explicit flags, or the TUI initialization dialog, never
-from `argv[0]`.
+The user-facing wrapper path is `agentvm`. `agentvm-frontend wrap` remains a
+compatibility/development path. Tool setup comes from `--setup-tool` recipes,
+structured startup configuration, explicit compatibility flags, or the TUI
+initialization dialog; legacy `codex-wrap`/`copilot-wrap` executable-name
+inference remains unsupported.
 
 ## Dependencies
 
@@ -164,26 +165,28 @@ The first status bar should be one line. Candidate fields, in priority order:
 
 Status should come from controller state changes, not by tailing logs.
 
-## Startup Dialog And Codex Setup
+## Startup Dialog And Config Editing
 
-The TUI startup dialog should produce structured launch configuration. CLI flags
-can pre-fill or bypass choices, but the dialog is the interactive source for
-missing startup decisions.
+The TUI startup dialog should produce structured sandbox configuration. CLI
+flags can pre-fill or bypass choices, but the dialog is the interactive source
+for missing startup decisions.
 
-Initial choices:
+Config editor and startup choices:
 
-- Enable Codex.
+- Setup recipe: Codex, Pi, or custom command.
 - Project path when not supplied.
-- Network mode, including `--no-net`.
+- Network mode: public, none, or allowlist.
+- Whitelisted domains/hosts/IPs for allowlist mode.
 - Optional GitHub auth sharing (`--gh`).
 - Optional AWS profile (`--aws PROFILE`).
 - Additional `--ro` and `--rw` shares.
+- Published guest ports.
 - Reset/reinitialize sandbox state when requested.
 
-Enabling Codex must add the correct Codex state/config directories as rw mounts
-in the sandbox configuration. This should be represented as explicit structured
-configuration consumed by `guest_runtime_mounts`/runtime manifest generation,
-not as executable-name inference from `codex-wrap`.
+Enabling a setup recipe must add the correct tool state/config directories as rw
+mounts in `.sandbox/config.json`. This should be represented as explicit
+structured configuration consumed by `guest_runtime_mounts`/runtime manifest
+generation, not as executable-name inference from `codex-wrap`.
 
 ## Implementation Order
 
@@ -219,8 +222,8 @@ Fast offline tests should cover:
 Manual live smoke should cover:
 
 1. Start an interactive sandbox and confirm the TUI appears by default.
-2. Enable Codex in the startup dialog and verify Codex state dirs are present as
-   rw mounts in the generated composed-fs manifest.
+2. Configure Codex or Pi and verify tool state dirs are present as rw mounts in
+   the generated composed-fs manifest.
 3. Type into the guest terminal and confirm guest output stays inside the frame.
 4. Resize the host terminal and confirm the guest PTY observes the viewport
    size.

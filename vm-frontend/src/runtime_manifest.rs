@@ -9,6 +9,7 @@ use serde::Serialize;
 use crate::{FrontendConfig, COMPOSED_FS_MOUNTPOINT};
 
 pub const CODEX_TOOL_STATE_DIRS: &[&str] = &[".codex"];
+pub const PI_TOOL_STATE_DIRS: &[&str] = &[".pi"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -117,16 +118,28 @@ impl FromStr for GuestTool {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ToolStateMounts {
     pub codex: bool,
+    pub pi: bool,
 }
 
 impl ToolStateMounts {
     pub fn codex() -> Self {
-        Self { codex: true }
+        Self {
+            codex: true,
+            pi: false,
+        }
     }
 
     pub fn from_guest_tool(tool: Option<GuestTool>) -> Self {
         Self {
             codex: tool == Some(GuestTool::Codex),
+            pi: false,
+        }
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            codex: self.codex || other.codex,
+            pi: self.pi || other.pi,
         }
     }
 }
@@ -233,6 +246,19 @@ pub fn guest_runtime_mounts(
 
     if spec.tool_state.codex || spec.tool == Some(GuestTool::Codex) {
         for rel_dir in CODEX_TOOL_STATE_DIRS {
+            mounts.push(home_mount(
+                next_id,
+                &spec.host_home,
+                &guest_home,
+                rel_dir,
+                false,
+                ManifestSourceClass::ToolState,
+            ));
+            next_id += 1;
+        }
+    }
+    if spec.tool_state.pi {
+        for rel_dir in PI_TOOL_STATE_DIRS {
             mounts.push(home_mount(
                 next_id,
                 &spec.host_home,

@@ -3,6 +3,15 @@ name = "agentvm-frontend"
 version = "0.1.0"
 edition = "2021"
 publish = false
+default-run = "agentvm"
+
+[[bin]]
+name = "agentvm"
+path = "src/main.rs"
+
+[[bin]]
+name = "agentvm-frontend"
+path = "src/main.rs"
 
 [dependencies]
 agentvm-composed-fs = { path = "../composed-fs" }

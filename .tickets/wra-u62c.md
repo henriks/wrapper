@@ -1,6 +1,6 @@
 ---
 id: wra-u62c
-status: open
+status: closed
 deps: [wra-huvu, wra-tqup]
 links: []
 created: 2026-05-15T08:19:02Z
@@ -17,3 +17,9 @@ Introduce explicit tool setup recipes as the replacement for the current overloa
 
 Recipes are versioned/config-driven rather than hard-coded launch flags where practical. Running a setup recipe updates config.json only because the user explicitly requested setup. Normal launch does not persist CLI overrides. Tests cover codex recipe config output, pi recipe config output, launch from recipe-generated config, and compatibility/deprecation behavior for --tool.
 
+
+## Notes
+
+**2026-05-15T08:34:21Z**
+
+Added explicit --setup-tool recipes for codex and pi. Recipes build durable config.json records with setup_tool, default command, package metadata behavior, and tool state. Codex uses the existing GuestTool path and writable .codex state; Pi installs/launches @mariozechner/pi-coding-agent via the generic npm bootstrap and enables writable .pi tool state. Normal launch overrides do not persist; --setup-tool intentionally writes config before launch. Tests cover Pi recipe config/launch output and configured Codex behavior.

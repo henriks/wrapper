@@ -1,6 +1,6 @@
 ---
 id: wra-tqup
-status: open
+status: closed
 deps: [wra-4bi6]
 links: []
 created: 2026-05-15T08:12:26Z
@@ -17,3 +17,9 @@ Replace implementation-centered wrapper UX with a primary agentvm command center
 
 There is a documented primary agentvm UX. Normal first-run and subsequent-run examples use agentvm, not agentvm-frontend wrap. Low-level frontend commands remain accessible but are clearly marked internal/debug. Tests cover the selected agentvm command dispatch and backwards-compatible behavior for existing wrap usage if retained.
 
+
+## Notes
+
+**2026-05-15T08:33:48Z**
+
+Implemented agentvm as the primary wrapper entrypoint. Cargo now builds an agentvm binary, run_cli treats argv0=agentvm as wrapper mode by default while still allowing low-level subcommands, wrapper help/docs prefer agentvm, and validation smoke commands use cargo run --bin agentvm. Legacy agentvm-frontend wrap remains available for compatibility/development.

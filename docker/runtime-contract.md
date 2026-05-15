@@ -56,11 +56,18 @@ The guest is the only execution environment for the tool payload.
 The VM-only contract intentionally removes flags that only existed to support
 the old host-side Bubblewrap model.
 
+The normal user-facing command is `agentvm`. `agentvm-frontend` subcommands are
+low-level implementation/debug interfaces. The UX-level contract is maintained
+in `wrapper-ux-contract.md`.
+
 ### Flags That Stay
 
 - `--project PATH`
-- `--tool codex|copilot`
+- `--setup-tool codex|pi` for explicit durable setup
+- `--config` for the TUI config editor
 - `--no-net`
+- `--allow-domain DOMAIN`
+- `--allow-ip IP_OR_CIDR`
 - `--docker-publish HOST:GUEST` in wrapper mode, mapped to frontend
   `--publish HOST:GUEST`
 - `--ro PATH`
@@ -68,7 +75,13 @@ the old host-side Bubblewrap model.
 - `--gh`
 - `--aws PROFILE`
 - `--reset`
-- extra command arguments after `--`
+- command override after `--`
+
+Compatibility flags:
+
+- `--tool codex|copilot`
+- `--tool-arg ARG`
+- `--command CMD`
 
 ### Flags That Change Meaning
 
@@ -76,6 +89,9 @@ the old host-side Bubblewrap model.
   - old meaning: disable host sandbox network namespace sharing
   - new meaning: start the VM with restricted guest networking and do not allow
     guest egress; localhost publish behavior remains a separate concern
+- arguments after `--`
+  - old meaning: arguments passed to the selected tool
+  - new meaning: full one-run payload command override
 - `--docker-publish HOST:GUEST`
   - old meaning: publish a guest container port when `--docker` was enabled
   - new meaning: publish a guest-side TCP port from the always-present VM
@@ -108,6 +124,7 @@ Layout:
 
 ```text
 .sandbox/
+  config.json
   home/
   docker-vm/
     docker-data.raw
@@ -134,9 +151,12 @@ Rules:
   natural home path.
 - `.sandbox/docker-vm/docker-data.raw` is the persistent sparse disk mounted in
   the guest at `/var/lib/docker`.
+- `.sandbox/config.json` is the durable project sandbox configuration for setup
+  recipe, default command, network mode/allowlists, auth sharing, extra shares,
+  and published ports.
 - `.sandbox/docker-vm/run/` is per-launch runtime and diagnostic state.
 - `--reset` removes the entire `.sandbox/` tree, including guest home, Docker
-  data, and all runtime logs, unless an active lock is held.
+  data, config, and all runtime logs, unless an active lock is held.
 
 ## Required Guest Shares
 
