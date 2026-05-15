@@ -167,16 +167,15 @@ These operations are required for v1:
 - `lseek`: support ordinary `SEEK_SET`, `SEEK_CUR`, `SEEK_END`; support
   `SEEK_DATA` / `SEEK_HOLE` when host supports them or return an appropriate
   unsupported error
+- POSIX byte-range locks: advertise `POSIX_LOCKS` when the guest offers it and
+  bridge `getlk`, `setlk`, and `setlkw` to Linux OFD locks on host file
+  descriptions keyed by guest lock owner. This must coordinate with ordinary
+  host POSIX `fcntl` locks for shared SQLite-style workloads.
 
 ### Allowed To Defer
 
 These may be deferred in v1 if documented and covered by tests:
 
-- POSIX locks: `getlk`, `setlk`, `setlkw`. ComposedFs does not advertise
-  `POSIX_LOCKS` with the current `virtiofsd` crate API and returns
-  `EOPNOTSUPP` if those trait hooks are reached; shared writable workloads that
-  require host-coherent byte-range locks need explicit validation before being
-  considered fully supported.
 - `ioctl`
 - `bmap`
 - `poll`
@@ -388,7 +387,8 @@ Backend correctness tests should cover:
 - `access` enforcing readonly/write intent
 - `flush`, `fsync`, and `release` handle cleanup
 - SQLite-style WAL smoke on a real mounted composed-fs path in live VM
-  validation
+  validation, including concurrent host and guest writers against the same
+  workspace database followed by `PRAGMA integrity_check`
 
 VM integration tests should run the smoke commands above on:
 - `q35 + composed fs`
@@ -401,9 +401,6 @@ implementation ticket:
 
 - no live migration state support beyond default `SerializableFileSystem`
   unsupported behavior
-- no POSIX lock implementation with the current `virtiofsd` crate API; the
-  backend must not advertise `POSIX_LOCKS`, and lock hooks fail explicitly with
-  `EOPNOTSUPP`
 - no special-device `mknod`
 - no cross-mount hardlinks or renames
 - no reliable host-coherent long-lived attribute/path cache

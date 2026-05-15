@@ -58,7 +58,6 @@ retirement or convert the retention behavior into an explicit bounded cache.
 The following FUSE operations intentionally remain deferred and currently use
 the upstream trait defaults:
 
-- POSIX locks: `getlk`, `setlk`, `setlkw`
 - `ioctl`
 - `bmap`
 - `poll`
@@ -72,6 +71,12 @@ User impact: ordinary shell, Git, package-manager, and Docker bind-mount
 workflows should not require these deferred operations. If integration testing
 shows a real workload depends on one, add a focused ticket before making the
 backend default.
+
+POSIX byte-range locks are not deferred. The backend advertises `POSIX_LOCKS`
+when offered by the guest and maps `getlk`, `setlk`, and `setlkw` to host OFD
+locks using separate host file descriptions per guest lock owner. Unit coverage
+must include guest-owner conflicts, host POSIX lock conflicts, `GETLK`,
+subrange unlock, blocking `SETLKW`, and flush/release cleanup.
 
 The current tests are unit-level backend tests. Full guest-mounted virtio-fs
 validation remains a later integration ticket.

@@ -45,3 +45,7 @@ User requested broadening tests for POSIX filesystem behavior generally. Treat S
 **2026-05-14T21:58:52Z**
 
 Added generic SQLite/WAL smoke to the live VM self-test payload using Python sqlite3 under guest HOME, and documented the same smoke in filesystem-semantics-baseline.md and validation-workflow.md. This is not Codex-specific; it validates a normal SQLite-style workload on the real mounted composed-fs path when live validation runs. Fast tests verify the self-test payload includes the sqlite3/WAL workload. Verification: cargo test --manifest-path vm-frontend/Cargo.toml --offline; cargo test --manifest-path composed-fs/Cargo.toml --offline.
+
+**2026-05-15T06:08:05Z**
+
+Follow-up created: wra-zfib adds the missing lock-correctness milestone for generic SQLite-style workloads. The previous guest-only SQLite smoke is not enough; the new validation must stress concurrent host+guest WAL access to the same DB and verify integrity_check after contention/crash scenarios.

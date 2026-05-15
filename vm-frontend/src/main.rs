@@ -7,7 +7,7 @@ use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -810,6 +810,17 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
     if let Some(home) = guest_env.get("HOME").cloned() {
         guest_env.insert("AGENTVM_SELF_TEST_HOME".to_string(), home);
     }
+    let sqlite_concurrency_host_db = config
+        .project
+        .join(".agentvm-self-test-sqlite/state.sqlite");
+    if let Some(parent) = sqlite_concurrency_host_db.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create sqlite concurrency dir: {error}"))?;
+    }
+    guest_env.insert(
+        "AGENTVM_SQLITE_CONCURRENCY_DB".to_string(),
+        sqlite_concurrency_host_db.display().to_string(),
+    );
     let mut policy = policy_from_args(config.network.clone(), policy_args);
     let _lock = ProjectLock::acquire(&config)?;
     let host_port = ensure_payload_listener(&mut policy);
@@ -834,6 +845,7 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         rows,
         cols,
     };
+    let mut host_sqlite = spawn_host_sqlite_concurrency(&sqlite_concurrency_host_db)?;
     let exit_code = run_payload_tcp_with_control(
         payload_addr,
         &request,
@@ -842,6 +854,8 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         PayloadControlOptions::disabled(),
     )
     .map_err(|error| format!("self-test payload failed: {error}"));
+    let host_sqlite_result = wait_host_sqlite_concurrency(&mut host_sqlite)
+        .and_then(|_| run_host_sqlite_integrity_check(&sqlite_concurrency_host_db));
     running
         .terminate()
         .map_err(|error| format!("self-test shutdown failed: {error}"))?;
@@ -849,6 +863,7 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
     if exit_code != 0 {
         return Err(format!("self-test payload exited with {exit_code}"));
     }
+    host_sqlite_result?;
     println!("self-test: ok");
     Ok(())
 }
@@ -934,17 +949,41 @@ assert value == "value", value
 conn.close()
 assert os.path.exists(db)
 "#;
+    let sqlite_concurrency = r#"import os, sqlite3, time
+db = os.environ["AGENTVM_SQLITE_CONCURRENCY_DB"]
+os.makedirs(os.path.dirname(db), exist_ok=True)
+conn = sqlite3.connect(db, timeout=30.0, isolation_level=None)
+conn.execute("PRAGMA busy_timeout=30000")
+mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+assert mode == "wal", mode
+conn.execute("CREATE TABLE IF NOT EXISTS concurrent_writes (source TEXT NOT NULL, n INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY(source, n))")
+for i in range(200):
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO concurrent_writes(source, n, value) VALUES('guest', ?, ?)", (i, f"guest-{i}"))
+    if i % 10 == 0:
+        time.sleep(0.005)
+assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+conn.close()
+"#;
     let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
         "test \"$HOME\" = \"${AGENTVM_SELF_TEST_HOME:?}\"".to_string(),
+        "echo self-test: home-ok".to_string(),
         "test \"$(id -u)\" = \"${AGENTVM_UID:?}\"".to_string(),
+        "echo self-test: uid-ok".to_string(),
         "test \"$(id -g)\" = \"${AGENTVM_GID:?}\"".to_string(),
+        "echo self-test: gid-ok".to_string(),
         "test -d \"$HOME\"".to_string(),
+        "echo self-test: home-dir-ok".to_string(),
         "test \"$PWD\" = \"$AGENTVM_SELF_TEST_PROJECT\"".to_string(),
+        "echo self-test: cwd-ok".to_string(),
         "test -f /run/agentvm-config/mitm-ca.crt".to_string(),
+        "echo self-test: ca-cert-ok".to_string(),
         "test ! -e /run/agentvm-config/mitm-ca.key".to_string(),
+        "echo self-test: ca-key-hidden-ok".to_string(),
         "test -f /run/agentvm-ca-bundle.pem".to_string(),
+        "echo self-test: ca-bundle-ok".to_string(),
         "test \"${NODE_EXTRA_CA_CERTS:-}\" = /run/agentvm-ca-bundle.pem".to_string(),
         "test \"${NPM_CONFIG_CAFILE:-}\" = /run/agentvm-ca-bundle.pem".to_string(),
         "if touch /run/agentvm-config/agentvm-self-test-ro 2>/tmp/agentvm-config-ro.err; then echo config-fs-write-unexpected; exit 1; fi".to_string(),
@@ -954,7 +993,10 @@ assert os.path.exists(db)
         "if [ \"${AGENTVM_SELF_TEST_NETWORK:-allow}\" = allow ]; then node -e 'const dns = require(\"dns\"); dns.lookup(\"example.com\", err => { if (err) throw err; });'; fi".to_string(),
         "printf workspace-ok > .agentvm-self-test-workspace".to_string(),
         "test \"$(cat .agentvm-self-test-workspace)\" = workspace-ok".to_string(),
+        "echo self-test: sqlite-home-smoke".to_string(),
         format!("python3 -c {}", shell_quote(sqlite_smoke)),
+        "echo self-test: sqlite-concurrency-smoke".to_string(),
+        format!("python3 -c {}", shell_quote(sqlite_concurrency)),
         "printf bind-ok > .agentvm-self-test-bind".to_string(),
         "docker version >/tmp/agentvm-docker-version".to_string(),
         "docker info >/tmp/agentvm-docker-info".to_string(),
@@ -970,6 +1012,66 @@ assert os.path.exists(db)
         steps.splice(12..12, hostile_self_test_payload_steps());
     }
     steps.join("; ")
+}
+
+fn spawn_host_sqlite_concurrency(db: &PathBuf) -> Result<Child, String> {
+    let script = r#"import os, sqlite3, sys, time
+db = sys.argv[1]
+os.makedirs(os.path.dirname(db), exist_ok=True)
+conn = sqlite3.connect(db, timeout=30.0, isolation_level=None)
+conn.execute("PRAGMA busy_timeout=30000")
+mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower()
+assert mode == "wal", mode
+conn.execute("CREATE TABLE IF NOT EXISTS concurrent_writes (source TEXT NOT NULL, n INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY(source, n))")
+for i in range(200):
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO concurrent_writes(source, n, value) VALUES('host', ?, ?)", (i, f"host-{i}"))
+    if i % 10 == 0:
+        time.sleep(0.005)
+assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+conn.close()
+"#;
+    Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(db)
+        .spawn()
+        .map_err(|error| format!("failed to start host sqlite concurrency worker: {error}"))
+}
+
+fn wait_host_sqlite_concurrency(child: &mut Child) -> Result<(), String> {
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed to wait for host sqlite worker: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("host sqlite worker exited with {status}"))
+    }
+}
+
+fn run_host_sqlite_integrity_check(db: &PathBuf) -> Result<(), String> {
+    let script = r#"import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1], timeout=30.0)
+conn.execute("PRAGMA busy_timeout=30000")
+assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+host_count = conn.execute("SELECT COUNT(*) FROM concurrent_writes WHERE source='host'").fetchone()[0]
+guest_count = conn.execute("SELECT COUNT(*) FROM concurrent_writes WHERE source='guest'").fetchone()[0]
+assert host_count == 200, host_count
+assert guest_count == 200, guest_count
+conn.close()
+"#;
+    let status = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .arg(db)
+        .status()
+        .map_err(|error| format!("failed to run host sqlite integrity check: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("host sqlite integrity check exited with {status}"))
+    }
 }
 
 fn hostile_self_test_payload_steps() -> Vec<String> {
@@ -2353,6 +2455,9 @@ mod tests {
         assert!(script.contains(".agentvm-self-test-workspace"));
         assert!(script.contains("sqlite3.connect"));
         assert!(script.contains("PRAGMA journal_mode=WAL"));
+        assert!(script.contains("AGENTVM_SQLITE_CONCURRENCY_DB"));
+        assert!(script.contains("concurrent_writes"));
+        assert!(script.contains("integrity_check"));
         assert!(script.contains("docker info"));
         assert!(script.contains("docker run --rm -v \"$PWD:/work:ro\" alpine:3.22"));
         assert!(script.contains(".agentvm-self-test-bind"));

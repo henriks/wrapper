@@ -124,11 +124,24 @@ Expected output includes:
 ```text
 self-test: published payload port 12079 ok
 self-test: payload-start
+self-test: home-ok
+self-test: uid-ok
+self-test: gid-ok
+self-test: home-dir-ok
+self-test: cwd-ok
+self-test: sqlite-home-smoke
+self-test: sqlite-concurrency-smoke
 docker-run-ok
 bind-ok
 self-test: payload-ok
 self-test: ok
 ```
+
+During the SQLite concurrency portion, the self-test uses
+`.agentvm-self-test-sqlite/state.sqlite` in the workspace. A valid run has host
+and guest rows in that database and `PRAGMA integrity_check = ok`. If the run
+fails after creating the directory, keep it for triage until the database has
+been inspected.
 
 ## Troubleshooting
 
@@ -147,5 +160,8 @@ Common causes:
 - Missing `/dev/kvm`: run on a KVM-capable Linux host.
 - Missing appliance artifacts: rebuild with `sudo docker/build-appliance.sh`.
 - Docker pull failures: inspect `vmnet-events.log` and guest Docker logs.
+- Payload behavior that does not match current guest source: rebuild
+  `docker/out/rootfs.raw`; the generated artifacts may contain an older
+  `agentvm-payload-server`.
 - Concurrent launch: wait for the active VM process or use `--reset` only
   after the lock is released.

@@ -1193,8 +1193,6 @@ dependencies = [
 [[package]]
 name = "virtiofsd"
 version = "1.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "162e60c45fbfeaf1d3f8407d788d4b5a0a718f49f469ccd3c7140480716d7677"
 dependencies = [
  "bitflags 1.3.2",
  "btree-range-map",

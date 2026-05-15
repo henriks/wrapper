@@ -45,3 +45,11 @@ User requested extending test sets to cover missing POSIX filesystem behavior. I
 **2026-05-14T21:57:14Z**
 
 Audited virtiofsd 1.13.3 FileSystem lock hooks. The trait methods getlk/setlk/setlkw expose no inode, handle, lock owner, range, or lock type details, so correct host-coherent POSIX byte-range lock forwarding is not implementable against this API. ComposedFs now does not advertise POSIX_LOCKS and overrides lock hooks to fail explicitly with EOPNOTSUPP if reached. Added tests for the advertised capability and explicit lock failures. Docs updated in filesystem-semantics-baseline.md and plan.md.
+
+**2026-05-15T06:08:02Z**
+
+Follow-up created: wra-zfib promotes POSIX byte-range locks from an explicit gate/deferred filesystem feature to a hard correctness requirement for shared writable host/guest mounts. Context: SQLite documents that missing or broken filesystem locks can corrupt databases under concurrent access; composed-fs currently cannot implement locks because virtiofsd 1.13.3 does not expose lock request fields through FileSystem.
+
+**2026-05-15T06:42:10Z**
+
+Follow-up wra-zfib is now complete: POSIX byte-range locks are implemented through the patched virtiofsd API and ComposedFs now advertises POSIX_LOCKS after lock tests and live SQLite WAL validation. This ticket's earlier EOPNOTSUPP/no-advertise outcome is superseded by wra-zfib.

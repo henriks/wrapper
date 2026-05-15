@@ -198,11 +198,11 @@ Outcome:
 - required behavior includes lookup counts, open handles surviving
   rename/unlink, nested readonly enforcement, file mounts in parent `readdir`,
   `access` checks, `flush`/`fsync`, and xattr delegation where supported
-- explicit v1 deferrals include host-coherent POSIX locks, special-device
-  `mknod`, cross-mount hardlinks/renames, live migration state, and rare
-  operations such as `ioctl`, `poll`, `copyfilerange`, and `syncfs`; the
-  backend must not advertise unsupported lock capability and should fail lock
-  hooks explicitly
+- explicit v1 deferrals include special-device `mknod`, cross-mount
+  hardlinks/renames, live migration state, and rare operations such as
+  `ioctl`, `poll`, `copyfilerange`, and `syncfs`
+- POSIX byte-range locks are implemented through host OFD locks and validated
+  against host POSIX lock conflicts plus SQLite-style WAL workloads
 
 ## Manifest Design
 
@@ -381,9 +381,9 @@ Implemented:
 Documented compromises:
 - stale host-backed inodes retain cached attributes after unlink but are not
   retired until backend shutdown
-- deferred locks, polling, live-migration state, `copyfilerange`, `syncfs`,
-  `tmpfile`, and `fallocate` remain unsupported unless integration testing
-  proves a real wrapper workload needs them
+- deferred polling, live-migration state, `copyfilerange`, `syncfs`, `tmpfile`,
+  and `fallocate` remain unsupported unless integration testing proves a real
+  wrapper workload needs them
 
 ## Guest Init Changes
 

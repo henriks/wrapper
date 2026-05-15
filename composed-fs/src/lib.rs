@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -208,12 +208,27 @@ struct FileHandle {
     inode: u64,
     file: File,
     writable: bool,
+    lock_path: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 #[derive(Default)]
 struct HandleTable {
     next_handle: u64,
     files: HashMap<u64, FileHandle>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct LockKey {
+    inode: u64,
+    handle: u64,
+    owner: u64,
+}
+
+#[derive(Default)]
+struct LockTable {
+    files: HashMap<LockKey, Arc<File>>,
 }
 
 impl Namespace {
@@ -699,6 +714,7 @@ impl Namespace {
 struct ComposedFs {
     namespace: Arc<RwLock<Namespace>>,
     handles: Arc<RwLock<HandleTable>>,
+    locks: Arc<Mutex<LockTable>>,
 }
 
 impl ComposedFs {
@@ -709,10 +725,18 @@ impl ComposedFs {
                 next_handle: 1,
                 files: HashMap::new(),
             })),
+            locks: Arc::new(Mutex::new(LockTable::default())),
         }
     }
 
-    fn insert_file_handle(&self, inode: u64, file: File, writable: bool) -> u64 {
+    fn insert_file_handle(
+        &self,
+        inode: u64,
+        file: File,
+        writable: bool,
+        lock_path: PathBuf,
+    ) -> io::Result<u64> {
+        let metadata = fstat_file(&file)?;
         let mut handles = self.handles.write().expect("handle table lock poisoned");
         let handle = handles.next_handle;
         handles.next_handle = handles.next_handle.saturating_add(1);
@@ -722,9 +746,12 @@ impl ComposedFs {
                 inode,
                 file,
                 writable,
+                lock_path,
+                dev: metadata.dev(),
+                ino: metadata.ino(),
             },
         );
-        handle
+        Ok(handle)
     }
 
     fn with_file_handle<T>(
@@ -743,6 +770,49 @@ impl ComposedFs {
         }
         f(file)
     }
+
+    fn lock_file_for(&self, inode: u64, handle: u64, owner: u64) -> io::Result<Arc<File>> {
+        let key = LockKey {
+            inode,
+            handle,
+            owner,
+        };
+        let mut locks = self.locks.lock().expect("lock table poisoned");
+        if let Some(file) = locks.files.get(&key) {
+            return Ok(file.clone());
+        }
+
+        let file = {
+            let handles = self.handles.read().expect("handle table lock poisoned");
+            let handle_file = handles
+                .files
+                .get(&handle)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?;
+            if handle_file.inode != inode {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            reopen_lock_file(handle_file)?
+        };
+        let file = Arc::new(file);
+        locks.files.insert(key, file.clone());
+        Ok(file)
+    }
+
+    fn remove_locks_for_owner(&self, inode: u64, handle: u64, owner: u64) {
+        let mut locks = self.locks.lock().expect("lock table poisoned");
+        locks.files.remove(&LockKey {
+            inode,
+            handle,
+            owner,
+        });
+    }
+
+    fn remove_locks_for_handle(&self, inode: u64, handle: u64) {
+        let mut locks = self.locks.lock().expect("lock table poisoned");
+        locks
+            .files
+            .retain(|key, _| key.inode != inode || key.handle != handle);
+    }
 }
 
 impl FileSystem for ComposedFs {
@@ -751,19 +821,52 @@ impl FileSystem for ComposedFs {
     type DirIter = VecDirIter;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
-        Ok(capable & FsOptions::BIG_WRITES)
+        Ok(capable & (FsOptions::BIG_WRITES | FsOptions::POSIX_LOCKS))
     }
 
-    fn getlk(&self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    fn getlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<fuse::FileLock> {
+        let file = self.lock_file_for(_inode, _handle, _owner)?;
+        let host_lock = fuse_lock_to_host(_lock)?;
+        let result = fcntl_ofd_lock(file.as_raw_fd(), libc::F_OFD_GETLK, host_lock)?;
+        Ok(host_lock_to_fuse(result)?)
     }
 
-    fn setlk(&self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    fn setlk(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
+        let file = self.lock_file_for(_inode, _handle, _owner)?;
+        let host_lock = fuse_lock_to_host(_lock)?;
+        fcntl_ofd_lock(file.as_raw_fd(), libc::F_OFD_SETLK, host_lock)?;
+        Ok(())
     }
 
-    fn setlkw(&self) -> io::Result<()> {
-        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+    fn setlkw(
+        &self,
+        _ctx: Context,
+        _inode: Self::Inode,
+        _handle: Self::Handle,
+        _owner: u64,
+        _lock: fuse::FileLock,
+        _flags: u32,
+    ) -> io::Result<()> {
+        let file = self.lock_file_for(_inode, _handle, _owner)?;
+        let host_lock = fuse_lock_to_host(_lock)?;
+        fcntl_ofd_lock(file.as_raw_fd(), libc::F_OFD_SETLKW, host_lock)?;
+        Ok(())
     }
 
     fn lookup(&self, _ctx: Context, parent: Self::Inode, name: &CStr) -> io::Result<Entry> {
@@ -984,9 +1087,11 @@ impl FileSystem for ComposedFs {
         }
         let mount = namespace.host_mount(mount_index)?;
         let file = open_host_file_for_io(mount, &relative_path, flags as i32, 0)?;
+        let lock_path = mount.root_path.join(&relative_path);
         drop(namespace);
 
-        let handle = self.insert_file_handle(inode, file, open_flags_want_write(flags));
+        let handle =
+            self.insert_file_handle(inode, file, open_flags_want_write(flags), lock_path)?;
         Ok((Some(handle), OpenOptions::empty()))
     }
 
@@ -1018,11 +1123,13 @@ impl FileSystem for ComposedFs {
             create_mode,
         )?;
         let metadata = fstat_file(&file)?;
+        let lock_path = mount.root_path.join(&relative_path);
         let entry = namespace.entry_for_host_metadata(mount_index, relative_path, &metadata);
         let inode = entry.inode;
         drop(namespace);
 
-        let handle = self.insert_file_handle(inode, file, open_flags_want_write(flags));
+        let handle =
+            self.insert_file_handle(inode, file, open_flags_want_write(flags), lock_path)?;
         Ok((entry, Some(handle), OpenOptions::empty()))
     }
 
@@ -1227,7 +1334,9 @@ impl FileSystem for ComposedFs {
         handle: Self::Handle,
         _lock_owner: u64,
     ) -> io::Result<()> {
-        self.with_file_handle(inode, handle, |_file| Ok(()))
+        self.with_file_handle(inode, handle, |_file| Ok(()))?;
+        self.remove_locks_for_owner(inode, handle, _lock_owner);
+        Ok(())
     }
 
     fn fsync(
@@ -1397,6 +1506,8 @@ impl FileSystem for ComposedFs {
         if flush && file.writable {
             file.file.sync_all()?;
         }
+        drop(file);
+        self.remove_locks_for_handle(inode, handle);
         Ok(())
     }
 
@@ -1686,6 +1797,89 @@ fn open_host_file_for_io(
         return open_absolute_nofollow(&mount.root_path, flags, mode);
     }
     open_beneath_for_io(mount.root.as_raw_fd(), relative_path, flags, mode)
+}
+
+fn reopen_lock_file(handle: &FileHandle) -> io::Result<File> {
+    let flags = if handle.writable {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
+    let file = open_absolute_nofollow(&handle.lock_path, flags, 0)?;
+    let metadata = fstat_file(&file)?;
+    if metadata.dev() != handle.dev || metadata.ino() != handle.ino {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    Ok(file)
+}
+
+fn fuse_lock_to_host(lock: fuse::FileLock) -> io::Result<libc::flock> {
+    let lock_type = match lock.type_ as i32 {
+        libc::F_RDLCK => libc::F_RDLCK,
+        libc::F_WRLCK => libc::F_WRLCK,
+        libc::F_UNLCK => libc::F_UNLCK,
+        _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+    };
+    if lock.end != u64::MAX && lock.end < lock.start {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let start = libc::off_t::try_from(lock.start)
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let len = if lock.end == u64::MAX {
+        0
+    } else {
+        let len = lock
+            .end
+            .checked_sub(lock.start)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+        libc::off_t::try_from(len).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?
+    };
+    Ok(libc::flock {
+        l_type: lock_type as libc::c_short,
+        l_whence: libc::SEEK_SET as libc::c_short,
+        l_start: start,
+        l_len: len,
+        // Linux requires l_pid to be zero for F_OFD_SETLK/F_OFD_SETLKW input.
+        l_pid: 0,
+    })
+}
+
+fn host_lock_to_fuse(lock: libc::flock) -> io::Result<fuse::FileLock> {
+    let lock_type = match lock.l_type as i32 {
+        libc::F_RDLCK => libc::F_RDLCK as u32,
+        libc::F_WRLCK => libc::F_WRLCK as u32,
+        libc::F_UNLCK => libc::F_UNLCK as u32,
+        _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+    };
+    let start =
+        u64::try_from(lock.l_start).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let end = if lock.l_len == 0 {
+        u64::MAX
+    } else {
+        let len =
+            u64::try_from(lock.l_len).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        start
+            .checked_add(len)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?
+    };
+    Ok(fuse::FileLock {
+        start,
+        end,
+        type_: lock_type,
+        pid: u32::try_from(lock.l_pid).unwrap_or(0),
+    })
+}
+
+fn fcntl_ofd_lock(fd: RawFd, command: i32, mut lock: libc::flock) -> io::Result<libc::flock> {
+    // SAFETY: fcntl is called with a valid fd and a pointer to an initialized flock.
+    let result = unsafe { libc::fcntl(fd, command, &mut lock) };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(lock)
+    }
 }
 
 fn open_absolute_nofollow(path: &Path, flags: i32, mode: u32) -> io::Result<File> {
@@ -2281,6 +2475,174 @@ mod tests {
         }
     }
 
+    fn byte_lock(lock_type: i32, start: libc::off_t, len: libc::off_t) -> libc::flock {
+        libc::flock {
+            l_type: lock_type as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: start,
+            l_len: len,
+            l_pid: 0,
+        }
+    }
+
+    fn fuse_byte_lock(lock_type: i32, start: u64, len: u64) -> fuse::FileLock {
+        fuse::FileLock {
+            start,
+            end: if len == 0 { u64::MAX } else { start + len - 1 },
+            type_: lock_type as u32,
+            pid: 0,
+        }
+    }
+
+    fn fcntl_lock(fd: RawFd, command: i32, mut lock: libc::flock) -> io::Result<libc::flock> {
+        // SAFETY: fcntl is called with a valid fd and a pointer to an initialized flock.
+        let result = unsafe { libc::fcntl(fd, command, &mut lock) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(lock)
+        }
+    }
+
+    fn assert_lock_conflict(error: io::Error, label: &str) {
+        let raw = error.raw_os_error();
+        assert!(
+            matches!(raw, Some(code) if code == libc::EACCES || code == libc::EAGAIN),
+            "{label} returned unexpected error {error:?}"
+        );
+    }
+
+    fn child_posix_write_lock_conflicts(path: &Path) -> bool {
+        let path = CString::new(path.as_os_str().as_bytes()).expect("cstring path");
+        // SAFETY: fork is followed in the child only by async-signal-safe libc calls and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            // SAFETY: path is a valid nul-terminated string and the result is checked.
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+            if fd < 0 {
+                unsafe { libc::_exit(10) };
+            }
+            let mut lock = byte_lock(libc::F_WRLCK, 0, 1);
+            // SAFETY: fd is valid and lock points to initialized memory.
+            let rc = unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) };
+            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            // SAFETY: fd was opened above and the child exits immediately afterward.
+            unsafe {
+                libc::close(fd);
+                if rc == 0 {
+                    libc::_exit(20);
+                }
+                if errno == libc::EACCES || errno == libc::EAGAIN {
+                    libc::_exit(0);
+                }
+                libc::_exit(30);
+            }
+        }
+
+        let mut status = 0;
+        // SAFETY: pid is the child returned by fork and status points to initialized storage.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            io::Error::last_os_error()
+        );
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+    }
+
+    struct ChildPosixLock {
+        pid: libc::pid_t,
+        release_fd: RawFd,
+    }
+
+    impl Drop for ChildPosixLock {
+        fn drop(&mut self) {
+            let byte = [1_u8];
+            // SAFETY: release_fd is owned by this guard and points to the child release pipe.
+            unsafe {
+                libc::write(self.release_fd, byte.as_ptr().cast(), byte.len());
+                libc::close(self.release_fd);
+            }
+            let mut status = 0;
+            // SAFETY: pid is the child returned by fork and status points to initialized storage.
+            let waited = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+            assert_eq!(
+                waited,
+                self.pid,
+                "waitpid failed: {}",
+                io::Error::last_os_error()
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child lock holder exited with status {status}"
+            );
+        }
+    }
+
+    fn child_hold_posix_write_lock(
+        path: &Path,
+        start: libc::off_t,
+        len: libc::off_t,
+    ) -> ChildPosixLock {
+        let path = CString::new(path.as_os_str().as_bytes()).expect("cstring path");
+        let mut ready = [0; 2];
+        let mut release = [0; 2];
+        // SAFETY: pipe initializes both fd arrays on success.
+        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
+        assert_eq!(
+            unsafe { libc::pipe(release.as_mut_ptr()) },
+            0,
+            "release pipe"
+        );
+        // SAFETY: fork is followed in the child only by simple libc calls and _exit.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                libc::close(ready[0]);
+                libc::close(release[1]);
+            }
+            // SAFETY: path is a valid nul-terminated string and the result is checked.
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+            if fd < 0 {
+                unsafe { libc::_exit(10) };
+            }
+            let mut lock = byte_lock(libc::F_WRLCK, start, len);
+            // SAFETY: fd is valid and lock points to initialized memory.
+            if unsafe { libc::fcntl(fd, libc::F_SETLK, &mut lock) } < 0 {
+                unsafe { libc::_exit(20) };
+            }
+            let byte = [1_u8];
+            unsafe {
+                libc::write(ready[1], byte.as_ptr().cast(), byte.len());
+                libc::close(ready[1]);
+            }
+            let mut buf = [0_u8; 1];
+            unsafe {
+                libc::read(release[0], buf.as_mut_ptr().cast(), buf.len());
+                libc::close(release[0]);
+                libc::close(fd);
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        let mut buf = [0_u8; 1];
+        // SAFETY: ready[0] is the parent read end of the child readiness pipe.
+        let read = unsafe { libc::read(ready[0], buf.as_mut_ptr().cast(), buf.len()) };
+        unsafe { libc::close(ready[0]) };
+        assert_eq!(read, 1, "child did not report lock readiness");
+        ChildPosixLock {
+            pid,
+            release_fd: release[1],
+        }
+    }
+
     fn lookup_count(fs: &ComposedFs, inode: u64) -> u64 {
         fs.namespace
             .read()
@@ -2428,6 +2790,301 @@ mod tests {
             ],
             1..96,
         )
+    }
+
+    #[derive(Clone, Debug)]
+    enum LockStressOp {
+        Set {
+            owner: u64,
+            kind: LockKind,
+            start: u64,
+            len: u64,
+        },
+        Get {
+            owner: u64,
+            kind: LockKind,
+            start: u64,
+            len: u64,
+        },
+        Flush {
+            owner: u64,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum LockKind {
+        Read,
+        Write,
+        Unlock,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ModelLock {
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        end: u64,
+    }
+
+    fn lock_stress_ops(max_len: usize) -> impl Strategy<Value = Vec<LockStressOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                (0u64..4, lock_kind_strategy(), 0u64..24, 1u64..8).prop_map(
+                    |(owner, kind, start, len)| LockStressOp::Set {
+                        owner,
+                        kind,
+                        start,
+                        len,
+                    }
+                ),
+                (
+                    0u64..4,
+                    prop_oneof![Just(LockKind::Read), Just(LockKind::Write)],
+                    0u64..24,
+                    1u64..8
+                )
+                    .prop_map(|(owner, kind, start, len)| LockStressOp::Get {
+                        owner,
+                        kind,
+                        start,
+                        len,
+                    }),
+                (0u64..4).prop_map(|owner| LockStressOp::Flush { owner }),
+            ],
+            1..max_len,
+        )
+    }
+
+    fn lock_kind_strategy() -> impl Strategy<Value = LockKind> {
+        prop_oneof![
+            Just(LockKind::Read),
+            Just(LockKind::Write),
+            Just(LockKind::Unlock),
+        ]
+    }
+
+    fn lock_kind_to_fuse(kind: LockKind) -> i32 {
+        match kind {
+            LockKind::Read => libc::F_RDLCK,
+            LockKind::Write => libc::F_WRLCK,
+            LockKind::Unlock => libc::F_UNLCK,
+        }
+    }
+
+    fn lock_conflicts(
+        existing: &ModelLock,
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        existing.owner != owner
+            && ranges_overlap(existing.start, existing.end, start, end)
+            && (existing.kind == LockKind::Write || kind == LockKind::Write)
+    }
+
+    fn ranges_overlap(left_start: u64, left_end: u64, right_start: u64, right_end: u64) -> bool {
+        left_start <= right_end && right_start <= left_end
+    }
+
+    fn model_conflict(
+        locks: &[ModelLock],
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        end: u64,
+    ) -> Option<&ModelLock> {
+        locks
+            .iter()
+            .find(|lock| lock_conflicts(lock, owner, kind, start, end))
+    }
+
+    fn model_has_conflict_matching_result(
+        locks: &[ModelLock],
+        owner: u64,
+        kind: LockKind,
+        request_start: u64,
+        request_end: u64,
+        result: &fuse::FileLock,
+    ) -> bool {
+        locks.iter().any(|lock| {
+            lock_conflicts(lock, owner, kind, request_start, request_end)
+                && lock_kind_to_fuse(lock.kind) as u32 == result.type_
+                && ranges_overlap(lock.start, lock.end, result.start, result.end)
+                && ranges_overlap(request_start, request_end, result.start, result.end)
+        })
+    }
+
+    fn model_unlock_owner_range(locks: &mut Vec<ModelLock>, owner: u64, start: u64, end: u64) {
+        let mut updated = Vec::new();
+        for lock in locks.drain(..) {
+            if lock.owner != owner || !ranges_overlap(lock.start, lock.end, start, end) {
+                updated.push(lock);
+                continue;
+            }
+            if lock.start < start {
+                updated.push(ModelLock {
+                    end: start - 1,
+                    ..lock.clone()
+                });
+            }
+            if end < lock.end {
+                updated.push(ModelLock {
+                    start: end + 1,
+                    ..lock
+                });
+            }
+        }
+        *locks = updated;
+    }
+
+    fn model_set_lock(
+        locks: &mut Vec<ModelLock>,
+        owner: u64,
+        kind: LockKind,
+        start: u64,
+        end: u64,
+    ) -> bool {
+        if kind != LockKind::Unlock && model_conflict(locks, owner, kind, start, end).is_some() {
+            return false;
+        }
+        model_unlock_owner_range(locks, owner, start, end);
+        if kind != LockKind::Unlock {
+            locks.push(ModelLock {
+                owner,
+                kind,
+                start,
+                end,
+            });
+        }
+        true
+    }
+
+    fn run_lock_ops_case(case_name: &str, generated_ops: &[LockStressOp]) {
+        let test_dir = TestDir::new(case_name);
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let file = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup file");
+        let (handle, _options) = fs
+            .open(ctx(), file.inode, false, libc::O_RDWR as u32)
+            .expect("open file");
+        let handle = handle.expect("handle");
+        let mut model = Vec::new();
+        let mut trace = Vec::new();
+
+        for (step, op) in generated_ops.iter().enumerate() {
+            match *op {
+                LockStressOp::Set {
+                    owner,
+                    kind,
+                    start,
+                    len,
+                } => {
+                    let end = start + len - 1;
+                    trace.push(format!(
+                        "{step}: set owner={owner} kind={kind:?} {start}..={end}"
+                    ));
+                    let mut expected_model = model.clone();
+                    let expected_ok = model_set_lock(&mut expected_model, owner, kind, start, end);
+                    let result = fs.setlk(
+                        ctx(),
+                        file.inode,
+                        handle,
+                        owner,
+                        fuse_byte_lock(lock_kind_to_fuse(kind), start, len),
+                        0,
+                    );
+                    if expected_ok {
+                        result.unwrap_or_else(|error| {
+                            panic!(
+                                "setlk failed unexpectedly: {error}\noperation trace:\n{}",
+                                trace.join("\n")
+                            )
+                        });
+                        model_set_lock(&mut model, owner, kind, start, end);
+                    } else {
+                        let error = result.expect_err("conflicting setlk should fail");
+                        assert_lock_conflict(error, "proptest setlk conflict");
+                    }
+                }
+                LockStressOp::Get {
+                    owner,
+                    kind,
+                    start,
+                    len,
+                } => {
+                    let end = start + len - 1;
+                    trace.push(format!(
+                        "{step}: get owner={owner} kind={kind:?} {start}..={end}"
+                    ));
+                    let has_expected_conflict =
+                        model_conflict(&model, owner, kind, start, end).is_some();
+                    let result = fs
+                        .getlk(
+                            ctx(),
+                            file.inode,
+                            handle,
+                            owner,
+                            fuse_byte_lock(lock_kind_to_fuse(kind), start, len),
+                            0,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "getlk failed unexpectedly: {error}\noperation trace:\n{}",
+                                trace.join("\n")
+                            )
+                        });
+                    if has_expected_conflict {
+                        assert_ne!(
+                            result.type_,
+                            libc::F_UNLCK as u32,
+                            "getlk missed conflict\noperation trace:\n{}",
+                            trace.join("\n")
+                        );
+                        assert!(
+                                model_has_conflict_matching_result(
+                                    &model,
+                                    owner,
+                                    kind,
+                                    start,
+                                    end,
+                                    &result
+                                ),
+                                "getlk conflict {result:?} did not match any model conflict\noperation trace:\n{}",
+                                trace.join("\n")
+                            );
+                    } else {
+                        assert_eq!(
+                            result.type_,
+                            libc::F_UNLCK as u32,
+                            "getlk reported unexpected conflict {result:?}\noperation trace:\n{}",
+                            trace.join("\n")
+                        );
+                    }
+                }
+                LockStressOp::Flush { owner } => {
+                    trace.push(format!("{step}: flush owner={owner}"));
+                    fs.flush(ctx(), file.inode, handle, owner)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "flush failed unexpectedly: {error}\noperation trace:\n{}",
+                                trace.join("\n")
+                            )
+                        });
+                    model.retain(|lock| lock.owner != owner);
+                }
+            }
+        }
     }
 
     fn nested_path(index: usize) -> &'static str {
@@ -3617,7 +4274,7 @@ mod tests {
     }
 
     #[test]
-    fn init_does_not_advertise_posix_locks_and_lock_ops_fail_explicitly() {
+    fn init_advertises_posix_locks_when_guest_offers_them() {
         let test_dir = TestDir::new("lock-policy");
         let root = test_dir.path.join("root");
         fs::create_dir(&root).expect("create root");
@@ -3634,10 +4291,481 @@ mod tests {
             .init(FsOptions::BIG_WRITES | FsOptions::POSIX_LOCKS)
             .expect("init");
         assert!(options.contains(FsOptions::BIG_WRITES));
-        assert!(!options.contains(FsOptions::POSIX_LOCKS));
-        assert_eq!(raw_error(fs.getlk(), "getlk"), Some(libc::EOPNOTSUPP));
-        assert_eq!(raw_error(fs.setlk(), "setlk"), Some(libc::EOPNOTSUPP));
-        assert_eq!(raw_error(fs.setlkw(), "setlkw"), Some(libc::EOPNOTSUPP));
+        assert!(options.contains(FsOptions::POSIX_LOCKS));
+    }
+
+    #[test]
+    fn ofd_locks_conflict_with_host_posix_locks_across_processes() {
+        let test_dir = TestDir::new("ofd-posix-conflict");
+        let path = test_dir.path.join("db.sqlite");
+        fs::write(&path, b"sqlite-lock-probe").expect("write probe");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open probe");
+
+        fcntl_lock(
+            file.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 1),
+        )
+        .expect("set ofd lock");
+        assert!(
+            child_posix_write_lock_conflicts(&path),
+            "host POSIX lock unexpectedly ignored existing OFD lock"
+        );
+        fcntl_lock(
+            file.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_UNLCK, 0, 1),
+        )
+        .expect("unlock ofd lock");
+    }
+
+    #[test]
+    fn separate_ofd_descriptions_model_distinct_guest_lock_owners() {
+        let test_dir = TestDir::new("ofd-owner-model");
+        let path = test_dir.path.join("state.sqlite");
+        fs::write(&path, b"sqlite-lock-probe").expect("write probe");
+        let owner_a = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open owner a");
+        let owner_b = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open owner b");
+
+        fcntl_lock(
+            owner_a.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 8),
+        )
+        .expect("set owner a lock");
+        let conflict = fcntl_lock(
+            owner_b.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 8),
+        )
+        .expect_err("owner b should conflict");
+        assert_lock_conflict(conflict, "owner b OFD lock");
+
+        // Closing a duplicate of owner A must not release the lock while owner A remains open.
+        // SAFETY: dup is called on a valid fd and the result is checked below.
+        let dup = unsafe { libc::dup(owner_a.as_raw_fd()) };
+        assert!(dup >= 0, "dup failed: {}", io::Error::last_os_error());
+        // SAFETY: dup returned a new fd owned by this test.
+        assert_eq!(unsafe { libc::close(dup) }, 0, "close dup failed");
+        let conflict = fcntl_lock(
+            owner_b.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 8),
+        )
+        .expect_err("closing a dup should not release owner a lock");
+        assert_lock_conflict(conflict, "owner b after dup close");
+
+        fcntl_lock(
+            owner_a.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_UNLCK, 0, 8),
+        )
+        .expect("unlock owner a");
+        fcntl_lock(
+            owner_b.as_raw_fd(),
+            libc::F_OFD_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 8),
+        )
+        .expect("owner b lock after owner a unlock");
+    }
+
+    #[test]
+    fn composed_lock_bridge_conflicts_guest_owners_and_host_posix_locks() {
+        let test_dir = TestDir::new("lock-bridge-conflict");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+
+        let mut guest_pid_lock = fuse_byte_lock(libc::F_WRLCK, 0, 1);
+        guest_pid_lock.pid = 1234;
+        fs.setlk(ctx(), db.inode, handle, 10, guest_pid_lock, 0)
+            .expect("owner 10 write lock");
+        let conflict = fs
+            .setlk(
+                ctx(),
+                db.inode,
+                handle,
+                20,
+                fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                0,
+            )
+            .expect_err("owner 20 should conflict");
+        assert_lock_conflict(conflict, "guest owner 20");
+
+        let getlk = fs
+            .getlk(
+                ctx(),
+                db.inode,
+                handle,
+                20,
+                fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                0,
+            )
+            .expect("getlk");
+        assert_eq!(getlk.type_, libc::F_WRLCK as u32);
+        assert_eq!(getlk.start, 0);
+        assert_eq!(getlk.end, 0);
+        assert!(
+            child_posix_write_lock_conflicts(&root.join("state.sqlite")),
+            "host POSIX lock unexpectedly ignored composed-fs OFD lock"
+        );
+
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            10,
+            fuse_byte_lock(libc::F_UNLCK, 0, 1),
+            0,
+        )
+        .expect("owner 10 unlock");
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            20,
+            fuse_byte_lock(libc::F_WRLCK, 0, 1),
+            0,
+        )
+        .expect("owner 20 lock after unlock");
+        fs.release(ctx(), db.inode, 0, handle, false, false, None)
+            .expect("release");
+    }
+
+    #[test]
+    fn composed_lock_bridge_flush_and_release_cleanup_owner_locks() {
+        let test_dir = TestDir::new("lock-bridge-cleanup");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            10,
+            fuse_byte_lock(libc::F_WRLCK, 0, 1),
+            0,
+        )
+        .expect("owner 10 lock");
+        fs.flush(ctx(), db.inode, handle, 10)
+            .expect("flush owner 10");
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            20,
+            fuse_byte_lock(libc::F_WRLCK, 0, 1),
+            0,
+        )
+        .expect("owner 20 lock after flush");
+        fs.release(ctx(), db.inode, 0, handle, false, false, None)
+            .expect("release");
+
+        let host = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(root.join("state.sqlite"))
+            .expect("open host");
+        fcntl_lock(
+            host.as_raw_fd(),
+            libc::F_SETLK,
+            byte_lock(libc::F_WRLCK, 0, 1),
+        )
+        .expect("host POSIX lock after release");
+    }
+
+    #[test]
+    fn composed_lock_bridge_supports_shared_reads_and_write_exclusion() {
+        let test_dir = TestDir::new("lock-bridge-shared-read");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_RDLCK, 0, 8),
+            0,
+        )
+        .expect("owner 1 read lock");
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            2,
+            fuse_byte_lock(libc::F_RDLCK, 0, 8),
+            0,
+        )
+        .expect("owner 2 read lock");
+        let conflict = fs
+            .setlk(
+                ctx(),
+                db.inode,
+                handle,
+                3,
+                fuse_byte_lock(libc::F_WRLCK, 0, 8),
+                0,
+            )
+            .expect_err("write lock should conflict with shared readers");
+        assert_lock_conflict(conflict, "write over shared reads");
+    }
+
+    #[test]
+    fn composed_lock_bridge_preserves_locks_after_subrange_unlock() {
+        let test_dir = TestDir::new("lock-bridge-subrange");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_WRLCK, 0, 10),
+            0,
+        )
+        .expect("owner 1 write lock");
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_UNLCK, 3, 2),
+            0,
+        )
+        .expect("owner 1 subrange unlock");
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            2,
+            fuse_byte_lock(libc::F_WRLCK, 3, 2),
+            0,
+        )
+        .expect("owner 2 lock in unlocked gap");
+        let conflict = fs
+            .setlk(
+                ctx(),
+                db.inode,
+                handle,
+                2,
+                fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                0,
+            )
+            .expect_err("owner 1 should still hold bytes outside the unlocked gap");
+        assert_lock_conflict(conflict, "lock outside subrange gap");
+    }
+
+    #[test]
+    fn composed_lock_bridge_setlkw_waits_for_unlock() {
+        let test_dir = TestDir::new("lock-bridge-setlkw");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+        let inode = db.inode;
+
+        fs.setlk(
+            ctx(),
+            inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_WRLCK, 0, 1),
+            0,
+        )
+        .expect("owner 1 write lock");
+        let waiter_fs = fs.clone();
+        let waiter = thread::spawn(move || {
+            waiter_fs
+                .setlkw(
+                    ctx(),
+                    inode,
+                    handle,
+                    2,
+                    fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                    0,
+                )
+                .expect("blocking owner 2 lock")
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "SETLKW returned before unlock");
+        fs.setlk(
+            ctx(),
+            inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_UNLCK, 0, 1),
+            0,
+        )
+        .expect("owner 1 unlock");
+        waiter.join().expect("waiter thread");
+    }
+
+    #[test]
+    fn composed_lock_bridge_observes_host_held_posix_locks() {
+        let test_dir = TestDir::new("lock-bridge-host-held");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        let host_path = root.join("state.sqlite");
+        fs::write(&host_path, b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDWR as u32)
+            .expect("open db");
+        let handle = handle.expect("handle");
+        let _host_lock = child_hold_posix_write_lock(&host_path, 0, 1);
+
+        let conflict = fs
+            .setlk(
+                ctx(),
+                db.inode,
+                handle,
+                1,
+                fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                0,
+            )
+            .expect_err("guest write lock should conflict with host POSIX lock");
+        assert_lock_conflict(conflict, "guest over host POSIX");
+    }
+
+    #[test]
+    fn composed_lock_bridge_respects_readonly_handles() {
+        let test_dir = TestDir::new("lock-bridge-readonly");
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write db");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+        let db = lookup(&fs, workspace.inode, "state.sqlite").expect("lookup db");
+        let (handle, _options) = fs
+            .open(ctx(), db.inode, false, libc::O_RDONLY as u32)
+            .expect("open db readonly");
+        let handle = handle.expect("handle");
+
+        fs.setlk(
+            ctx(),
+            db.inode,
+            handle,
+            1,
+            fuse_byte_lock(libc::F_RDLCK, 0, 1),
+            0,
+        )
+        .expect("read lock through readonly handle");
+        assert_eq!(
+            raw_error(
+                fs.setlk(
+                    ctx(),
+                    db.inode,
+                    handle,
+                    1,
+                    fuse_byte_lock(libc::F_WRLCK, 0, 1),
+                    0,
+                ),
+                "write lock through readonly handle",
+            ),
+            Some(libc::EBADF)
+        );
     }
 
     #[test]
@@ -4809,6 +5937,39 @@ mod tests {
                 Ok(())
             })
             .expect("stress proptest nested operation sequence");
+    }
+
+    #[test]
+    fn proptest_lock_operation_sequences_cover_owner_and_range_interleavings() {
+        let mut runner = TestRunner::new(Config {
+            cases: 96,
+            max_shrink_iters: 4096,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&lock_stress_ops(96), |ops| {
+                run_lock_ops_case("proptest-lock-sequence", &ops);
+                Ok(())
+            })
+            .expect("proptest lock operation sequence");
+    }
+
+    #[test]
+    #[ignore = "property stress: run explicitly with `cargo test --manifest-path composed-fs/Cargo.toml --offline proptest_lock_operation_sequences_stress -- --ignored --nocapture`"]
+    fn proptest_lock_operation_sequences_stress() {
+        let mut runner = TestRunner::new(Config {
+            cases: 512,
+            max_shrink_iters: 8192,
+            failure_persistence: Some(Box::new(FileFailurePersistence::Off)),
+            ..Config::default()
+        });
+        runner
+            .run(&lock_stress_ops(320), |ops| {
+                run_lock_ops_case("proptest-lock-sequence-stress", &ops);
+                Ok(())
+            })
+            .expect("stress proptest lock operation sequence");
     }
 
     #[test]

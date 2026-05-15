@@ -79,8 +79,15 @@ Prerequisites:
 The live tier validates the real QEMU stream network, payload-control listener,
 published payload port, composed virtiofs workspace, guest config filesystem,
 MITM CA bundle exposure without private key exposure, guest DNS lookup,
-SQLite/WAL activity under guest `$HOME`, Docker CLI, and Docker bind-mounted
+SQLite/WAL activity under guest `$HOME`, concurrent host+guest SQLite WAL
+writes against the same workspace database, Docker CLI, and Docker bind-mounted
 workspace.
+
+For the SQLite concurrency check, the self-test creates
+`.agentvm-self-test-sqlite/state.sqlite`, starts a host `python3 sqlite3`
+worker, and runs a guest `python3 sqlite3` worker against the same database.
+The run is valid only if both sides write 200 rows and a final
+`PRAGMA integrity_check` returns `ok`.
 
 ## Interactive TUI Smoke
 
@@ -157,6 +164,12 @@ points to:
 UDP denials, unsupported protocol classifications, TCP policy/setup failures,
 HTTP/TLS proxy events, TLS MITM failures, upstream failures, and host-ingress
 events. It must not contain CA private key material.
+
+If the source guest scripts changed but `docker/out/rootfs.raw` has not been
+rebuilt, live payload behavior may not match the working tree. For lock
+validation during development, a temporary rootfs copy can be patched with
+`debugfs` and referenced by a temporary artifact manifest; do not treat that as
+a replacement for rebuilding `docker/out` before release.
 
 For filesystem failures, preserve the generated manifests and any operation
 trace from the failing test. The trace is part of the repro and should be added
