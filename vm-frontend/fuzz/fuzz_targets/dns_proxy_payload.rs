@@ -37,4 +37,3 @@ fuzz_target!(|data: &[u8]| {
         assert!(response.len() <= 4096);
     }
 });
-

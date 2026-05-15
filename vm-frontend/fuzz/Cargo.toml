@@ -8,7 +8,7 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-agentvm-composed-fs = { path = "../../composed-fs" }
+agentvm-composed-fs = { path = "../../composed-fs", features = ["fuzzing"] }
 agentvm-frontend = { path = ".." }
 hickory-proto = "0.26.1"
 libfuzzer-sys = "0.4"
@@ -38,6 +38,20 @@ bench = false
 [[bin]]
 name = "composed_manifest_shape"
 path = "fuzz_targets/composed_manifest_shape.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "composed_fs_ops"
+path = "fuzz_targets/composed_fs_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "composed_fs_locks"
+path = "fuzz_targets/composed_fs_locks.rs"
 test = false
 doc = false
 bench = false

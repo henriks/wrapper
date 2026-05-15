@@ -23,4 +23,3 @@ fuzz_target!(|data: &[u8]| {
         assert!(gateway.active_tcp_sessions().is_empty());
     }
 });
-

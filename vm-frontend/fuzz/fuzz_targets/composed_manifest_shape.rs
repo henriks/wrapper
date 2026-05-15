@@ -8,4 +8,3 @@ fuzz_target!(|data: &[u8]| {
         let _ = validate_manifest_json_shape(text);
     }
 });
-

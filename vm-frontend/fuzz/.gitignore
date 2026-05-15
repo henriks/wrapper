@@ -1,3 +1,6 @@
 artifacts/
+corpus/*/[0-9a-f]*
+fuzz-*.log
+logs/
+run-corpus/
 target/
-

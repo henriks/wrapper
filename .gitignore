@@ -3,3 +3,4 @@
 __pycache__/
 composed-fs/target/
 vm-frontend/target/
+vm-frontend/fuzz-*.log

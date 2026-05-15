@@ -2413,6 +2413,9 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzz_harness;
+
 #[cfg(test)]
 mod test_support;
 

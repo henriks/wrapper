@@ -1,4 +1,5 @@
 use std::net::{SocketAddr, UdpSocket};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use hickory_proto::op::{Message, Metadata, ResponseCode};
@@ -22,7 +23,19 @@ where
     }
 
     pub fn handle_udp_payload(&self, payload: &[u8]) -> DnsProxyResult {
-        let query = match Message::from_vec(payload) {
+        if payload_has_resource_records(payload) {
+            return DnsProxyResult {
+                response: None,
+                log: DnsLogEntry {
+                    domain: None,
+                    decision: DnsDecision::Malformed,
+                    detail: "DNS query payload must not contain resource record sections"
+                        .to_string(),
+                },
+            };
+        }
+
+        let query = match parse_message(payload) {
             Ok(query) => query,
             Err(error) => {
                 return DnsProxyResult {
@@ -30,7 +43,7 @@ where
                     log: DnsLogEntry {
                         domain: None,
                         decision: DnsDecision::Malformed,
-                        detail: error.to_string(),
+                        detail: error,
                     },
                 };
             }
@@ -112,7 +125,7 @@ impl DnsUpstream for UdpDnsUpstream {
             .recv_from(&mut response)
             .map_err(|_| DnsUpstreamError::Unavailable)?;
         response.truncate(len);
-        Message::from_vec(&response).map_err(|_| DnsUpstreamError::InvalidResponse)
+        parse_message(&response).map_err(|_| DnsUpstreamError::InvalidResponse)
     }
 }
 
@@ -202,6 +215,23 @@ fn query_domain(query: &Message) -> Option<String> {
             .trim_end_matches('.')
             .to_ascii_lowercase(),
     )
+}
+
+fn payload_has_resource_records(payload: &[u8]) -> bool {
+    if payload.len() < 12 {
+        return false;
+    }
+    u16::from_be_bytes([payload[6], payload[7]]) != 0
+        || u16::from_be_bytes([payload[8], payload[9]]) != 0
+        || u16::from_be_bytes([payload[10], payload[11]]) != 0
+}
+
+fn parse_message(payload: &[u8]) -> Result<Message, String> {
+    match catch_unwind(AssertUnwindSafe(|| Message::from_vec(payload))) {
+        Ok(Ok(message)) => Ok(message),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("DNS parser panicked on malformed payload".to_string()),
+    }
 }
 
 fn error_response(query: &Message, code: ResponseCode) -> Message {
@@ -496,6 +526,51 @@ mod tests {
 
         assert_eq!(result.response, None);
         assert_eq!(result.log.decision, DnsDecision::Malformed);
+    }
+
+    #[test]
+    fn dns_parser_panic_payload_is_logged_as_malformed() {
+        let policy = policy_allowing("example.com");
+        let proxy = DnsProxy::new(
+            &policy,
+            StaticUpstream {
+                result: Ok(empty_success_response(0x1234, "example.com")),
+            },
+        );
+        let payload = [
+            0x0b, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00,
+            0xfa, 0xff, 0xf6, 0x5c, 0x99, 0x99, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x20, 0x09, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0xfa, 0x0c, 0x00,
+        ];
+
+        let result = proxy.handle_udp_payload(&payload);
+
+        assert_eq!(result.response, None);
+        assert_eq!(result.log.decision, DnsDecision::Malformed);
+    }
+
+    #[test]
+    fn dns_resource_record_payload_is_rejected_before_parser() {
+        let policy = policy_allowing("example.com");
+        let proxy = DnsProxy::new(
+            &policy,
+            StaticUpstream {
+                result: Ok(empty_success_response(0x1234, "example.com")),
+            },
+        );
+        let payload = [
+            11, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 255, 0, 0, 250, 255, 254, 0, 1, 0, 0, 0, 1, 0, 0, 32,
+            9, 0, 0, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 0, 0, 0, 0, 44, 0,
+        ];
+
+        let result = proxy.handle_udp_payload(&payload);
+
+        assert_eq!(result.response, None);
+        assert_eq!(result.log.decision, DnsDecision::Malformed);
+        assert_eq!(
+            result.log.detail,
+            "DNS query payload must not contain resource record sections"
+        );
     }
 
     #[test]
