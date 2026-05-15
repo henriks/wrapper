@@ -143,7 +143,12 @@ impl FrontendConfig {
     ) -> Result<Self, launch::LaunchError> {
         let project = project.into();
         let manifest_path = artifact_manifest.as_ref();
-        let text = std::fs::read_to_string(manifest_path).map_err(launch::LaunchError::Io)?;
+        let text = std::fs::read_to_string(manifest_path).map_err(|error| {
+            launch::LaunchError::Artifact(format!(
+                "failed to read artifact manifest {}: {error}",
+                manifest_path.display()
+            ))
+        })?;
         let manifest: launch::ArtifactManifest =
             serde_json::from_str(&text).map_err(launch::LaunchError::Json)?;
         let repo_root = manifest_path
@@ -408,6 +413,27 @@ mod tests {
             guest_http_smoke_url: None,
             upstream_mappings: Vec::new(),
         }
+    }
+
+    #[test]
+    fn missing_artifact_manifest_error_names_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let manifest = temp.path().join("missing-artifact-manifest.json");
+
+        let error = FrontendConfig::from_artifact_manifest_file(
+            temp.path().join("repo"),
+            temp.path().join("run"),
+            "qemu-system-x86_64",
+            &manifest,
+        )
+        .expect_err("missing manifest should fail")
+        .to_string();
+
+        assert!(
+            error.contains("failed to read artifact manifest"),
+            "{error}"
+        );
+        assert!(error.contains(&manifest.display().to_string()), "{error}");
     }
 
     #[test]

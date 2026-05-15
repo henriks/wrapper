@@ -218,6 +218,7 @@ where
                 continue;
             }
             if readiness.writable(active.handle) {
+                flush_pending_https_plaintext(session, active.handle, &mut events);
                 drain_upstream_tls_writes(session, active.handle, &mut events);
                 flush_pending_upstream_bytes(session, active.handle, &mut events);
             }
@@ -948,7 +949,7 @@ mod tests {
     use crate::vmnet_gateway::{GuestFrameOutcome, VmnetGateway};
     use crate::GuestNetwork;
     use rustls::pki_types::ServerName;
-    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
     use smoltcp::phy::ChecksumCapabilities;
     use smoltcp::wire::{
         EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
@@ -1324,6 +1325,122 @@ mod tests {
     }
 
     #[test]
+    fn https_reused_connection_flushes_pending_plaintext_when_upstream_becomes_writable() {
+        let ca = TestCa::new("tcp-proxy-https-reused-connection");
+        let authority = Arc::new(ca.authority());
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.ca_cert()).expect("root");
+        let upstream_server_config = test_tls_server_config(&authority, "example.com");
+        let mut bridge = TcpProxyBridge::with_tls_mitm_and_client_config(
+            TlsServerConnector {
+                server_config: upstream_server_config,
+            },
+            authority.clone(),
+            Arc::new(rustls_client_config_with_roots(roots.clone()).expect("proxy client config")),
+        )
+        .expect("bridge");
+        let (mut gateway, server_ack) = configured_https_gateway(&ca);
+        let mut guest_client = ClientConnection::new(
+            guest_client_config(roots),
+            ServerName::try_from("example.com")
+                .expect("server name")
+                .to_owned(),
+        )
+        .expect("guest client");
+        let mut guest_seq = 101_i32;
+        let mut clock = 4_i64;
+
+        send_guest_tls_to_proxy(
+            &mut guest_client,
+            &mut gateway,
+            &mut bridge,
+            server_ack,
+            &mut guest_seq,
+            &mut clock,
+        );
+        assert!(!guest_client.is_handshaking());
+
+        guest_client
+            .writer()
+            .write_all(b"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .expect("first request");
+        let first_events = send_guest_tls_to_proxy(
+            &mut guest_client,
+            &mut gateway,
+            &mut bridge,
+            server_ack,
+            &mut guest_seq,
+            &mut clock,
+        );
+        assert!(first_events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::GuestPayload { bytes, .. } if *bytes > 0)));
+        let handle = bridge.session_handles().pop().expect("proxy session");
+        let session = bridge.sessions.get(&handle).expect("session");
+        assert_eq!(session.connection.request_count, 1);
+        assert!(session.connection.requests[0].starts_with("GET /first "));
+
+        guest_client
+            .writer()
+            .write_all(b"GET /second HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .expect("second request");
+        let second_tls = drain_guest_client_tls(&mut guest_client);
+        assert!(!second_tls.is_empty());
+        gateway.handle_guest_frame(
+            tcp_frame(
+                443,
+                TcpControl::Psh,
+                TcpSeqNumber(guest_seq),
+                Some(server_ack),
+                &second_tls,
+            ),
+            Instant::from_millis(clock),
+        );
+        clock += 1;
+
+        let not_writable_events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(clock),
+            TcpProxyReadiness::selected(Vec::new(), Vec::new()),
+        );
+        clock += 1;
+        assert!(not_writable_events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::HttpRequest { summary, .. }
+                if summary.host.as_deref() == Some("example.com")
+        )));
+        let session = bridge.sessions.get(&handle).expect("session");
+        assert_eq!(
+            session.connection.request_count, 1,
+            "second request must not be written while upstream is not writable"
+        );
+        assert!(
+            !session.pending_upstream_plaintext.is_empty(),
+            "second HTTPS plaintext should be queued for upstream writable readiness"
+        );
+        assert_eq!(
+            bridge.session_interest(handle),
+            Some(UpstreamSessionInterest {
+                readable: true,
+                writable: true,
+            })
+        );
+
+        let writable_events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(clock),
+            TcpProxyReadiness::selected(Vec::new(), vec![handle]),
+        );
+        assert!(writable_events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::GuestPayload { bytes, .. } if *bytes > 0)));
+        let session = bridge.sessions.get(&handle).expect("session");
+        assert!(session.pending_upstream_plaintext.is_empty());
+        assert_eq!(session.connection.request_count, 2);
+        assert!(session.connection.requests[1].starts_with("GET /second "));
+    }
+
+    #[test]
     fn https_guest_without_sni_fails_before_upstream_connect() {
         let ca = TestCa::new("tcp-proxy-https-nosni");
         let authority = Arc::new(ca.authority());
@@ -1442,6 +1559,79 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct TlsServerConnector {
+        server_config: Arc<ServerConfig>,
+    }
+
+    impl TcpUpstreamConnector for TlsServerConnector {
+        type Connection = TlsServerConnection;
+
+        fn connect(
+            &self,
+            _destination: &TcpDestination,
+        ) -> Result<Self::Connection, TcpConnectError> {
+            Ok(TlsServerConnection {
+                server: ServerConnection::new(self.server_config.clone()).expect("tls server"),
+                response_tls: Vec::new(),
+                plaintext_buffer: Vec::new(),
+                requests: Vec::new(),
+                request_count: 0,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct TlsServerConnection {
+        server: ServerConnection,
+        response_tls: Vec<u8>,
+        plaintext_buffer: Vec<u8>,
+        requests: Vec<String>,
+        request_count: usize,
+    }
+
+    impl Read for TlsServerConnection {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.response_tls.is_empty() {
+                return Err(io::Error::from(ErrorKind::WouldBlock));
+            }
+            let count = self.response_tls.len().min(buf.len());
+            buf[..count].copy_from_slice(&self.response_tls[..count]);
+            self.response_tls.drain(..count);
+            Ok(count)
+        }
+    }
+
+    impl Write for TlsServerConnection {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut reader = buf;
+            self.server.read_tls(&mut reader)?;
+            self.server
+                .process_new_packets()
+                .map_err(|error| io::Error::new(ErrorKind::InvalidData, error.to_string()))?;
+            self.response_tls
+                .extend(drain_tls_server(&mut self.server)?);
+            read_tls_server_plaintext(&mut self.server, &mut self.plaintext_buffer)?;
+            while let Some(end) = http_header_end(&self.plaintext_buffer) {
+                let request = self.plaintext_buffer[..end].to_vec();
+                self.plaintext_buffer.drain(..end);
+                self.request_count += 1;
+                self.requests
+                    .push(String::from_utf8_lossy(&request).to_string());
+                self.server
+                    .writer()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")?;
+                self.response_tls
+                    .extend(drain_tls_server(&mut self.server)?);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
     struct FailingConnector;
 
     impl TcpUpstreamConnector for FailingConnector {
@@ -1553,6 +1743,54 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn test_tls_server_config(authority: &TlsMitmAuthority, host: &str) -> Arc<ServerConfig> {
+        let generated = authority
+            .generate_server_certificate(host)
+            .expect("server cert");
+        Arc::new(
+            ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_protocol_versions(rustls::DEFAULT_VERSIONS)
+                .expect("versions")
+                .with_no_client_auth()
+                .with_single_cert(generated.cert_chain, generated.private_key)
+                .expect("server config"),
+        )
+    }
+
+    fn read_tls_server_plaintext(
+        server: &mut ServerConnection,
+        output: &mut Vec<u8>,
+    ) -> io::Result<()> {
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            match server.reader().read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(count) => output.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn drain_tls_server(server: &mut ServerConnection) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        while server.wants_write() {
+            let before = output.len();
+            server.write_tls(&mut output)?;
+            if output.len() == before {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
+    fn http_header_end(buffer: &[u8]) -> Option<usize> {
+        buffer
+            .windows(b"\r\n\r\n".len())
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + b"\r\n\r\n".len())
     }
 
     fn send_guest_tls_to_proxy<C>(

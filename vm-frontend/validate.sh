@@ -22,6 +22,8 @@ tiers:
   stress      Run opt-in ignored stress/property tests.
   all-local   Run docs, fmt, guest-services, fuzz-check, fast, and stress tiers; does not boot QEMU.
   live-smoke  Run the quick KVM/QEMU self-test required by the gate.
+  live-setup-tools
+              Run setup-tool bootstrap/persistence KVM scenarios for agent CLIs.
   live-hostile
               Run a slower hostile/no-net KVM scenario (uses HOSTILE_IMAGE or IMAGE).
   live-payload
@@ -45,6 +47,7 @@ live environment overrides:
   DOCKER_IMAGE=alpine:3.22
   DOCKER_PUBLISH_HOST_PORT=12080
   DOCKER_PUBLISH_GUEST_PORT=18080
+  SETUP_TOOL_SMOKE_PROJECT=.sandbox/setup-tool-smoke/codex
 EOF
 }
 
@@ -161,6 +164,69 @@ live_smoke() {
     --publish-payload-port "${publish_port}"
 }
 
+live_setup_tools() {
+  require_kvm
+  local qemu="${QEMU:-/usr/bin/qemu-system-x86_64}"
+  local project="${SETUP_TOOL_SMOKE_PROJECT:-${ROOT}/.sandbox/setup-tool-smoke/codex}"
+  local agentvm="${ROOT}/vm-frontend/target/debug/agentvm"
+  announce "live-setup-tools: building agentvm wrapper"
+  cargo build --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm
+
+  rm -rf "${project}"
+  mkdir -p "${project}/.sandbox"
+  cat >"${project}/.sandbox/config.json" <<EOF
+{
+  "schema_version": 2,
+  "setup_tool": "codex",
+  "default_command": { "command": "codex", "args": ["--version"] },
+  "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
+  "auth": { "github": false, "aws_profile": null },
+  "shares": [],
+  "published_ports": []
+}
+EOF
+
+  local bootstrap_log="${project}/.sandbox/codex-bootstrap.log"
+  announce "live-setup-tools: codex bootstrap over public egress/TLS MITM"
+  "${agentvm}" \
+    --project "${project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-tui 2>&1 | tee "${bootstrap_log}"
+  grep -Fq "codex-cli" "${bootstrap_log}" || {
+    echo "error: codex bootstrap did not print codex-cli version" >&2
+    exit 1
+  }
+
+  local restart_log="${project}/.sandbox/codex-no-net-restart.log"
+  announce "live-setup-tools: codex no-net restart from persisted guest state"
+  "${agentvm}" \
+    --project "${project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-tui \
+    --no-net 2>&1 | tee "${restart_log}"
+  grep -Fq "codex-cli" "${restart_log}" || {
+    echo "error: codex persisted no-net restart did not print codex-cli version" >&2
+    exit 1
+  }
+
+  local metadata_log="${project}/.sandbox/codex-metadata.log"
+  announce "live-setup-tools: codex optional package metadata survived payload shutdown"
+  "${agentvm}" launch \
+    --project "${project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-net \
+    --payload-no-stdin \
+    --payload-script 'set -e; pkg="$HOME/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; codex --version' \
+    2>&1 | tee "${metadata_log}"
+  grep -Fq "codex-cli" "${metadata_log}" || {
+    echo "error: codex metadata verification did not print codex-cli version" >&2
+    exit 1
+  }
+}
+
 live_hostile() {
   require_kvm
   local saved_image="${IMAGE-}"
@@ -264,6 +330,7 @@ live_full() {
   live_payload
   live_dns
   live_docker
+  live_setup_tools
   live_fs
   live_persistence
 }
@@ -275,6 +342,7 @@ required() {
   guest_services
   fuzz_check
   live_smoke
+  live_setup_tools
 }
 
 case "${1:-}" in
@@ -294,6 +362,7 @@ case "${1:-}" in
     stress
     ;;
   live|host-live|live-smoke) live_smoke ;;
+  live-setup-tools) live_setup_tools ;;
   live-hostile) live_hostile ;;
   live-payload) live_payload ;;
   live-dns) live_dns ;;

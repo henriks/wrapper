@@ -20,8 +20,8 @@ use agentvm_frontend::network_policy::{
     EgressAction, EgressReason, HostListener, HostListenerPurpose, VmnetPolicy,
 };
 use agentvm_frontend::payload_client::{
-    ping_payload, run_payload_tcp_with_control, socket_addr, terminal_size, PayloadControlOptions,
-    PayloadRequest,
+    ping_payload, run_diagnostic_tcp, run_payload_tcp_with_control, socket_addr, terminal_size,
+    DiagnosticRequest, PayloadControlOptions, PayloadRequest,
 };
 use agentvm_frontend::runtime_manifest::{guest_runtime_mounts, GuestShareSpec, RuntimeMount};
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
@@ -93,23 +93,35 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
             let script = config
                 .script
                 .ok_or_else(|| "--script is required unless --ping is set".to_string())?;
-            let request = PayloadRequest {
-                script,
-                cwd: config.cwd,
-                env: config.env,
-                rows: config.rows,
-                cols: config.cols,
+            let exit_code = if config.diagnostic {
+                let request = DiagnosticRequest {
+                    script,
+                    cwd: config.cwd,
+                    env: config.env,
+                    timeout_seconds: config.timeout_seconds,
+                    max_output_bytes: config.max_output_bytes,
+                };
+                run_diagnostic_tcp(addr, &request, &mut io::stdout())
+                    .map_err(|error| error.to_string())?
+            } else {
+                let request = PayloadRequest {
+                    script,
+                    cwd: config.cwd,
+                    env: config.env,
+                    rows: config.rows,
+                    cols: config.cols,
+                };
+                let input =
+                    (!config.no_stdin).then(|| Box::new(io::stdin()) as Box<dyn io::Read + Send>);
+                run_payload_tcp_with_control(
+                    addr,
+                    &request,
+                    input,
+                    &mut io::stdout(),
+                    PayloadControlOptions::interactive(),
+                )
+                .map_err(|error| error.to_string())?
             };
-            let input =
-                (!config.no_stdin).then(|| Box::new(io::stdin()) as Box<dyn io::Read + Send>);
-            let exit_code = run_payload_tcp_with_control(
-                addr,
-                &request,
-                input,
-                &mut io::stdout(),
-                PayloadControlOptions::interactive(),
-            )
-            .map_err(|error| error.to_string())?;
             std::process::exit(payload_exit_status(exit_code));
         }
         Some("self-test") => run_self_test(&args[1..]),
@@ -180,6 +192,9 @@ fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> Result<(), String> {
                 .map_err(|error| error.to_string())
             }
         };
+        if let Err(error) = flush_guest_filesystems(addr) {
+            eprintln!("warning: failed to flush guest filesystem before VM shutdown: {error}");
+        }
         running
             .terminate()
             .map_err(|error| format!("launch shutdown failed: {error}"))?;
@@ -1483,6 +1498,9 @@ struct PayloadClientConfig {
     rows: u16,
     cols: u16,
     no_stdin: bool,
+    diagnostic: bool,
+    timeout_seconds: u64,
+    max_output_bytes: u64,
 }
 
 fn payload_client_config_from_args(args: &[String]) -> Result<PayloadClientConfig, String> {
@@ -1516,6 +1534,25 @@ fn payload_client_config_from_args(args: &[String]) -> Result<PayloadClientConfi
             .transpose()?
             .unwrap_or(cols),
         no_stdin: matches.get_flag("no_stdin"),
+        diagnostic: matches.get_flag("diagnostic"),
+        timeout_seconds: matches
+            .get_one::<String>("timeout_seconds")
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| "invalid --timeout-seconds".to_string())
+            })
+            .transpose()?
+            .unwrap_or(10),
+        max_output_bytes: matches
+            .get_one::<String>("max_output_bytes")
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| "invalid --max-output-bytes".to_string())
+            })
+            .transpose()?
+            .unwrap_or(1024 * 1024),
     };
     if let Some(values) = matches.get_many::<String>("env") {
         for env in values {
@@ -1532,6 +1569,12 @@ fn payload_client_config_from_args(args: &[String]) -> Result<PayloadClientConfi
     if !config.ping && config.script.is_none() {
         return Err("--script is required unless --ping is set".to_string());
     }
+    if config.timeout_seconds == 0 {
+        return Err("--timeout-seconds must be positive".to_string());
+    }
+    if config.max_output_bytes == 0 {
+        return Err("--max-output-bytes must be positive".to_string());
+    }
 
     Ok(config)
 }
@@ -1542,6 +1585,11 @@ fn payload_client_clap_command() -> ClapCommand {
         .arg(Arg::new("port").long("port").value_name("PORT"))
         .arg(Arg::new("ping").long("ping").action(ArgAction::SetTrue))
         .arg(Arg::new("script").long("script").value_name("SCRIPT"))
+        .arg(
+            Arg::new("diagnostic")
+                .long("diagnostic")
+                .action(ArgAction::SetTrue),
+        )
         .arg(Arg::new("cwd").long("cwd").value_name("PATH"))
         .arg(
             Arg::new("env")
@@ -1551,6 +1599,16 @@ fn payload_client_clap_command() -> ClapCommand {
         )
         .arg(Arg::new("rows").long("rows").value_name("N"))
         .arg(Arg::new("cols").long("cols").value_name("N"))
+        .arg(
+            Arg::new("timeout_seconds")
+                .long("timeout-seconds")
+                .value_name("N"),
+        )
+        .arg(
+            Arg::new("max_output_bytes")
+                .long("max-output-bytes")
+                .value_name("N"),
+        )
         .arg(
             Arg::new("no_stdin")
                 .long("no-stdin")
@@ -1564,6 +1622,26 @@ fn payload_exit_status(exit_code: i32) -> i32 {
     } else {
         exit_code
     }
+}
+
+fn flush_guest_filesystems(addr: std::net::SocketAddr) -> Result<(), String> {
+    let request = guest_sync_diagnostic_request();
+    let mut output = Vec::new();
+    match run_diagnostic_tcp(addr, &request, &mut output) {
+        Ok(0) => Ok(()),
+        Ok(exit_code) => Err(format!(
+            "sync diagnostic exited with {exit_code}: {}",
+            String::from_utf8_lossy(&output).trim()
+        )),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn guest_sync_diagnostic_request() -> DiagnosticRequest {
+    let mut request = DiagnosticRequest::new("sync");
+    request.timeout_seconds = 10;
+    request.max_output_bytes = 4096;
+    request
 }
 
 #[derive(Debug, Default)]
@@ -1947,6 +2025,22 @@ fn check_published_container_port(host_port: u16) -> Result<(), String> {
     }))
 }
 
+const DEFAULT_ARTIFACT_MANIFEST_RELATIVE: &str = "docker/out/artifact-manifest.json";
+
+fn default_artifact_manifest_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(DEFAULT_ARTIFACT_MANIFEST_RELATIVE)
+}
+
+fn artifact_manifest_arg(matches: &ArgMatches) -> PathBuf {
+    matches
+        .get_one::<String>("artifact_manifest")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_artifact_manifest_path)
+}
+
 fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String> {
     let matches = parse_clap_matches(self_test_clap_command(), args)?;
     let mut config = SelfTestConfig {
@@ -1959,10 +2053,7 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
             .get_one::<String>("run_dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".sandbox/docker-vm/self-test")),
-        artifact_manifest: matches
-            .get_one::<String>("artifact_manifest")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("docker/out/artifact-manifest.json")),
+        artifact_manifest: artifact_manifest_arg(&matches),
         qemu: matches
             .get_one::<String>("qemu")
             .map(PathBuf::from)
@@ -2445,10 +2536,7 @@ fn frontend_config_from_args(args: &[String]) -> Result<(FrontendConfig, PolicyA
         .get_one::<String>("run_dir")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".sandbox/docker-vm/run"));
-    let artifact_manifest = matches
-        .get_one::<String>("artifact_manifest")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("docker/out/artifact-manifest.json"));
+    let artifact_manifest = artifact_manifest_arg(&matches);
     let qemu = matches
         .get_one::<String>("qemu")
         .map(PathBuf::from)
@@ -2719,7 +2807,7 @@ fn payload_launch_args(policy: &mut PolicyArgs) -> &mut PayloadLaunchArgs {
     let (rows, cols) = terminal_size();
     policy.payload.get_or_insert_with(|| PayloadLaunchArgs {
         script: String::new(),
-        cwd: "/".to_string(),
+        cwd: String::new(),
         env: BTreeMap::new(),
         rows,
         cols,
@@ -2728,10 +2816,17 @@ fn payload_launch_args(policy: &mut PolicyArgs) -> &mut PayloadLaunchArgs {
 }
 
 fn launch_payload_args(
-    _config: &FrontendConfig,
+    config: &FrontendConfig,
     policy: &PolicyArgs,
 ) -> Result<Option<PayloadLaunchArgs>, String> {
-    Ok(policy.payload.clone())
+    let mut payload = match policy.payload.clone() {
+        Some(payload) => payload,
+        None => return Ok(None),
+    };
+    if payload.cwd.is_empty() {
+        payload.cwd = config.project.display().to_string();
+    }
+    Ok(Some(payload))
 }
 
 fn runtime_mounts(
@@ -2943,7 +3038,8 @@ fn tool_bootstrap_payload_script(
         r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
         r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
         format!(
-            "if ! command -v {} >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --no-progress {}; fi",
+            "if ! command -v {} >/dev/null 2>&1 || ! {} --version >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --force --no-progress {}; fi",
+            shell_quote(cli),
             shell_quote(cli),
             shell_quote(&format!("agentvm: npm is required to install {cli} CLI")),
             shell_quote(&install_message),
@@ -3346,7 +3442,7 @@ fn print_usage() {
          prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--gh] [--aws PROFILE] [--ro PATH] [--rw PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--payload-script SCRIPT] [--payload-cwd PATH] [--payload-env KEY=VALUE] [--payload-no-stdin] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
          self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--no-net] [--hostile]\n\
          vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
-         payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin]"
+         payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--diagnostic] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin] [--timeout-seconds N] [--max-output-bytes N]"
     );
 }
 
@@ -3383,6 +3479,17 @@ mod tests {
         fn as_ref(&self) -> &Path {
             self.dir.path()
         }
+    }
+
+    #[test]
+    fn default_artifact_manifest_is_repo_relative_not_cwd_relative() {
+        assert_eq!(
+            default_artifact_manifest_path(),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("vm-frontend parent")
+                .join("docker/out/artifact-manifest.json")
+        );
     }
 
     #[test]
@@ -3604,6 +3711,33 @@ mod tests {
             .expect("payload")
             .expect("payload script");
         assert_eq!(payload.script, "exec codex --model gpt-5");
+        assert_eq!(payload.cwd, config.project.display().to_string());
+    }
+
+    #[test]
+    fn payload_cwd_override_is_preserved() {
+        let root = frontend_test_root();
+        let cwd = root.join("repo/subdir");
+        let (config, policy) = frontend_config_from_args(&[
+            "--project".to_string(),
+            root.join("repo").display().to_string(),
+            "--run-dir".to_string(),
+            root.join(".sandbox/docker-vm/run").display().to_string(),
+            "--artifact-manifest".to_string(),
+            root.join("docker/out/artifact-manifest.json")
+                .display()
+                .to_string(),
+            "--payload-script".to_string(),
+            "pwd".to_string(),
+            "--payload-cwd".to_string(),
+            cwd.display().to_string(),
+        ])
+        .expect("config");
+
+        let payload = launch_payload_args(&config, &policy)
+            .expect("payload")
+            .expect("payload script");
+        assert_eq!(payload.cwd, cwd.display().to_string());
     }
 
     #[test]
@@ -3957,8 +4091,10 @@ mod tests {
         );
 
         assert!(script.contains("command -v pi >/dev/null 2>&1"));
-        assert!(script
-            .contains("npm install --global --no-progress @mariozechner/pi-coding-agent@latest"));
+        assert!(script.contains("pi --version >/dev/null 2>&1"));
+        assert!(script.contains(
+            "npm install --global --force --no-progress @mariozechner/pi-coding-agent@latest"
+        ));
         assert!(script.contains("agentvm: npm is required to install pi CLI"));
         assert!(script.contains("agentvm: installing pi CLI in guest HOME (first run only)"));
         assert!(script.contains("exec pi --model 'claude 3.5'"));
@@ -3973,7 +4109,8 @@ mod tests {
         );
 
         assert!(script.contains("command -v codex >/dev/null 2>&1"));
-        assert!(script.contains("npm install --global --no-progress @openai/codex@latest"));
+        assert!(script.contains("codex --version >/dev/null 2>&1"));
+        assert!(script.contains("npm install --global --force --no-progress @openai/codex@latest"));
         assert!(script.contains("agentvm: npm is required to install codex CLI"));
         assert!(script.contains("agentvm: installing codex CLI in guest HOME (first run only)"));
         assert!(script.contains("--dangerously-bypass-approvals-and-sandbox"));
@@ -4699,6 +4836,45 @@ mod tests {
         assert!(attempts > 0);
         assert!(error.contains("timed out waiting for guest payload control path"));
         assert!(error.contains("last error: probe-"));
+    }
+
+    #[test]
+    fn guest_sync_diagnostic_request_is_bounded_sync() {
+        let request = guest_sync_diagnostic_request();
+
+        assert_eq!(request.script, "sync");
+        assert_eq!(request.cwd, "/");
+        assert_eq!(request.timeout_seconds, 10);
+        assert_eq!(request.max_output_bytes, 4096);
+        assert!(request.env.is_empty());
+    }
+
+    #[test]
+    fn flush_guest_filesystems_sends_sync_diagnostic() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake payload server");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept diagnostic");
+            let mut header = [0_u8; 5];
+            stream.read_exact(&mut header).expect("read frame header");
+            assert_eq!(header[0], b'D');
+            let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+            let mut payload = vec![0_u8; len];
+            stream.read_exact(&mut payload).expect("read frame payload");
+            let request: DiagnosticRequest =
+                serde_json::from_slice(&payload).expect("request json");
+            assert_eq!(request, guest_sync_diagnostic_request());
+
+            let response = br#"{"exit_code":0}"#;
+            stream.write_all(&[b'X']).expect("write frame type");
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .expect("write frame length");
+            stream.write_all(response).expect("write frame payload");
+        });
+
+        flush_guest_filesystems(addr).expect("guest sync succeeds");
+        server.join().expect("fake server completes");
     }
 
     #[test]

@@ -37,6 +37,27 @@ impl PayloadRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticRequest {
+    pub script: String,
+    pub cwd: String,
+    pub env: BTreeMap<String, String>,
+    pub timeout_seconds: u64,
+    pub max_output_bytes: u64,
+}
+
+impl DiagnosticRequest {
+    pub fn new(script: impl Into<String>) -> Self {
+        Self {
+            script: script.into(),
+            cwd: "/".to_string(),
+            env: BTreeMap::new(),
+            timeout_seconds: 10,
+            max_output_bytes: 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PayloadClientError {
     Io(io::Error),
@@ -105,17 +126,7 @@ impl<S: Read + Write> PayloadSession<S> {
     }
 
     pub fn recv_event(&mut self) -> Result<PayloadEvent, PayloadClientError> {
-        let (frame_type, payload) = recv_frame(&mut self.stream)?;
-        match frame_type {
-            b'O' => Ok(PayloadEvent::Output(payload)),
-            b'X' => exit_code_from_payload(&payload).map(PayloadEvent::Exit),
-            b'F' => Ok(PayloadEvent::Failure(
-                String::from_utf8_lossy(&payload).to_string(),
-            )),
-            other => Err(PayloadClientError::Protocol(format!(
-                "unexpected payload frame type {other:?}"
-            ))),
-        }
+        payload_event_from_stream(&mut self.stream)
     }
 }
 
@@ -185,6 +196,18 @@ pub fn run_payload_tcp(
         output,
         PayloadControlOptions::disabled(),
     )
+}
+
+pub fn run_diagnostic_tcp(
+    addr: impl ToSocketAddrs,
+    request: &DiagnosticRequest,
+    output: &mut impl Write,
+) -> Result<i32, PayloadClientError> {
+    let mut stream = connect_payload(addr, Duration::from_secs(10))?;
+    stream.set_nodelay(true)?;
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    run_diagnostic_io(&mut stream, request, output)
 }
 
 pub fn run_payload_tcp_with_control(
@@ -295,6 +318,39 @@ fn run_payload_io(
             PayloadEvent::Exit(exit_code) => return Ok(exit_code),
             PayloadEvent::Failure(message) => return Err(PayloadClientError::Protocol(message)),
         }
+    }
+}
+
+fn run_diagnostic_io(
+    stream: &mut (impl Read + Write),
+    request: &DiagnosticRequest,
+    output: &mut impl Write,
+) -> Result<i32, PayloadClientError> {
+    let request_json = serde_json::to_vec(request)?;
+    send_frame(stream, b'D', &request_json)?;
+    loop {
+        match payload_event_from_stream(stream)? {
+            PayloadEvent::Output(payload) => {
+                output.write_all(&payload)?;
+                output.flush()?;
+            }
+            PayloadEvent::Exit(exit_code) => return Ok(exit_code),
+            PayloadEvent::Failure(message) => return Err(PayloadClientError::Protocol(message)),
+        }
+    }
+}
+
+fn payload_event_from_stream(stream: &mut impl Read) -> Result<PayloadEvent, PayloadClientError> {
+    let (frame_type, payload) = recv_frame(stream)?;
+    match frame_type {
+        b'O' => Ok(PayloadEvent::Output(payload)),
+        b'X' => exit_code_from_payload(&payload).map(PayloadEvent::Exit),
+        b'F' => Ok(PayloadEvent::Failure(
+            String::from_utf8_lossy(&payload).to_string(),
+        )),
+        other => Err(PayloadClientError::Protocol(format!(
+            "unexpected payload frame type {other:?}"
+        ))),
     }
 }
 
@@ -632,6 +688,36 @@ mod tests {
     }
 
     #[test]
+    fn run_diagnostic_sends_diagnostic_request_and_returns_exit_code() {
+        let mut server_frames = Vec::new();
+        send_frame(&mut server_frames, b'O', b"diag\n").expect("output");
+        send_frame(
+            &mut server_frames,
+            b'X',
+            br#"{"exit_code":3,"diagnostic":true}"#,
+        )
+        .expect("exit");
+        let mut stream = ScriptedIo::new(server_frames);
+
+        let mut request = DiagnosticRequest::new("echo diag");
+        request.timeout_seconds = 2;
+        request.max_output_bytes = 4096;
+        let mut output = Vec::new();
+        let exit_code =
+            run_diagnostic_io(&mut stream, &request, &mut output).expect("diagnostic run");
+
+        assert_eq!(exit_code, 3);
+        assert_eq!(output, b"diag\n");
+        let (frame_type, payload) =
+            recv_frame(&mut io::Cursor::new(stream.written)).expect("request frame");
+        assert_eq!(frame_type, b'D');
+        let request: serde_json::Value = serde_json::from_slice(&payload).expect("json");
+        assert_eq!(request["script"], "echo diag");
+        assert_eq!(request["timeout_seconds"], 2);
+        assert_eq!(request["max_output_bytes"], 4096);
+    }
+
+    #[test]
     fn rust_client_runs_real_python_payload_server() {
         let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -676,6 +762,66 @@ mod tests {
         assert!(output
             .windows(b"rust-python-ok".len())
             .any(|window| window == b"rust-python-ok"));
+        child.kill_and_wait();
+    }
+
+    #[test]
+    fn diagnostic_can_run_while_primary_payload_is_active() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        let server_path = repo_root.join("docker/guest-payload-server.py");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let child = match std::process::Command::new("python3")
+            .arg(server_path)
+            .arg("--tcp-host")
+            .arg("127.0.0.1")
+            .arg("--tcp-port")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(error) => panic!("spawn python payload server: {error}"),
+        };
+        let mut child = ChildGuard(Some(child));
+
+        let mut ready = false;
+        for _ in 0..50 {
+            if ping_payload(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "python payload server did not become ready");
+
+        let primary = thread::spawn(move || {
+            let request = PayloadRequest::new("printf primary-start; sleep 1; printf primary-done");
+            let mut output = Vec::new();
+            let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
+                .expect("primary payload run");
+            (exit_code, output)
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        let request = DiagnosticRequest::new("printf diagnostic-ok; exit 7");
+        let mut output = Vec::new();
+        let exit_code =
+            run_diagnostic_tcp(("127.0.0.1", port), &request, &mut output).expect("diagnostic run");
+
+        assert_eq!(exit_code, 7);
+        assert_eq!(output, b"diagnostic-ok");
+        let (primary_exit, primary_output) = primary.join().expect("primary thread");
+        assert_eq!(primary_exit, 0);
+        assert!(primary_output
+            .windows(b"primary-done".len())
+            .any(|window| window == b"primary-done"));
         child.kill_and_wait();
     }
 

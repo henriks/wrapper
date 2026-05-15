@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one guest payload at a time and stream stdio over a framed TCP protocol."""
+"""Run a primary guest payload and bounded concurrent diagnostic payloads."""
 
 from __future__ import annotations
 
@@ -8,17 +8,24 @@ import errno
 import fcntl
 import json
 import os
+import itertools
 import pty
+import select
 import signal
 import socket
 import struct
 import subprocess
 import termios
 import threading
+import time
 
 
 FRAME_HEADER = struct.Struct("!cI")
 MAX_FRAME_PAYLOAD = 16 * 1024 * 1024
+DEFAULT_DIAGNOSTIC_TIMEOUT_SECONDS = 10.0
+MAX_DIAGNOSTIC_TIMEOUT_SECONDS = 60.0
+DEFAULT_DIAGNOSTIC_OUTPUT_BYTES = 1024 * 1024
+MAX_DIAGNOSTIC_OUTPUT_BYTES = 4 * 1024 * 1024
 
 
 def log(msg: str) -> None:
@@ -196,7 +203,137 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
         finished.set()
 
 
-def handle_client(conn: socket.socket, session_lock: threading.Lock) -> None:
+def bounded_float(value: object, default: float, maximum: float) -> float:
+    if value is None:
+        return default
+    parsed = float(value)
+    if parsed <= 0:
+        raise ValueError("diagnostic timeout must be positive")
+    return min(parsed, maximum)
+
+
+def bounded_int(value: object, default: int, maximum: int) -> int:
+    if value is None:
+        return default
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError("diagnostic output limit must be positive")
+    return min(parsed, maximum)
+
+
+def run_diagnostic(conn: socket.socket, request: dict[str, object], session_id: int) -> None:
+    script = str(request.get("script") or "")
+    if not script:
+        raise ValueError("diagnostic request is missing script")
+
+    cwd = str(request.get("cwd") or "/")
+    env = dict(os.environ)
+    env.update({str(k): str(v) for k, v in dict(request.get("env") or {}).items()})
+    uid, gid = payload_identity(env)
+    ensure_home(env, uid, gid)
+    timeout_seconds = bounded_float(
+        request.get("timeout_seconds"),
+        DEFAULT_DIAGNOSTIC_TIMEOUT_SECONDS,
+        MAX_DIAGNOSTIC_TIMEOUT_SECONDS,
+    )
+    max_output_bytes = bounded_int(
+        request.get("max_output_bytes"),
+        DEFAULT_DIAGNOSTIC_OUTPUT_BYTES,
+        MAX_DIAGNOSTIC_OUTPUT_BYTES,
+    )
+
+    log(f"diagnostic session {session_id} starting timeout={timeout_seconds}s max_output={max_output_bytes}")
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=cwd,
+        env=env,
+        preexec_fn=payload_preexec(uid, gid),
+        close_fds=True,
+    )
+    if proc.stdout is None:
+        raise RuntimeError("diagnostic stdout pipe was not created")
+
+    deadline = time.monotonic() + timeout_seconds
+    sent = 0
+    timed_out = False
+    truncated = False
+    fd = proc.stdout.fileno()
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= deadline and proc.poll() is None:
+                timed_out = True
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            remaining = max(0.0, deadline - now) if proc.poll() is None else 0.0
+            readable, _, _ = select.select([fd], [], [], min(0.1, remaining))
+            if readable:
+                capacity = max_output_bytes - sent
+                if capacity <= 0:
+                    truncated = True
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    continue
+                chunk = os.read(fd, min(65536, capacity))
+                if chunk:
+                    sent += len(chunk)
+                    send_frame(conn, b"O", chunk)
+                    if sent >= max_output_bytes and proc.poll() is None:
+                        truncated = True
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    continue
+            if proc.poll() is not None:
+                while True:
+                    chunk = os.read(fd, min(65536, max(0, max_output_bytes - sent)))
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    send_frame(conn, b"O", chunk)
+                    if sent >= max_output_bytes:
+                        truncated = True
+                        break
+                break
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+
+    exit_code = proc.wait()
+    if timed_out:
+        exit_code = 124
+        send_frame(conn, b"O", b"\nagentvm diagnostic timed out\n")
+    elif truncated:
+        exit_code = 125
+        send_frame(conn, b"O", b"\nagentvm diagnostic output limit exceeded\n")
+    payload = json.dumps({
+        "exit_code": exit_code,
+        "diagnostic": True,
+        "timed_out": timed_out,
+        "truncated": truncated,
+    }).encode("utf-8")
+    send_frame(conn, b"X", payload)
+    log(f"diagnostic session {session_id} exited code={exit_code} timed_out={timed_out} truncated={truncated}")
+
+
+def handle_client(conn: socket.socket, session_lock: threading.Lock,
+                  diagnostic_sem: threading.BoundedSemaphore | None = None,
+                  session_ids: itertools.count | None = None) -> None:
+    if diagnostic_sem is None:
+        diagnostic_sem = threading.BoundedSemaphore(4)
+    if session_ids is None:
+        session_ids = itertools.count(1)
     with conn:
         try:
             frame_type, payload = recv_frame(conn)
@@ -213,13 +350,29 @@ def handle_client(conn: socket.socket, session_lock: threading.Lock) -> None:
         if frame_type == b"P":
             send_frame(conn, b"K", b"ok")
             return
-        if frame_type != b"R":
+        if frame_type not in (b"R", b"D"):
             send_frame(conn, b"F", b"unexpected initial frame")
             return
         try:
             request = json.loads(payload.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             send_frame(conn, b"F", f"invalid payload request JSON: {exc}".encode("utf-8"))
+            return
+        if frame_type == b"D":
+            if not diagnostic_sem.acquire(blocking=False):
+                send_frame(conn, b"F", b"too many diagnostic sessions active")
+                return
+            session_id = next(session_ids)
+            try:
+                run_diagnostic(conn, request, session_id)
+            except Exception as exc:  # noqa: BLE001
+                log(f"diagnostic request failed: {exc}")
+                try:
+                    send_frame(conn, b"F", str(exc).encode("utf-8"))
+                except OSError:
+                    pass
+            finally:
+                diagnostic_sem.release()
             return
         if not session_lock.acquire(blocking=False):
             send_frame(conn, b"F", b"payload session already active")
@@ -242,13 +395,15 @@ def serve_tcp(tcp_host: str, tcp_port: int) -> None:
     listener.bind((tcp_host, tcp_port))
     listener.listen()
     session_lock = threading.Lock()
+    diagnostic_sem = threading.BoundedSemaphore(4)
+    session_ids = itertools.count(1)
     log(f"listening on tcp {tcp_host}:{tcp_port}")
 
     while True:
         conn, _ = listener.accept()
         thread = threading.Thread(
             target=handle_client,
-            args=(conn, session_lock),
+            args=(conn, session_lock, diagnostic_sem, session_ids),
             daemon=True,
         )
         thread.start()
@@ -256,7 +411,7 @@ def serve_tcp(tcp_host: str, tcp_port: int) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run one payload at a time and stream stdio over TCP.",
+        description="Run one primary payload and bounded diagnostic payloads over TCP.",
     )
     parser.add_argument("--tcp-port", type=int, required=True)
     parser.add_argument("--tcp-host", default="0.0.0.0")

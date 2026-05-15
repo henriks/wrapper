@@ -67,7 +67,7 @@ Object with:
 
 For config compatibility, the reader also accepts a string value such as `"codex"` and treats it as `{ "command": "codex", "args": [] }`. Writers should emit the object form.
 
-Arguments after `agentvm --` override this command for one launch and do not modify the file.
+Arguments after `agentvm --` override this command for one launch and do not modify the file. Configured/default payloads run with the selected project directory as their current working directory unless a launch-level `--payload-cwd` override is supplied.
 
 ### `network`
 

@@ -10,8 +10,9 @@ vm-frontend/validate.sh required
 The required gate performs the validation documentation drift check, `cargo fmt
 --check` for the Rust crates and fuzz package, composed-fs and vm-frontend
 offline tests, offline guest service tests, fuzz target compilation with `cargo
-check --manifest-path vm-frontend/fuzz/Cargo.toml --offline`, and the quick
-`live-smoke` host live validation scenario. `full` is an alias for the same gate.
+check --manifest-path vm-frontend/fuzz/Cargo.toml --offline`, the quick
+`live-smoke` host live validation scenario, and the `live-setup-tools` Codex
+bootstrap/persistence scenario. `full` is an alias for the same gate.
 If `/dev/kvm` is unavailable, the gate fails with a host-live limitation instead
 of silently passing; rerun it on a KVM-capable host before closing live
 validation work.
@@ -131,6 +132,7 @@ Run after rebuilding appliance artifacts and before closing live frontend
 contract work. The live matrix has named scenarios:
 
 - `live-smoke` (also `host-live`/`live`): quick required self-test with the published payload listener.
+- `live-setup-tools`: required Codex setup-tool bootstrap over npm/TLS MITM, then no-net relaunch from persisted guest state and optional-package metadata verification.
 - `live-hostile`: slower hostile/no-net self-test that probes denied metadata/loopback/DNS behavior.
 - `live-payload`: payload protocol stress self-test with a large request environment and large guest output.
 - `live-dns`: allowed resolver-path and denied/no-net resolver-path self-tests with explicit query diagnostics.
@@ -142,6 +144,7 @@ Prefer `host-live` in docs when emphasizing host prerequisites:
 
 ```sh
 vm-frontend/validate.sh host-live
+vm-frontend/validate.sh live-setup-tools
 vm-frontend/validate.sh live-hostile
 vm-frontend/validate.sh live-payload
 vm-frontend/validate.sh live-dns
@@ -177,8 +180,9 @@ The live tier validates the real QEMU stream network, payload-control listener,
 published payload port, composed virtiofs workspace, guest config filesystem,
 MITM CA bundle exposure without private key exposure, guest DNS lookup,
 SQLite/WAL activity under guest `$HOME`, concurrent host+guest SQLite WAL
-writes against the same workspace database, Docker CLI, and Docker bind-mounted
-workspace.
+writes against the same workspace database, Docker CLI, Docker bind-mounted
+workspace, setup-tool npm bootstrap, and persisted agent CLI state across
+payload-triggered VM shutdown and relaunch.
 
 For the SQLite concurrency check, the self-test creates
 `.agentvm-self-test-sqlite/state.sqlite`, starts a host `python3 sqlite3`

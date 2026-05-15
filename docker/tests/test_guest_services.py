@@ -171,6 +171,67 @@ class GuestPayloadServerTests(unittest.TestCase):
             self.assertIn(b"payload-ok", output)
             self.assertEqual(exit_code, 0)
 
+    def test_diagnostic_request_runs_while_primary_session_lock_is_held(self) -> None:
+        client, server = self.socket_pair()
+        primary_lock = threading.Lock()
+        self.assertTrue(primary_lock.acquire(blocking=False))
+        self.addCleanup(primary_lock.release)
+        with tempfile.TemporaryDirectory() as cwd:
+            request = {
+                "script": "printf diagnostic-ok; exit 7",
+                "cwd": cwd,
+                "env": {},
+                "timeout_seconds": 5,
+                "max_output_bytes": 4096,
+            }
+            send_frame(client, b"D", json.dumps(request).encode("utf-8"))
+
+            payload_server.handle_client(server, primary_lock)
+
+            output = bytearray()
+            exit_code = None
+            for _ in range(16):
+                frame_type, payload = recv_frame(client)
+                if frame_type == b"O":
+                    output.extend(payload)
+                elif frame_type == b"X":
+                    exit_code = json.loads(payload.decode("utf-8"))["exit_code"]
+                    break
+                elif frame_type == b"F":
+                    self.fail(f"diagnostic failed: {payload!r}")
+
+            self.assertEqual(output, b"diagnostic-ok")
+            self.assertEqual(exit_code, 7)
+
+    def test_diagnostic_timeout_returns_bounded_exit_code(self) -> None:
+        client, server = self.socket_pair()
+        with tempfile.TemporaryDirectory() as cwd:
+            request = {
+                "script": "sleep 5",
+                "cwd": cwd,
+                "env": {},
+                "timeout_seconds": 0.1,
+                "max_output_bytes": 4096,
+            }
+            send_frame(client, b"D", json.dumps(request).encode("utf-8"))
+
+            payload_server.handle_client(server, threading.Lock())
+
+            output = bytearray()
+            exit_code = None
+            for _ in range(16):
+                frame_type, payload = recv_frame(client)
+                if frame_type == b"O":
+                    output.extend(payload)
+                elif frame_type == b"X":
+                    exit_code = json.loads(payload.decode("utf-8"))["exit_code"]
+                    break
+                elif frame_type == b"F":
+                    self.fail(f"diagnostic failed: {payload!r}")
+
+            self.assertIn(b"diagnostic timed out", output)
+            self.assertEqual(exit_code, 124)
+
     def test_payload_identity_requires_uid_and_gid_together(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires both"):
             payload_server.payload_identity({"AGENTVM_UID": "1000"})
