@@ -30,6 +30,7 @@ dependencies = [
  "httparse",
  "ipnet",
  "libc",
+ "mio",
  "pcap-file",
  "proptest",
  "ratatui",

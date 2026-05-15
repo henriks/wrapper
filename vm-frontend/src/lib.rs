@@ -21,6 +21,7 @@ pub mod tcp_gateway;
 pub mod tcp_proxy;
 pub mod tls_mitm;
 pub mod vmnet_gateway;
+pub mod vmnet_poller;
 pub mod vmnet_runtime;
 pub mod vmnet_stream;
 

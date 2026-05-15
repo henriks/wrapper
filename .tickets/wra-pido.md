@@ -1,6 +1,6 @@
 ---
 id: wra-pido
-status: open
+status: closed
 deps: [wra-ssve]
 links: []
 created: 2026-05-15T09:31:10Z
@@ -21,3 +21,9 @@ Keep TcpProxyBridge responsible for protocol state and buffering, but keep mio r
 
 Upstream TCP proxy read/write progress is driven by readiness events rather than unconditional per-tick probing. Existing tcp_proxy tests pass, including large upstream responses, partial guest sends, TLS handshake payload, and pending write behavior. Add tests for readiness-driven upstream read, readiness-driven pending write flush, connection close/failure deregistration, and TLS interest updates. cargo test --manifest-path vm-frontend/Cargo.toml --offline passes.
 
+
+## Notes
+
+**2026-05-15T09:44:55Z**
+
+Added TcpProxyReadiness and readiness-aware upstream processing. TcpProxyBridge now exposes session handles, per-session interests, and raw fds for the runtime's MappedTcpConnector path. Guest-to-upstream bytes are buffered when upstream writability has not fired and flushed on writable readiness; pending write flushes now emit GuestPayload for plain TCP. TLS upstream interest includes pending bytes/plaintext and rustls wants_write. Added readiness_buffers_guest_payload_until_upstream_socket_is_writable coverage.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::Ipv4Addr;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use smoltcp::iface::SocketHandle;
@@ -70,6 +71,18 @@ where
         &mut self,
         gateway: &mut VmnetGateway<'_>,
         now: Instant,
+    ) -> Vec<TcpProxyEvent>
+    where
+        C::Connection: Read + Write,
+    {
+        self.process_gateway_with_readiness(gateway, now, TcpProxyReadiness::all())
+    }
+
+    pub fn process_gateway_with_readiness(
+        &mut self,
+        gateway: &mut VmnetGateway<'_>,
+        now: Instant,
+        readiness: TcpProxyReadiness,
     ) -> Vec<TcpProxyEvent>
     where
         C::Connection: Read + Write,
@@ -174,7 +187,14 @@ where
                 }
             };
             if !guest_bytes.is_empty() {
-                self.process_guest_payload(active.handle, guest_bytes, gateway, now, &mut events);
+                self.process_guest_payload(
+                    active.handle,
+                    guest_bytes,
+                    gateway,
+                    now,
+                    readiness.writable(active.handle),
+                    &mut events,
+                );
             }
 
             let Some(session) = self.sessions.get_mut(&active.handle) else {
@@ -191,11 +211,16 @@ where
             if !session.pending_guest_bytes.is_empty() {
                 continue;
             }
-            drain_upstream_tls_writes(session, active.handle, &mut events);
-            flush_pending_upstream_bytes(session, active.handle, &mut events);
-            if let Some(upstream_bytes) =
-                read_available(&mut session.connection, &mut events, active.handle)
-            {
+            if readiness.writable(active.handle) {
+                drain_upstream_tls_writes(session, active.handle, &mut events);
+                flush_pending_upstream_bytes(session, active.handle, &mut events);
+            }
+            if readiness.readable(active.handle) {
+                let Some(upstream_bytes) =
+                    read_available(&mut session.connection, &mut events, active.handle)
+                else {
+                    continue;
+                };
                 let guest_bytes = if session.decision.action == TcpAction::InterceptHttps {
                     let upstream_read = match session
                         .upstream_tls
@@ -215,26 +240,32 @@ where
                         }
                     };
                     if !upstream_read.tls_to_upstream.is_empty() {
-                        match write_buffered_best_effort(
-                            &mut session.connection,
-                            &mut session.pending_upstream_bytes,
-                            &upstream_read.tls_to_upstream,
-                        ) {
-                            Ok(bytes) => {
-                                if bytes > 0 {
-                                    events.push(TcpProxyEvent::TlsUpstreamPayload {
+                        if readiness.writable(active.handle) {
+                            match write_buffered_best_effort(
+                                &mut session.connection,
+                                &mut session.pending_upstream_bytes,
+                                &upstream_read.tls_to_upstream,
+                            ) {
+                                Ok(bytes) => {
+                                    if bytes > 0 {
+                                        events.push(TcpProxyEvent::TlsUpstreamPayload {
+                                            handle: active.handle,
+                                            bytes,
+                                        });
+                                    }
+                                }
+                                Err(error) => {
+                                    events.push(TcpProxyEvent::UpstreamWriteFailed {
                                         handle: active.handle,
-                                        bytes,
+                                        error,
                                     });
+                                    continue;
                                 }
                             }
-                            Err(error) => {
-                                events.push(TcpProxyEvent::UpstreamWriteFailed {
-                                    handle: active.handle,
-                                    error,
-                                });
-                                continue;
-                            }
+                        } else {
+                            session
+                                .pending_upstream_bytes
+                                .extend_from_slice(&upstream_read.tls_to_upstream);
                         }
                     }
                     if !session.upstream_tls_ready {
@@ -243,8 +274,10 @@ where
                             .as_ref()
                             .is_some_and(|upstream_tls| !upstream_tls.is_handshaking());
                     }
-                    flush_pending_https_plaintext(session, active.handle, &mut events);
-                    drain_upstream_tls_writes(session, active.handle, &mut events);
+                    if readiness.writable(active.handle) {
+                        flush_pending_https_plaintext(session, active.handle, &mut events);
+                        drain_upstream_tls_writes(session, active.handle, &mut events);
+                    }
                     if upstream_read.plaintext.is_empty() {
                         continue;
                     }
@@ -288,6 +321,7 @@ where
         guest_bytes: Vec<u8>,
         gateway: &mut VmnetGateway<'_>,
         now: Instant,
+        upstream_writable: bool,
         events: &mut Vec<TcpProxyEvent>,
     ) where
         C::Connection: Write,
@@ -322,7 +356,13 @@ where
                     events,
                 );
             }
-            if !ensure_https_upstream_tls(session, handle, self.tls_client_config.clone(), events) {
+            if !ensure_https_upstream_tls(
+                session,
+                handle,
+                self.tls_client_config.clone(),
+                upstream_writable,
+                events,
+            ) {
                 return;
             }
             read.plaintext
@@ -353,17 +393,57 @@ where
                     .extend_from_slice(&payload);
                 return;
             }
-            write_https_plaintext_upstream(session, handle, &payload, events);
+            if upstream_writable {
+                write_https_plaintext_upstream(session, handle, &payload, events);
+            } else {
+                session
+                    .pending_upstream_plaintext
+                    .extend_from_slice(&payload);
+            }
         } else {
-            match write_buffered_best_effort(
-                &mut session.connection,
-                &mut session.pending_upstream_bytes,
-                &payload,
-            ) {
-                Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
-                Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+            if upstream_writable {
+                match write_buffered_best_effort(
+                    &mut session.connection,
+                    &mut session.pending_upstream_bytes,
+                    &payload,
+                ) {
+                    Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
+                    Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+                }
+            } else {
+                session.pending_upstream_bytes.extend_from_slice(&payload);
             }
         }
+    }
+}
+
+impl TcpProxyBridge<crate::tcp_gateway::MappedTcpConnector> {
+    pub fn session_raw_fd(&self, handle: SocketHandle) -> Option<RawFd> {
+        self.sessions
+            .get(&handle)
+            .map(|session| session.connection.as_raw_fd())
+    }
+}
+
+impl<C> TcpProxyBridge<C>
+where
+    C: TcpUpstreamConnector,
+{
+    pub fn session_handles(&self) -> Vec<SocketHandle> {
+        self.sessions.keys().copied().collect()
+    }
+
+    pub fn session_interest(&self, handle: SocketHandle) -> Option<UpstreamSessionInterest> {
+        let session = self.sessions.get(&handle)?;
+        Some(UpstreamSessionInterest {
+            readable: session.pending_guest_bytes.is_empty(),
+            writable: !session.pending_upstream_bytes.is_empty()
+                || !session.pending_upstream_plaintext.is_empty()
+                || session
+                    .upstream_tls
+                    .as_ref()
+                    .is_some_and(|upstream_tls| upstream_tls.wants_write()),
+        })
     }
 }
 
@@ -378,6 +458,45 @@ struct UpstreamSession<T> {
     pending_upstream_bytes: Vec<u8>,
     pending_upstream_plaintext: Vec<u8>,
     pending_guest_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamSessionInterest {
+    pub readable: bool,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TcpProxyReadiness {
+    poll_all: bool,
+    readable: Vec<SocketHandle>,
+    writable: Vec<SocketHandle>,
+}
+
+impl TcpProxyReadiness {
+    pub fn all() -> Self {
+        Self {
+            poll_all: true,
+            readable: Vec::new(),
+            writable: Vec::new(),
+        }
+    }
+
+    pub fn selected(readable: Vec<SocketHandle>, writable: Vec<SocketHandle>) -> Self {
+        Self {
+            poll_all: false,
+            readable,
+            writable,
+        }
+    }
+
+    fn readable(&self, handle: SocketHandle) -> bool {
+        self.poll_all || self.readable.contains(&handle)
+    }
+
+    fn writable(&self, handle: SocketHandle) -> bool {
+        self.poll_all || self.writable.contains(&handle)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +559,7 @@ fn ensure_https_upstream_tls<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
+    upstream_writable: bool,
     events: &mut Vec<TcpProxyEvent>,
 ) -> bool {
     if session.upstream_tls.is_some() {
@@ -486,20 +606,26 @@ fn ensure_https_upstream_tls<T: Write>(
         }
     };
     if !client_hello.is_empty() {
-        match write_buffered_best_effort(
-            &mut session.connection,
-            &mut session.pending_upstream_bytes,
-            &client_hello,
-        ) {
-            Ok(bytes) => {
-                if bytes > 0 {
-                    events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+        if upstream_writable {
+            match write_buffered_best_effort(
+                &mut session.connection,
+                &mut session.pending_upstream_bytes,
+                &client_hello,
+            ) {
+                Ok(bytes) => {
+                    if bytes > 0 {
+                        events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
+                    }
+                }
+                Err(error) => {
+                    events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
+                    return false;
                 }
             }
-            Err(error) => {
-                events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
-                return false;
-            }
+        } else {
+            session
+                .pending_upstream_bytes
+                .extend_from_slice(&client_hello);
         }
     }
     session.upstream_tls = Some(upstream_tls);
@@ -608,6 +734,7 @@ fn flush_pending_upstream_bytes<T: Write>(
         Ok(bytes) if bytes > 0 && session.decision.action == TcpAction::InterceptHttps => {
             events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
         }
+        Ok(bytes) if bytes > 0 => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
         Ok(_) => {}
         Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
     }
@@ -906,6 +1033,63 @@ mod tests {
             pending > 0,
             "large upstream responses must be retained when smoltcp accepts only a partial guest send"
         );
+    }
+
+    #[test]
+    fn readiness_buffers_guest_payload_until_upstream_socket_is_writable() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(FakeConnector {
+            response: Vec::new(),
+            write_would_block_count: 0,
+        });
+
+        establish_http_session(&mut gateway);
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(5),
+            TcpProxyReadiness::selected(Vec::new(), Vec::new()),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::Connected { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::GuestPayload { .. })));
+
+        let handle = bridge
+            .sessions
+            .keys()
+            .copied()
+            .next()
+            .expect("proxy session handle");
+        let session = bridge.sessions.get(&handle).expect("proxy session");
+        assert!(!session.pending_upstream_bytes.is_empty());
+        assert!(session.connection.written.is_empty());
+        assert_eq!(
+            bridge.session_interest(handle),
+            Some(UpstreamSessionInterest {
+                readable: true,
+                writable: true
+            })
+        );
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(6),
+            TcpProxyReadiness::selected(Vec::new(), vec![handle]),
+        );
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::GuestPayload { bytes, .. } if *bytes > 0)));
+        let session = bridge.sessions.get(&handle).expect("proxy session");
+        assert!(session.pending_upstream_bytes.is_empty());
+        assert!(!session.connection.written.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, RawFd};
 
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp;
@@ -51,29 +52,48 @@ impl HostIngressListenerSet {
 
     pub fn accept_pending(&self) -> Vec<std::io::Result<AcceptedHostConnection>> {
         let mut accepted = Vec::new();
-        for listener in &self.listeners {
-            loop {
-                match listener.listener.accept() {
-                    Ok((stream, _addr)) => {
-                        if let Err(error) = stream.set_nonblocking(true) {
-                            accepted.push(Err(error));
-                            continue;
-                        }
-                        accepted.push(Ok(AcceptedHostConnection {
-                            guest_port: listener.config.guest_port,
-                            purpose: listener.config.purpose,
-                            connection: stream,
-                        }));
-                    }
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                    Err(error) => {
+        for index in 0..self.listeners.len() {
+            accepted.extend(self.accept_ready(index));
+        }
+        accepted
+    }
+
+    pub fn accept_ready(
+        &self,
+        listener_index: usize,
+    ) -> Vec<std::io::Result<AcceptedHostConnection>> {
+        let mut accepted = Vec::new();
+        let Some(listener) = self.listeners.get(listener_index) else {
+            return accepted;
+        };
+        loop {
+            match listener.listener.accept() {
+                Ok((stream, _addr)) => {
+                    if let Err(error) = stream.set_nonblocking(true) {
                         accepted.push(Err(error));
-                        break;
+                        continue;
                     }
+                    accepted.push(Ok(AcceptedHostConnection {
+                        guest_port: listener.config.guest_port,
+                        purpose: listener.config.purpose,
+                        connection: stream,
+                    }));
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    accepted.push(Err(error));
+                    break;
                 }
             }
         }
         accepted
+    }
+
+    pub fn listener_fds(&self) -> Vec<RawFd> {
+        self.listeners
+            .iter()
+            .map(|listener| listener.listener.as_raw_fd())
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -111,6 +131,8 @@ impl<C> HostIngressBridge<C> {
             HostIngressSession {
                 guest_port,
                 connection,
+                pending_host_write: Vec::new(),
+                guest_closed: None,
             },
         );
         Ok(HostIngressOpen {
@@ -143,6 +165,15 @@ where
         gateway: &mut VmnetGateway<'_>,
         now: Instant,
     ) -> Vec<HostIngressEvent> {
+        self.process_gateway_with_readiness(gateway, now, HostIngressReadiness::all())
+    }
+
+    pub fn process_gateway_with_readiness(
+        &mut self,
+        gateway: &mut VmnetGateway<'_>,
+        now: Instant,
+        readiness: HostIngressReadiness,
+    ) -> Vec<HostIngressEvent> {
         let mut events = Vec::new();
         let mut closed = Vec::new();
         for active in gateway.host_ingress_sessions() {
@@ -151,7 +182,8 @@ where
             };
             let guest_port = session.guest_port;
 
-            if active.session.state == tcp::State::Established {
+            if active.session.state == tcp::State::Established && readiness.readable(active.handle)
+            {
                 match read_available(&mut session.connection) {
                     HostRead::Payload(host_bytes) => {
                         match gateway.send_tcp_session(active.handle, &host_bytes, now) {
@@ -193,46 +225,88 @@ where
                         continue;
                     }
                 }
-            } else if !guest_closed_state(active.session.state) {
+            }
+            if active.session.state != tcp::State::Established
+                && !guest_closed_state(active.session.state)
+            {
                 continue;
             }
 
             match gateway.recv_tcp_session(active.handle) {
                 Ok(guest_bytes) if !guest_bytes.is_empty() => {
-                    match write_all_best_effort(&mut session.connection, &guest_bytes) {
-                        Ok(bytes) => events.push(HostIngressEvent::GuestPayload {
-                            handle: active.handle,
-                            guest_port,
-                            bytes,
-                        }),
-                        Err(error) => {
-                            let guest_frames = gateway.close_tcp_session(active.handle, now);
-                            events.push(HostIngressEvent::HostWriteFailed {
-                                handle: active.handle,
-                                error,
-                            });
-                            events.push(HostIngressEvent::HostClosed {
+                    session.pending_host_write.extend_from_slice(&guest_bytes);
+                    if readiness.writable(active.handle) {
+                        match write_all_best_effort(
+                            &mut session.connection,
+                            &mut session.pending_host_write,
+                        ) {
+                            Ok(bytes) if bytes > 0 => events.push(HostIngressEvent::GuestPayload {
                                 handle: active.handle,
                                 guest_port,
-                                guest_frames,
-                            });
-                            closed.push(active.handle);
+                                bytes,
+                            }),
+                            Ok(_) => {}
+                            Err(error) => {
+                                let guest_frames = gateway.close_tcp_session(active.handle, now);
+                                events.push(HostIngressEvent::HostWriteFailed {
+                                    handle: active.handle,
+                                    error,
+                                });
+                                events.push(HostIngressEvent::HostClosed {
+                                    handle: active.handle,
+                                    guest_port,
+                                    guest_frames,
+                                });
+                                closed.push(active.handle);
+                            }
                         }
                     }
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    if readiness.writable(active.handle) && !session.pending_host_write.is_empty() {
+                        match write_all_best_effort(
+                            &mut session.connection,
+                            &mut session.pending_host_write,
+                        ) {
+                            Ok(bytes) if bytes > 0 => events.push(HostIngressEvent::GuestPayload {
+                                handle: active.handle,
+                                guest_port,
+                                bytes,
+                            }),
+                            Ok(_) => {}
+                            Err(error) => {
+                                let guest_frames = gateway.close_tcp_session(active.handle, now);
+                                events.push(HostIngressEvent::HostWriteFailed {
+                                    handle: active.handle,
+                                    error,
+                                });
+                                events.push(HostIngressEvent::HostClosed {
+                                    handle: active.handle,
+                                    guest_port,
+                                    guest_frames,
+                                });
+                                closed.push(active.handle);
+                            }
+                        }
+                    }
+                }
                 Err(error) => events.push(HostIngressEvent::GuestReadFailed {
                     handle: active.handle,
                     error,
                 }),
             }
             if guest_closed_state(active.session.state) {
-                events.push(HostIngressEvent::GuestClosed {
-                    handle: active.handle,
-                    guest_port,
-                    state: active.session.state,
-                });
-                closed.push(active.handle);
+                session.guest_closed = Some(active.session.state);
+            }
+            if let Some(state) = session.guest_closed {
+                if session.pending_host_write.is_empty() {
+                    events.push(HostIngressEvent::GuestClosed {
+                        handle: active.handle,
+                        guest_port,
+                        state,
+                    });
+                    closed.push(active.handle);
+                }
             }
         }
         for handle in closed {
@@ -246,11 +320,72 @@ where
             .get(&handle)
             .map(|session| &session.connection)
     }
+
+    pub fn session_interest(&self, handle: SocketHandle) -> Option<HostSessionInterest> {
+        let session = self.sessions.get(&handle)?;
+        Some(HostSessionInterest {
+            readable: session.guest_closed.is_none(),
+            writable: !session.pending_host_write.is_empty(),
+        })
+    }
+
+    pub fn session_handles(&self) -> Vec<SocketHandle> {
+        self.sessions.keys().copied().collect()
+    }
 }
 
 struct HostIngressSession<C> {
     guest_port: u16,
     connection: C,
+    pending_host_write: Vec<u8>,
+    guest_closed: Option<tcp::State>,
+}
+
+impl HostIngressBridge<TcpStream> {
+    pub fn session_raw_fd(&self, handle: SocketHandle) -> Option<RawFd> {
+        self.sessions
+            .get(&handle)
+            .map(|session| session.connection.as_raw_fd())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostSessionInterest {
+    pub readable: bool,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostIngressReadiness {
+    poll_all: bool,
+    readable: Vec<SocketHandle>,
+    writable: Vec<SocketHandle>,
+}
+
+impl HostIngressReadiness {
+    pub fn all() -> Self {
+        Self {
+            poll_all: true,
+            readable: Vec::new(),
+            writable: Vec::new(),
+        }
+    }
+
+    pub fn selected(readable: Vec<SocketHandle>, writable: Vec<SocketHandle>) -> Self {
+        Self {
+            poll_all: false,
+            readable,
+            writable,
+        }
+    }
+
+    fn readable(&self, handle: SocketHandle) -> bool {
+        self.poll_all || self.readable.contains(&handle)
+    }
+
+    fn writable(&self, handle: SocketHandle) -> bool {
+        self.poll_all || self.writable.contains(&handle)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -343,14 +478,17 @@ fn read_available(connection: &mut impl Read) -> HostRead {
     }
 }
 
-fn write_all_best_effort(connection: &mut impl Write, mut bytes: &[u8]) -> Result<usize, String> {
+fn write_all_best_effort(
+    connection: &mut impl Write,
+    bytes: &mut Vec<u8>,
+) -> Result<usize, String> {
     let mut written = 0;
     while !bytes.is_empty() {
         match connection.write(bytes) {
             Ok(0) => break,
             Ok(count) => {
                 written += count;
-                bytes = &bytes[count..];
+                bytes.drain(..count);
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => break,
             Err(error) => return Err(error.to_string()),
@@ -634,6 +772,74 @@ mod tests {
             )
         }));
         assert!(bridge.session_connection(open.handle).is_none());
+    }
+
+    #[test]
+    fn readiness_buffers_guest_payload_until_host_socket_is_writable() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = HostIngressBridge::new();
+
+        let open = bridge
+            .open_session(
+                &mut gateway,
+                1075,
+                MemoryConnection::new(vec![]),
+                Instant::from_millis(1),
+            )
+            .expect("open");
+        let gateway_ack = complete_guest_accept(&mut gateway, &open);
+        gateway.handle_guest_frame(
+            tcp_frame(
+                1075,
+                open.local_port,
+                TcpControl::Psh,
+                TcpSeqNumber(201),
+                Some(gateway_ack),
+                b"guest payload",
+            ),
+            Instant::from_millis(4),
+        );
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(5),
+            HostIngressReadiness::selected(Vec::new(), Vec::new()),
+        );
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, HostIngressEvent::GuestPayload { .. })));
+        assert_eq!(
+            bridge.session_interest(open.handle),
+            Some(HostSessionInterest {
+                readable: true,
+                writable: true
+            })
+        );
+        assert!(bridge
+            .session_connection(open.handle)
+            .expect("session")
+            .written
+            .is_empty());
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(6),
+            HostIngressReadiness::selected(Vec::new(), vec![open.handle]),
+        );
+
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, HostIngressEvent::GuestPayload { bytes: 13, .. })));
+        assert_eq!(
+            bridge
+                .session_connection(open.handle)
+                .expect("session")
+                .written,
+            b"guest payload"
+        );
     }
 
     #[test]

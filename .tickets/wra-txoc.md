@@ -1,6 +1,6 @@
 ---
 id: wra-txoc
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T09:30:19Z
@@ -20,3 +20,9 @@ Keep VmnetGateway and GuestTcpCore synchronous and single-owner. Do not leak mio
 
 The vmnet gateway no longer relies on periodic idle sleeps for host listener/session and upstream socket progress. smoltcp remains serialized behind one runtime owner. Existing vm-frontend offline tests pass. New tests cover the event model and at least host_ingress and tcp_proxy readiness dispatch. Documentation or ticket notes explain the remaining path to a future Tokio actor driver.
 
+
+## Notes
+
+**2026-05-15T09:45:53Z**
+
+Completed the mio readiness runtime epic. Added a narrow vmnet_poller driver, readiness-aware host_ingress and tcp_proxy bridge entry points, smoltcp poll-delay scheduling, QEMU stream fd readiness handling in serve_vmnet_gateway, docs for the validation/Tokio path, and offline tests for the new event boundary and buffered readiness behavior. Validation: cargo test --manifest-path vm-frontend/Cargo.toml --offline; cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check.

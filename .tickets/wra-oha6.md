@@ -1,6 +1,6 @@
 ---
 id: wra-oha6
-status: open
+status: closed
 deps: [wra-wway]
 links: []
 created: 2026-05-15T09:31:49Z
@@ -21,3 +21,9 @@ Use existing fast offline tests as the required baseline. Add focused ignored/li
 
 Documentation and/or ticket notes record validation results, known limitations, and rollback/fallback behavior. The docs explain the future Tokio migration path and which modules should remain scheduler-agnostic. cargo test --manifest-path vm-frontend/Cargo.toml --offline and cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check pass. Any relevant live or ignored tests are documented with exact commands and results if run.
 
+
+## Notes
+
+**2026-05-15T09:45:37Z**
+
+Updated vm-frontend/README.md, requirements.md, validation-workflow.md, validation-matrix.md, and vmnet-runtime-validation.md for the readiness-driven runtime. Documented that future Tokio work should replace the event-source driver with channel-fed tasks while one actor owns smoltcp; smoltcp should not be shared behind locks. Validation run: cargo test --manifest-path vm-frontend/Cargo.toml --offline passed; cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check passed. Live QEMU readiness timing remains documented as a follow-up validation need because the command sandbox cannot exercise real QEMU/loopback fd readiness.

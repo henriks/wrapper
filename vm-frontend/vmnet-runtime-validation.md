@@ -275,16 +275,39 @@ escalation and passed.
 
 ## Remaining Gaps
 
-`sandbox-wrap` still constructs the current QEMU command with `-netdev user`
-and `hostfwd`, so running it as-is would validate the old path rather than this
-Rust vmnet gateway. Use `agentvm-frontend launch` for the stream path.
-
 Bounded validation timeouts now have explicit lifecycle reporting. A
 `--qemu-timeout-seconds 10` run exits with
 `qemu timed out after 10 seconds and was terminated with status: signal: 9 (SIGKILL)`;
 `state.json` records `status=timed_out`, and expected embedded backend
 disconnects after QEMU termination are suppressed instead of being printed as
 misleading composed-fs/config-fs/vmnet failures.
+
+## Readiness-Driven Runtime
+
+As of `wra-txoc`, the launched vmnet gateway uses a narrow `mio` poller instead
+of a fixed idle sleep as the normal progress mechanism. The poller owns QEMU
+stream, host listener/session, and upstream session fd registration and maps raw
+readiness back into domain events. `VmnetGateway` and `GuestTcpCore` remain
+synchronous and single-owner; smoltcp is advanced explicitly when guest frames
+arrive, app data is sent, sessions close, or the smoltcp poll deadline expires.
+
+The current offline validation command was:
+
+```sh
+cargo test --manifest-path vm-frontend/Cargo.toml --offline
+```
+
+It covers the runtime poller registration boundary, readiness-buffered host
+ingress writes, readiness-buffered upstream proxy writes, QEMU stream framing,
+policy behavior, pcap output, and event-log formatting. Live KVM validation
+should still be run before relying on this for long interactive sessions because
+the command sandbox cannot exercise the real QEMU stream fd, loopback listeners,
+or OS readiness timing.
+
+The future Tokio path should keep the same ownership rule: one actor owns
+smoltcp and receives QEMU/host/upstream events over channels. Tokio tasks may
+replace the `mio` driver as event sources, but smoltcp should not be shared
+behind locks or awaited across mutable gateway state.
 
 Additional booted validation still needed before replacement:
 

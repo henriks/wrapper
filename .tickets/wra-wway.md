@@ -1,6 +1,6 @@
 ---
 id: wra-wway
-status: open
+status: closed
 deps: [wra-pido]
 links: []
 created: 2026-05-15T09:31:29Z
@@ -21,3 +21,9 @@ Keep QEMU frame parsing/writing in QemuFrameIo or a narrow adapter. The runtime 
 
 serve_vmnet_gateway no longer uses DEFAULT_VMNET_IDLE_SLEEP as the primary idle mechanism for normal operation. QEMU frame readiness, EOF, frame writes, pcap capture, event logging, and smoltcp timer progress are handled by the readiness loop. Existing vmnet_stream/vmnet_gateway/vmnet_runtime tests pass, with added coverage for QEMU readable event, EOF shutdown, smoltcp deadline wake, and no busy idle loop. cargo test --manifest-path vm-frontend/Cargo.toml --offline passes.
 
+
+## Notes
+
+**2026-05-15T09:45:17Z**
+
+Integrated the readiness loop into serve_vmnet_gateway. The runtime registers QEMU stream fd and host listener fds, polls with the current smoltcp poll_delay as timeout, drains QEMU frames on readable readiness, accepts host listeners on listener readiness, dispatches host/proxy session readiness, advances smoltcp timer work on poll timeout, and syncs session fd interests after each pump. DEFAULT_VMNET_IDLE_SLEEP remains in config for compatibility but is no longer the normal serve loop idle mechanism.

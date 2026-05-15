@@ -87,6 +87,12 @@ impl GuestTcpCore {
         self.interface.poll(now, device, &mut self.sockets)
     }
 
+    pub fn poll_delay(&mut self, now: Instant) -> Option<std::time::Duration> {
+        self.interface
+            .poll_delay(now, &self.sockets)
+            .map(|delay| std::time::Duration::from_micros(delay.total_micros()))
+    }
+
     pub fn connect_to_guest(
         &mut self,
         network: &GuestNetwork,

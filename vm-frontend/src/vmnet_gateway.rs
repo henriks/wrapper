@@ -201,6 +201,15 @@ impl<'a> VmnetGateway<'a> {
         self.policy
     }
 
+    pub fn tcp_poll_delay(&mut self, now: Instant) -> Option<std::time::Duration> {
+        self.tcp_core.poll_delay(now)
+    }
+
+    pub fn poll_tcp(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        self.tcp_core.poll(now, &mut self.tcp_device);
+        self.drain_tcp_frames()
+    }
+
     fn handle_dns_frame(&self, frame: &[u8]) -> Option<DnsFrameResult> {
         let query = parse_dns_query_frame(self.policy, frame)?;
         let proxy = DnsProxy::new(self.policy, self.dns_upstream.as_ref());

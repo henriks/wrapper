@@ -69,6 +69,7 @@ Exact day-to-day commands are maintained in `validation-workflow.md`. Use
 | HTTPS/443 MITM | Missing CA fail-closed, generated CA load, per-host cert generation, SNI handling, guest TLS termination, upstream TLS, large TLS responses, fragmented records, certificate trust env. | In-process integration; live KVM/QEMU | `wra-czl0`, `wra-9udq` |
 | Policy matrix | Default deny, wrapper default public egress, `--no-net`, allowed domain/IP, denied private/metadata IPs, blocked UDP/443, IPv6 denied, unsupported protocols denied. | Fast offline unit; live KVM/QEMU | `wra-y325`, `wra-9udq` |
 | Host ingress | Payload listener, Docker listener, published TCP ports, no-net interaction, multiple listeners, close/error propagation, backpressure, event logs. | In-process integration; live KVM/QEMU | `wra-bc6k`, `wra-9udq` |
+| Runtime readiness | `mio` token registration, QEMU stream readiness, host listener/session readiness, upstream proxy readiness, pending write interest updates, smoltcp timer wakeups, no fixed idle polling as the normal progress mechanism. | Fast offline unit; in-process integration; live KVM/QEMU | `wra-txoc` |
 | Capture and observability | pcap file shape, `vmnet-events.log` content, denied preaccept logs, DNS decisions, TCP connect events, TLS failure detail, partial-send diagnostics without leaking secrets. | Fast offline unit; live KVM/QEMU | `wra-mvxd` |
 
 ## Filesystem And Runtime Sharing Matrix

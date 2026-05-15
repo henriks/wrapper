@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -46,6 +47,25 @@ impl VmnetStreamEndpoint {
         let (stream, _addr) = self.listener.accept()?;
         stream.set_nonblocking(true)?;
         Ok(QemuFrameIo::new(stream, DEFAULT_MAX_FRAME_LEN))
+    }
+
+    pub fn listener_raw_fd(&self) -> RawFd {
+        self.listener.as_raw_fd()
+    }
+
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.listener.set_nonblocking(nonblocking)
+    }
+
+    pub fn accept_ready(&self) -> io::Result<Option<VmnetFrameIo>> {
+        match self.listener.accept() {
+            Ok((stream, _addr)) => {
+                stream.set_nonblocking(true)?;
+                Ok(Some(QemuFrameIo::new(stream, DEFAULT_MAX_FRAME_LEN)))
+            }
+            Err(error) if would_block(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -151,6 +171,15 @@ where
 
     pub fn into_inner(self) -> T {
         self.stream
+    }
+}
+
+impl<T> QemuFrameIo<T>
+where
+    T: AsRawFd,
+{
+    pub fn raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 

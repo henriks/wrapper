@@ -181,6 +181,10 @@ QEMU uses `-netdev stream` over a Unix socket. The Rust vmnet gateway owns the
 guest network boundary in userspace:
 
 - default policy is deny-by-default unless an allow profile is selected
+- the gateway waits on QEMU stream, host listener/session, and upstream socket
+  readiness through a narrow `mio` poller
+- smoltcp remains single-owner and is advanced explicitly on guest packets,
+  app data, close events, and smoltcp timer deadlines
 - `--allow-public-internet` is used by direct `launch` for public egress
 - wrapper mode enables public egress unless `--no-net` is supplied
 - configured projects can select `public`, `none`, or `allowlist` network mode

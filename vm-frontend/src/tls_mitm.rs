@@ -240,6 +240,10 @@ impl TlsUpstreamSession {
     pub fn is_handshaking(&self) -> bool {
         self.client.is_handshaking()
     }
+
+    pub fn wants_write(&self) -> bool {
+        self.client.wants_write()
+    }
 }
 
 const TLS_FEED_CHUNK_SIZE: usize = 1024;

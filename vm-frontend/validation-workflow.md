@@ -21,6 +21,10 @@ cargo test --manifest-path vm-frontend/Cargo.toml --offline
 
 Expected runtime is a few seconds on a warm build. This tier must not require
 network access, root, `/dev/kvm`, QEMU, Docker, or rebuilt appliance artifacts.
+For vmnet runtime changes this tier covers the domain event/poller boundary,
+readiness-buffered host ingress writes, readiness-buffered upstream proxy
+writes, smoltcp/QEMU stream framing, policy behavior, pcap output, and event log
+formatting without depending on host loopback networking.
 
 ## Stress And Property
 

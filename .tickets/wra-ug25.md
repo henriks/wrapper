@@ -1,6 +1,6 @@
 ---
 id: wra-ug25
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-15T09:30:35Z
@@ -21,3 +21,9 @@ Create small domain types or traits in/near vmnet_runtime for readiness events a
 
 There is a checked-in event/boundary abstraction or documented in-code structure that later mio tickets can use. VmnetGateway/GuestTcpCore remain synchronous and single-owner. No mio::Token or mio::Registry appears in vmnet_gateway, guest_tcp, network_policy, or tcp_gateway. cargo test --manifest-path vm-frontend/Cargo.toml --offline passes.
 
+
+## Notes
+
+**2026-05-15T09:44:02Z**
+
+Implemented vmnet runtime event boundary around VmnetEventSource/VmnetReadyEvent/VmnetInterest in vm-frontend/src/vmnet_poller.rs. VmnetGateway and GuestTcpCore remain synchronous and single-owner; no mio types were added to vmnet_gateway, guest_tcp, network_policy, or tcp_gateway. Added smoltcp poll-delay exposure for runtime timer scheduling.

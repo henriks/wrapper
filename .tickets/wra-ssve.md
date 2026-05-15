@@ -1,6 +1,6 @@
 ---
 id: wra-ssve
-status: open
+status: closed
 deps: [wra-tegy]
 links: []
 created: 2026-05-15T09:30:59Z
@@ -21,3 +21,9 @@ HostIngressBridge may expose readiness-specific operations such as accept_ready,
 
 Host ingress listener accepts and host session read/write progress are driven by readiness events rather than unconditional per-tick scanning. Existing host_ingress tests pass, with added coverage for readiness-triggered accept, readable host payload, writable guest payload flush, guest close propagation, and deregistration on close/failure. cargo test --manifest-path vm-frontend/Cargo.toml --offline passes.
 
+
+## Notes
+
+**2026-05-15T09:44:36Z**
+
+Moved host ingress toward readiness dispatch. HostIngressListenerSet now exposes listener fds and accept_ready(index). HostIngressBridge has HostIngressReadiness, per-session interests, raw fd access for TcpStream sessions, and pending host-write buffering so guest payload is not dropped when the host socket is not writable. vmnet_runtime registers/deregisters host sessions through RuntimePoller. Added readiness_buffers_guest_payload_until_host_socket_is_writable regression coverage.

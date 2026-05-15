@@ -45,10 +45,13 @@ HTTP/HTTPS interception decisions, expose a host `TcpStream` connector boundary,
 and parse HTTP/1 request method/path/host with `httparse`.
 
 The guest TCP stack and stream runtime are in `src/guest_tcp.rs`,
-`src/vmnet_gateway.rs`, `src/tcp_proxy.rs`, and `src/vmnet_runtime.rs`. They use
-`smoltcp` to terminate guest TCP sessions in userspace, preserve original
-destinations for policy, bridge allowed sessions to ordinary host sockets, and
-write upstream bytes back as guest Ethernet frames. The launched gateway writes
+`src/vmnet_gateway.rs`, `src/tcp_proxy.rs`, `src/host_ingress.rs`,
+`src/vmnet_poller.rs`, and `src/vmnet_runtime.rs`. They use `smoltcp` to
+terminate guest TCP sessions in userspace, preserve original destinations for
+policy, bridge allowed sessions to ordinary host sockets, and write upstream
+bytes back as guest Ethernet frames. The launched gateway uses a narrow `mio`
+poller for QEMU stream, host listener/session, and upstream socket readiness
+while keeping smoltcp owned by one synchronous runtime owner. The gateway writes
 concise TCP/HTTP event summaries to `.sandbox/docker-vm/run/vmnet-events.log`.
 Denied pre-accept TCP SYNs emit guest-visible resets and `tcp_denied_preaccept`
 events so blocked destinations fail closed without hanging guest connects.
