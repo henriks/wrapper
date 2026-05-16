@@ -2,7 +2,7 @@
 id: wra-ylt9
 status: open
 deps: [wra-e9sc]
-links: []
+links: [wra-t9s7]
 created: 2026-05-15T22:51:42Z
 type: bug
 priority: 2

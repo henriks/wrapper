@@ -2,7 +2,7 @@
 id: wra-y5l6
 status: open
 deps: []
-links: []
+links: [wra-xaf5, wra-xo1i]
 created: 2026-05-15T21:09:57Z
 type: feature
 priority: 3
