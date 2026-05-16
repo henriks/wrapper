@@ -43,6 +43,7 @@ selected Alpine branch, and installs only the packages needed for the guest:
 - `iproute2`
 - `util-linux`
 - `bubblewrap`
+- `bash`
 - `nodejs`
 - `npm`
 - pinned upstream `mise`
