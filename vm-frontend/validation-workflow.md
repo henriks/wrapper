@@ -11,7 +11,7 @@ The required gate performs the validation documentation drift check, `cargo fmt
 --check` for the Rust crates and fuzz package, composed-fs and vm-frontend
 offline tests, offline guest service tests, fuzz target compilation with `cargo
 check --manifest-path vm-frontend/fuzz/Cargo.toml --offline`, the quick
-`live-smoke` host live validation scenario, and the `live-setup-tools` Codex
+`live-smoke` host live validation scenario, and the `live-setup-tools` Codex/Pi
 bootstrap/persistence scenario. `full` is an alias for the same gate.
 If `/dev/kvm` is unavailable, the gate fails with a host-live limitation instead
 of silently passing; rerun it on a KVM-capable host before closing live
@@ -132,7 +132,7 @@ Run after rebuilding appliance artifacts and before closing live frontend
 contract work. The live matrix has named scenarios:
 
 - `live-smoke` (also `host-live`/`live`): quick required self-test with the published payload listener.
-- `live-setup-tools`: required Codex setup-tool bootstrap over npm/TLS MITM, then no-net relaunch from persisted guest state and optional-package metadata verification.
+- `live-setup-tools`: required Codex and Pi setup-tool bootstrap through the targeted mise config over npm/TLS MITM, then no-net relaunch from persisted guest state and package metadata verification.
 - `live-hostile`: slower hostile/no-net self-test that probes denied metadata/loopback/DNS behavior.
 - `live-payload`: payload protocol stress self-test with a large request environment and large guest output.
 - `live-dns`: allowed resolver-path and denied/no-net resolver-path self-tests with explicit query diagnostics.

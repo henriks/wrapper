@@ -44,6 +44,44 @@ struct Manifest {
     synthetic: Option<SyntheticSpec>,
     #[serde(default)]
     protected_guest_paths: Vec<String>,
+    #[serde(default)]
+    shadow_root: Option<String>,
+    #[serde(default)]
+    filters: Vec<FilterSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilterSpec {
+    #[serde(default)]
+    mount_id: Option<String>,
+    suffixes: Vec<String>,
+    action: FilterAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum FilterAction {
+    HideAndShadow,
+}
+
+impl FilterSpec {
+    fn validate(&self) -> io::Result<()> {
+        if self.suffixes.is_empty() {
+            return Err(invalid_input("filter suffixes cannot be empty"));
+        }
+        for suffix in &self.suffixes {
+            if suffix.is_empty() || suffix.contains('/') || suffix.contains('\0') {
+                return Err(invalid_input(format!(
+                    "filter suffix must be a non-empty path-component suffix: {suffix:?}"
+                )));
+            }
+        }
+        match self.action {
+            FilterAction::HideAndShadow => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +201,10 @@ enum NodeKind {
         mount: usize,
         relative_path: PathBuf,
     },
+    Shadow {
+        mount: usize,
+        relative_path: PathBuf,
+    },
 }
 
 #[derive(Debug)]
@@ -184,6 +226,9 @@ struct MountRuntime {
     root: File,
     kind: MountKind,
     access: AccessMode,
+    filter_suffixes: Vec<String>,
+    shadow_root_path: Option<PathBuf>,
+    shadow_root: Option<File>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -193,6 +238,12 @@ struct HostKey {
     ino: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ShadowKey {
+    mount: usize,
+    relative_path: PathBuf,
+}
+
 #[derive(Debug)]
 struct Namespace {
     nodes: HashMap<u64, Node>,
@@ -200,6 +251,7 @@ struct Namespace {
     path_to_inode: HashMap<String, u64>,
     mounts: Vec<MountRuntime>,
     host_inodes: HashMap<HostKey, u64>,
+    shadow_inodes: HashMap<ShadowKey, u64>,
     next_inode: u64,
     synthetic_uid: u32,
     synthetic_gid: u32,
@@ -247,6 +299,23 @@ impl Namespace {
             return Err(invalid_input("manifest must contain at least one mount"));
         }
 
+        if manifest.shadow_root.is_some() && manifest.filters.is_empty() {
+            return Err(invalid_input("shadow_root requires at least one filter"));
+        }
+        for filter in &manifest.filters {
+            filter.validate()?;
+        }
+        if !manifest.filters.is_empty() && manifest.shadow_root.is_none() {
+            return Err(invalid_input("filters require shadow_root"));
+        }
+        let shadow_root_path = manifest.shadow_root.as_ref().map(PathBuf::from);
+        if let Some(path) = &shadow_root_path {
+            if !path.is_absolute() {
+                return Err(invalid_input("shadow_root must be absolute"));
+            }
+            fs::create_dir_all(path)?;
+        }
+
         let synthetic = manifest.synthetic.as_ref();
         let synthetic_uid = synthetic.map_or(0, |s| s.uid);
         let synthetic_gid = synthetic.map_or(0, |s| s.gid);
@@ -261,6 +330,7 @@ impl Namespace {
             path_to_inode: HashMap::new(),
             mounts: Vec::new(),
             host_inodes: HashMap::new(),
+            shadow_inodes: HashMap::new(),
             next_inode: ROOT_ID + 1,
             synthetic_uid,
             synthetic_gid,
@@ -289,6 +359,18 @@ impl Namespace {
                 )));
             }
             let mount_index = ns.mounts.len();
+            let filter_suffixes = manifest
+                .filters
+                .iter()
+                .filter(|filter| filter.mount_id.as_deref().is_none_or(|id| id == mount.id))
+                .flat_map(|filter| filter.suffixes.iter().cloned())
+                .collect::<Vec<_>>();
+            let shadow_root_path_for_mount = (!filter_suffixes.is_empty())
+                .then(|| shadow_root_path.clone().expect("filters require shadow_root"));
+            let shadow_root = shadow_root_path_for_mount
+                .as_ref()
+                .map(|path| open_mount_root(path, MountKind::Dir))
+                .transpose()?;
             let root = open_mount_root(Path::new(&mount.host_path), mount.kind)?;
             ns.mounts.push(MountRuntime {
                 id: mount.id.clone(),
@@ -296,6 +378,9 @@ impl Namespace {
                 root,
                 kind: mount.kind,
                 access: mount.access,
+                filter_suffixes,
+                shadow_root_path: shadow_root_path_for_mount,
+                shadow_root,
             });
 
             let components = path_components(&guest_path)?;

@@ -1705,6 +1705,7 @@ struct SelfTestConfig {
     payload_stress: bool,
     dns_check: bool,
     docker_net_check: bool,
+    skip_sqlite_concurrency: bool,
     fs_check: bool,
     root_persistence_check: bool,
     expect_root_persistence: bool,
@@ -1785,7 +1786,8 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "self-test".to_string());
-    let skip_sqlite_concurrency = self_test.docker_net_check && self_test.no_net;
+    let skip_sqlite_concurrency =
+        self_test.skip_sqlite_concurrency || (self_test.docker_net_check && self_test.no_net);
     let sqlite_concurrency_host_db = config
         .project
         .join(format!(".agentvm-self-test-sqlite/{sqlite_db_name}.sqlite"));
@@ -2078,6 +2080,7 @@ fn self_test_config_from_args(args: &[String]) -> Result<SelfTestConfig, String>
         payload_stress: matches.get_flag("payload_stress"),
         dns_check: matches.get_flag("dns_check"),
         docker_net_check: matches.get_flag("docker_net_check"),
+        skip_sqlite_concurrency: matches.get_flag("skip_sqlite_concurrency"),
         fs_check: matches.get_flag("fs_check"),
         root_persistence_check: matches.get_flag("root_persistence_check"),
         expect_root_persistence: matches.get_flag("expect_root_persistence"),
@@ -2138,6 +2141,11 @@ fn self_test_clap_command() -> ClapCommand {
         .arg(
             Arg::new("docker_net_check")
                 .long("docker-net-check")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("skip_sqlite_concurrency")
+                .long("skip-sqlite-concurrency")
                 .action(ArgAction::SetTrue),
         )
         .arg(
@@ -3031,23 +3039,44 @@ fn tool_bootstrap_payload_script(
     command.push(shell_quote(cli));
     command.extend(auto_flags.iter().map(|flag| shell_quote(flag)));
     command.extend(tool_args.iter().map(|arg| shell_quote(arg)));
-    let npm_package = format!("{npm_package}@latest");
-    let install_message =
-        format!("agentvm: installing {cli} CLI in guest HOME (first run only)...");
+    const NODE_HTTP_TOOL: &str = "http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]";
+    const NODE_HTTP_VERSION: &str = "24.15.0";
+    let node_http_spec = format!("{NODE_HTTP_TOOL}@{NODE_HTTP_VERSION}");
+    let npm_tool = format!("npm:{npm_package}");
+    let npm_tool_spec = format!("{npm_tool}@latest");
+    let install_message = format!("agentvm: installing {cli} CLI with mise in guest HOME...");
     [
-        r#"export NPM_CONFIG_PREFIX="$HOME/.local""#.to_string(),
-        r#"mkdir -p "$NPM_CONFIG_PREFIX""#.to_string(),
+        r#"export AGENTVM_MISE_DIR="$HOME/.config/agentvm/mise""#.to_string(),
+        r#"export AGENTVM_MISE_BOOTSTRAP_DIR="${TMPDIR:-/tmp}/agentvm-mise-bootstrap""#.to_string(),
+        r#"mkdir -p "$AGENTVM_MISE_DIR" "$AGENTVM_MISE_BOOTSTRAP_DIR""#.to_string(),
         format!(
-            "if ! command -v {} >/dev/null 2>&1 || ! {} --version >/dev/null 2>&1; then if ! command -v npm >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi; printf '%s\\n' {} >&2; npm install --global --force --no-progress {}; fi",
+            "printf '%s\\n' '[tools]' {} {} > \"$AGENTVM_MISE_DIR/mise.toml\"",
+            shell_quote(&format!(
+                "{} = \"{}\"",
+                toml_basic_string(NODE_HTTP_TOOL),
+                NODE_HTTP_VERSION
+            )),
+            shell_quote(&format!("{} = \"latest\"", toml_basic_string(&npm_tool)))
+        ),
+        r#"export MISE_TRUSTED_CONFIG_PATHS="$AGENTVM_MISE_DIR${MISE_TRUSTED_CONFIG_PATHS:+:$MISE_TRUSTED_CONFIG_PATHS}""#.to_string(),
+        "export MISE_YES=true MISE_TERMINAL_PROGRESS=false NPM_CONFIG_PROGRESS=false NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false NPM_CONFIG_MAXSOCKETS=1 NPM_CONFIG_FETCH_RETRIES=5 NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000 NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=20000".to_string(),
+        format!(
+            "if ! command -v mise >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
+            shell_quote(&format!("agentvm: mise is required to install {cli} CLI"))
+        ),
+        format!(
+            "if ! MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false mise exec -C \"$AGENTVM_MISE_DIR\" -- {} --version >/dev/null 2>&1; then printf '%s\\n' {} >&2; mise install --quiet --force --yes --jobs 1 -C \"$AGENTVM_MISE_BOOTSTRAP_DIR\" {} || exit $?; mise install --quiet --force --yes --jobs 1 -C \"$AGENTVM_MISE_DIR\" {} || exit $?; fi",
             shell_quote(cli),
-            shell_quote(cli),
-            shell_quote(&format!("agentvm: npm is required to install {cli} CLI")),
             shell_quote(&install_message),
-            shell_quote(&npm_package)
+            shell_quote(&node_http_spec),
+            shell_quote(&npm_tool_spec),
         ),
         "hash -r 2>/dev/null || true".to_string(),
-        r#"export MISE_TRUSTED_CONFIG_PATHS="$PWD""#.to_string(),
-        format!("exec {}", command.join(" ")),
+        format!(
+            "exec mise exec -C \"$AGENTVM_MISE_DIR\" -- sh -c {} sh \"$PWD\" {}",
+            shell_quote("cd \"$1\" && shift && exec \"$@\""),
+            command.join(" ")
+        ),
     ]
     .join(" && ")
 }
@@ -3056,6 +3085,11 @@ fn shell_quote(value: &str) -> String {
     shlex::try_quote(value)
         .expect("shell argument contains an embedded NUL byte")
         .into_owned()
+}
+
+fn toml_basic_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn host_home_dir() -> Result<PathBuf, String> {
@@ -3448,7 +3482,7 @@ fn print_usage() {
 
 fn print_self_test_usage() {
     eprintln!(
-        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--no-net] [--hostile]"
+        "usage: agentvm-frontend self-test [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--skip-sqlite-concurrency] [--no-net] [--hostile]"
     );
 }
 
@@ -4046,8 +4080,8 @@ mod tests {
         }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
-                && window[1].contains("@openai/codex@latest")
-                && window[1].contains("exec codex --dangerously-bypass-approvals-and-sandbox")
+                && window[1].contains("\"npm:@openai/codex\" = \"latest\"")
+                && window[1].contains("codex --dangerously-bypass-approvals-and-sandbox")
         }));
     }
 
@@ -4078,8 +4112,9 @@ mod tests {
         }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
-                && window[1].contains("@mariozechner/pi-coding-agent@latest")
-                && window[1].contains("exec pi")
+                && window[1].contains("\"npm:@mariozechner/pi-coding-agent\" = \"latest\"")
+                && window[1].contains("exec \"$@\"")
+                && window[1].contains(" pi")
         }));
     }
 
@@ -4090,15 +4125,21 @@ mod tests {
             &["--model".to_string(), "claude 3.5".to_string()],
         );
 
-        assert!(script.contains("command -v pi >/dev/null 2>&1"));
-        assert!(script.contains("pi --version >/dev/null 2>&1"));
-        assert!(script.contains(
-            "npm install --global --force --no-progress @mariozechner/pi-coding-agent@latest"
-        ));
-        assert!(script.contains("agentvm: npm is required to install pi CLI"));
-        assert!(script.contains("agentvm: installing pi CLI in guest HOME (first run only)"));
-        assert!(script.contains("exec pi --model 'claude 3.5'"));
-        assert!(script.contains("MISE_TRUSTED_CONFIG_PATHS=\"$PWD\""));
+        assert!(script.contains("command -v mise >/dev/null 2>&1"));
+        assert!(script.contains("\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\""));
+        assert!(script.contains("http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]@24.15.0"));
+        assert!(script.contains("\"npm:@mariozechner/pi-coding-agent\" = \"latest\""));
+        assert!(
+            script.contains("MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false mise exec -C")
+        );
+        assert!(script.contains("mise install --quiet --force --yes --jobs 1 -C"));
+        assert!(script.contains("MISE_TERMINAL_PROGRESS=false"));
+        assert!(script.contains("NPM_CONFIG_PROGRESS=false"));
+        assert!(script.contains("NPM_CONFIG_MAXSOCKETS=1"));
+        assert!(script.contains("agentvm: mise is required to install pi CLI"));
+        assert!(script.contains("agentvm: installing pi CLI with mise in guest HOME"));
+        assert!(script.contains("--model 'claude 3.5'"));
+        assert!(script.contains("MISE_TRUSTED_CONFIG_PATHS=\"$AGENTVM_MISE_DIR"));
     }
 
     #[test]
@@ -4108,11 +4149,14 @@ mod tests {
             &["--profile".to_string(), "work account".to_string()],
         );
 
-        assert!(script.contains("command -v codex >/dev/null 2>&1"));
+        assert!(script.contains("command -v mise >/dev/null 2>&1"));
+        assert!(script.contains("\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\""));
+        assert!(script.contains("http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]@24.15.0"));
+        assert!(script.contains("\"npm:@openai/codex\" = \"latest\""));
         assert!(script.contains("codex --version >/dev/null 2>&1"));
-        assert!(script.contains("npm install --global --force --no-progress @openai/codex@latest"));
-        assert!(script.contains("agentvm: npm is required to install codex CLI"));
-        assert!(script.contains("agentvm: installing codex CLI in guest HOME (first run only)"));
+        assert!(script.contains("mise install --quiet --force --yes --jobs 1 -C"));
+        assert!(script.contains("agentvm: mise is required to install codex CLI"));
+        assert!(script.contains("agentvm: installing codex CLI with mise in guest HOME"));
         assert!(script.contains("--dangerously-bypass-approvals-and-sandbox"));
         assert!(script.contains("--profile 'work account'"));
     }
@@ -5026,6 +5070,7 @@ mod tests {
             "--payload-stress".to_string(),
             "--dns-check".to_string(),
             "--docker-net-check".to_string(),
+            "--skip-sqlite-concurrency".to_string(),
             "--fs-check".to_string(),
         ])
         .expect("self-test config");
@@ -5045,6 +5090,7 @@ mod tests {
         assert!(config.payload_stress);
         assert!(config.dns_check);
         assert!(config.docker_net_check);
+        assert!(config.skip_sqlite_concurrency);
         assert!(config.fs_check);
     }
 

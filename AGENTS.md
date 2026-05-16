@@ -4,6 +4,7 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 * when creating epics and tickets ensure the dependencies between tickets reflect implementation order correctly
 * when working on a ticket, add notes for any significant insights gained during implementation
 * when working on a ticket, if encountering details relevant to other tickets, document them in said other tickets
+* if encountering bugs during development, make sure to document them as a bug ticket, instead of working around their impact in an inoptimal way -- that way we can return to them
 * when done with a ticket, remember to close it
 
 
@@ -19,8 +20,9 @@ Always consider carefully whether a problem can be solved by removing and combin
 
 # Testing
 
-After code changes, run the required validation gate before considering the work done: `./vm-frontend/validate.sh required`. That gate includes formatting, composed-fs and vm-frontend offline tests, offline guest service tests, fuzz target compilation, documentation drift checks, the quick live host scenario (`live-smoke`), and the setup-tool bootstrap/persistence live scenario (`live-setup-tools`). The live-only tier remains available as `./vm-frontend/validate.sh host-live` (or `live`), and broader live scenarios are available through `live-setup-tools`, `live-hostile`, `live-payload`, `live-dns`, `live-docker`, `live-fs`, and `live-full`. If live validation cannot be run in the current environment, explicitly document that limitation and ask the user to run it.
+After code changes, run the required validation gate before considering the work done: `./vm-frontend/validate.sh required`. That gate includes formatting, composed-fs and vm-frontend offline tests, offline guest service tests, fuzz target compilation, documentation drift checks, the quick live host scenario (`live-smoke`), and the Codex/Pi setup-tool bootstrap/persistence live scenario (`live-setup-tools`). The live-only tier remains available as `./vm-frontend/validate.sh host-live` (or `live`), and broader live scenarios are available through `live-setup-tools`, `live-hostile`, `live-payload`, `live-dns`, `live-docker`, `live-fs`, and `live-full`. If live validation cannot be run in the current environment, explicitly document that limitation and ask the user to run it.
 
 Unless code has been exercised in the live environment, do not mark a task as completed.
 
 For any code dealing with arbitrary input and output, make sure to add fuzzing tests.
+

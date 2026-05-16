@@ -48,6 +48,7 @@ live environment overrides:
   DOCKER_PUBLISH_HOST_PORT=12080
   DOCKER_PUBLISH_GUEST_PORT=18080
   SETUP_TOOL_SMOKE_PROJECT=.sandbox/setup-tool-smoke/codex
+  PI_SETUP_TOOL_SMOKE_PROJECT=.sandbox/setup-tool-smoke/pi
 EOF
 }
 
@@ -161,13 +162,15 @@ live_smoke() {
   run_self_test_scenario \
     "live-smoke self-test: publish-payload-port=${publish_port}" \
     "${ROOT}/.sandbox/docker-vm/self-test" \
-    --publish-payload-port "${publish_port}"
+    --publish-payload-port "${publish_port}" \
+    --skip-sqlite-concurrency
 }
 
 live_setup_tools() {
   require_kvm
   local qemu="${QEMU:-/usr/bin/qemu-system-x86_64}"
   local project="${SETUP_TOOL_SMOKE_PROJECT:-${ROOT}/.sandbox/setup-tool-smoke/codex}"
+  local pi_project="${PI_SETUP_TOOL_SMOKE_PROJECT:-${ROOT}/.sandbox/setup-tool-smoke/pi}"
   local agentvm="${ROOT}/vm-frontend/target/debug/agentvm"
   announce "live-setup-tools: building agentvm wrapper"
   cargo build --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm
@@ -193,6 +196,10 @@ EOF
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
     --no-tui 2>&1 | tee "${bootstrap_log}"
+  grep -Fq "agentvm: installing codex CLI with mise" "${bootstrap_log}" || {
+    echo "error: codex bootstrap did not use mise install path" >&2
+    exit 1
+  }
   grep -Fq "codex-cli" "${bootstrap_log}" || {
     echo "error: codex bootstrap did not print codex-cli version" >&2
     exit 1
@@ -219,10 +226,68 @@ EOF
     --qemu "${qemu}" \
     --no-net \
     --payload-no-stdin \
-    --payload-script 'set -e; pkg="$HOME/.local/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; codex --version' \
+    --payload-script 'set -e; export MISE_TRUSTED_CONFIG_PATHS="$HOME/.config/agentvm/mise"; grep -F "\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\"" "$HOME/.config/agentvm/mise/mise.toml"; grep -F "\"npm:@openai/codex\" = \"latest\"" "$HOME/.config/agentvm/mise/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; mise exec -C "$HOME/.config/agentvm/mise" -- codex --version' \
     2>&1 | tee "${metadata_log}"
   grep -Fq "codex-cli" "${metadata_log}" || {
     echo "error: codex metadata verification did not print codex-cli version" >&2
+    exit 1
+  }
+
+  rm -rf "${pi_project}"
+  mkdir -p "${pi_project}/.sandbox"
+  cat >"${pi_project}/.sandbox/config.json" <<EOF
+{
+  "schema_version": 2,
+  "setup_tool": "pi",
+  "default_command": { "command": "pi", "args": ["--version"] },
+  "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
+  "auth": { "github": false, "aws_profile": null },
+  "shares": [],
+  "published_ports": []
+}
+EOF
+
+  local pi_bootstrap_log="${pi_project}/.sandbox/pi-bootstrap.log"
+  announce "live-setup-tools: pi bootstrap over public egress/TLS MITM"
+  "${agentvm}" \
+    --project "${pi_project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-tui 2>&1 | tee "${pi_bootstrap_log}"
+  grep -Fq "agentvm: installing pi CLI with mise" "${pi_bootstrap_log}" || {
+    echo "error: pi bootstrap did not use mise install path" >&2
+    exit 1
+  }
+  grep -Eq '^([[:digit:]]+\.){2}[[:digit:]]+' "${pi_bootstrap_log}" || {
+    echo "error: pi bootstrap did not print a semver version" >&2
+    exit 1
+  }
+
+  local pi_restart_log="${pi_project}/.sandbox/pi-no-net-restart.log"
+  announce "live-setup-tools: pi no-net restart from persisted guest state"
+  "${agentvm}" \
+    --project "${pi_project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-tui \
+    --no-net 2>&1 | tee "${pi_restart_log}"
+  grep -Eq '^([[:digit:]]+\.){2}[[:digit:]]+' "${pi_restart_log}" || {
+    echo "error: pi persisted no-net restart did not print a semver version" >&2
+    exit 1
+  }
+
+  local pi_metadata_log="${pi_project}/.sandbox/pi-metadata.log"
+  announce "live-setup-tools: pi package metadata survived payload shutdown"
+  "${agentvm}" launch \
+    --project "${pi_project}" \
+    --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
+    --qemu "${qemu}" \
+    --no-net \
+    --payload-no-stdin \
+    --payload-script 'set -e; export MISE_TRUSTED_CONFIG_PATHS="$HOME/.config/agentvm/mise"; grep -F "\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\"" "$HOME/.config/agentvm/mise/mise.toml"; grep -F "\"npm:@mariozechner/pi-coding-agent\" = \"latest\"" "$HOME/.config/agentvm/mise/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@mariozechner/pi-coding-agent/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; version=$(mise exec -C "$HOME/.config/agentvm/mise" -- pi --version); case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "unexpected pi version: $version" >&2; exit 1 ;; esac; echo "pi-version=$version"' \
+    2>&1 | tee "${pi_metadata_log}"
+  grep -Fq "pi-version=" "${pi_metadata_log}" || {
+    echo "error: pi metadata verification did not print pi-version" >&2
     exit 1
   }
 }
