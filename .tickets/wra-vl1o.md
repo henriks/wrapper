@@ -2,7 +2,7 @@
 id: wra-vl1o
 status: open
 deps: [wra-i3t9]
-links: []
+links: [wra-rh21, wra-g13g]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 2

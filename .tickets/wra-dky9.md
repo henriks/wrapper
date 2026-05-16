@@ -2,7 +2,7 @@
 id: wra-dky9
 status: open
 deps: []
-links: []
+links: [wra-lcbk, wra-sum7, wra-g0uv]
 created: 2026-05-16T15:50:48Z
 type: bug
 priority: 2

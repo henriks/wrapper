@@ -2,7 +2,7 @@
 id: wra-sum7
 status: open
 deps: [wra-g0uv]
-links: []
+links: [wra-lcbk, wra-dky9, wra-g0uv]
 created: 2026-05-16T15:50:48Z
 type: bug
 priority: 2

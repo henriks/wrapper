@@ -1,0 +1,53 @@
+---
+id: wra-yl7i
+status: open
+deps: []
+links: [wra-bjaa]
+created: 2026-05-16T16:12:05Z
+type: feature
+priority: 1
+assignee: Henrik Saksela
+tags: [tui, control-socket, frontend, architecture, agentvm]
+---
+# Make the TUI a control-socket frontend to the agentvm supervisor
+
+Problem / direction:
+The current TUI is coupled directly into the launch/payload path. It should become a frontend client to an actual running agentvm supervisor process, communicating over a control socket or equivalent local IPC. The supervisor should own VM lifecycle, payload sessions, diagnostics, status, logs, and shutdown semantics; the TUI should render/control that state rather than being the process that directly runs the VM path.
+
+Why this matters:
+- Makes future TUI features easier to develop: attach/detach, richer status panes, diagnostics, multiple views, prompts/decisions, and reconnect behavior.
+- Separates durable runtime ownership from presentation. Closing or crashing the TUI should not necessarily imply ambiguous VM/runtime cleanup unless explicitly requested.
+- Aligns with the async service-IO direction: agentvm can expose a structured control plane while internal service IO evolves independently.
+- Provides a cleaner boundary for plain CLI mode, TUI mode, tests, and possible future non-TUI clients.
+
+Relevant current code:
+- vm-frontend/src/main.rs run_launch currently decides plain vs TUI payload mode and directly starts/terminates the frontend.
+- vm-frontend/src/tui.rs currently runs the payload viewport in-process.
+- vm-frontend/src/payload_client.rs contains the payload protocol used after launch readiness.
+- vm-frontend/src/launch.rs owns RunningFrontend lifecycle, QEMU process handling, state.json, and termination.
+- Runtime artifacts already include .sandbox/docker-vm/run paths that could host a local control socket.
+
+Design questions to answer:
+- Is the control socket Unix-domain only, and where is it located under RuntimePaths?
+- What is the minimum protocol surface: status snapshot, subscribe events/logs, start payload, resize/input/signal payload, diagnostics, graceful shutdown, force shutdown?
+- How does auth/safety work for a project-local socket?
+- Can plain CLI and TUI both use the same control client API?
+- What happens on TUI disconnect while a payload is running?
+- How are protocol compatibility and config-file compatibility documented/tested?
+
+Suggested implementation shape:
+1. Define a small typed control protocol and supervisor/client boundary without changing runtime behavior.
+2. Move launch ownership into an agentvm supervisor that exposes the socket and writes state/events.
+3. Rework plain payload mode and TUI mode to use the same control client.
+4. Add attach/reconnect semantics after the basic protocol is stable.
+
+Validation:
+- Unit tests for protocol framing/serialization and state transitions.
+- Integration test that starts a supervisor, connects a client, runs a payload, disconnects/reconnects, and observes consistent status.
+- TUI/PTY test proving terminal UI is only a client and nonzero payload failures are still visible after terminal restore.
+- Live validation before closing because this changes lifecycle ownership.
+
+Related work:
+- Link to async runtime epic wra-bjaa: the control plane should be designed so vmnet/service IO can move to Tokio without changing TUI semantics.
+- Related stability tickets include payload cancellation, graceful shutdown, and TUI post-restore summaries.
+

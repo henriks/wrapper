@@ -2,7 +2,7 @@
 id: wra-rh21
 status: open
 deps: []
-links: []
+links: [wra-vl1o, wra-g13g]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 2

@@ -2,7 +2,7 @@
 id: wra-e9sr
 status: open
 deps: [wra-i3t9]
-links: []
+links: [wra-57z4, wra-nui7]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 1
