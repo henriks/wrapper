@@ -464,6 +464,8 @@ fn manifest_with_mounts(mounts: Vec<MountSpec>) -> Manifest {
             dir_mode: "0555".to_string(),
         }),
         protected_guest_paths: vec![],
+        shadow_root: None,
+        filters: Vec::new(),
     }
 }
 

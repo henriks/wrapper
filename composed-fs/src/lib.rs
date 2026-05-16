@@ -103,6 +103,12 @@ impl MountSpec {
         if self.id.is_empty() {
             return Err(invalid_input("mount id cannot be empty"));
         }
+        validate_single_path_component(&self.id).map_err(|_| {
+            invalid_input(format!(
+                "mount id must be a safe path component: {:?}",
+                self.id
+            ))
+        })?;
         if !self.host_path.starts_with('/') {
             return Err(invalid_input(format!(
                 "host_path must be absolute for mount {}: {:?}",
@@ -304,6 +310,13 @@ impl Namespace {
         }
         for filter in &manifest.filters {
             filter.validate()?;
+            if let Some(mount_id) = &filter.mount_id {
+                if !manifest.mounts.iter().any(|mount| &mount.id == mount_id) {
+                    return Err(invalid_input(format!(
+                        "filter references unknown mount_id: {mount_id}"
+                    )));
+                }
+            }
         }
         if !manifest.filters.is_empty() && manifest.shadow_root.is_none() {
             return Err(invalid_input("filters require shadow_root"));
@@ -365,8 +378,11 @@ impl Namespace {
                 .filter(|filter| filter.mount_id.as_deref().is_none_or(|id| id == mount.id))
                 .flat_map(|filter| filter.suffixes.iter().cloned())
                 .collect::<Vec<_>>();
-            let shadow_root_path_for_mount = (!filter_suffixes.is_empty())
-                .then(|| shadow_root_path.clone().expect("filters require shadow_root"));
+            let shadow_root_path_for_mount = (!filter_suffixes.is_empty()).then(|| {
+                shadow_root_path
+                    .clone()
+                    .expect("filters require shadow_root")
+            });
             let shadow_root = shadow_root_path_for_mount
                 .as_ref()
                 .map(|path| open_mount_root(path, MountKind::Dir))
@@ -592,6 +608,10 @@ impl Namespace {
                     .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
                 Ok(Some(stat_beneath(mount.root.as_raw_fd(), relative_path)?))
             }
+            NodeKind::Shadow {
+                mount,
+                relative_path,
+            } => Ok(Some(self.shadow_metadata(*mount, relative_path)?)),
             NodeKind::SyntheticDir => Ok(None),
         }
     }
@@ -600,7 +620,7 @@ impl Namespace {
         Ok(match &node.kind {
             NodeKind::SyntheticDir | NodeKind::OverlayDir { .. } => true,
             NodeKind::MountRoot { mount } => matches!(self.mounts[*mount].kind, MountKind::Dir),
-            NodeKind::Host { .. } => self
+            NodeKind::Host { .. } | NodeKind::Shadow { .. } => self
                 .host_metadata_for(node)?
                 .is_some_and(|metadata| metadata.file_type().is_dir()),
         })
@@ -652,6 +672,61 @@ impl Namespace {
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
     }
 
+    fn shadow_root(&self, mount: usize) -> io::Result<&File> {
+        self.host_mount(mount)?
+            .shadow_root
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    fn shadow_root_path(&self, mount: usize) -> io::Result<&Path> {
+        self.host_mount(mount)?
+            .shadow_root_path
+            .as_deref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))
+    }
+
+    fn shadow_relative_path(&self, mount: usize, relative_path: &Path) -> io::Result<PathBuf> {
+        validate_relative_path(relative_path)?;
+        Ok(Path::new(&self.host_mount(mount)?.id).join(relative_path))
+    }
+
+    fn shadow_metadata(&self, mount: usize, relative_path: &Path) -> io::Result<fs::Metadata> {
+        let shadow_relative = self.shadow_relative_path(mount, relative_path)?;
+        stat_beneath(self.shadow_root(mount)?.as_raw_fd(), &shadow_relative)
+    }
+
+    fn filtered_path(&self, mount: usize, relative_path: &Path) -> io::Result<bool> {
+        validate_relative_path(relative_path)?;
+        let Some(name) = relative_path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(false);
+        };
+        Ok(self
+            .host_mount(mount)?
+            .filter_suffixes
+            .iter()
+            .any(|suffix| name.ends_with(suffix)))
+    }
+
+    fn ensure_shadow_parent(&self, mount: usize, relative_path: &Path) -> io::Result<()> {
+        let shadow_root = self.shadow_root_path(mount)?;
+        let shadow_relative = self.shadow_relative_path(mount, relative_path)?;
+        if let Some(parent) = shadow_relative.parent() {
+            fs::create_dir_all(shadow_root.join(parent))?;
+        }
+        Ok(())
+    }
+
+    fn shadow_file_location(&self, node: &Node) -> Option<(usize, PathBuf)> {
+        match &node.kind {
+            NodeKind::Shadow {
+                mount,
+                relative_path,
+            } => Some((*mount, relative_path.clone())),
+            _ => None,
+        }
+    }
+
     fn xattr_location(&self, inode: u64) -> io::Result<(usize, PathBuf)> {
         let node = self
             .nodes
@@ -681,6 +756,15 @@ impl Namespace {
             return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
         }
         let relative_path = parent_relative.join(name);
+        if self.filtered_path(mount_index, &relative_path)? {
+            let metadata = match self.shadow_metadata(mount_index, &relative_path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let entry = self.entry_for_shadow_metadata(mount_index, relative_path, &metadata);
+            return Ok(Some((entry.inode, entry)));
+        }
         let metadata = match stat_beneath(mount.root.as_raw_fd(), &relative_path) {
             Ok(metadata) => metadata,
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
@@ -749,6 +833,65 @@ impl Namespace {
         inode
     }
 
+    fn get_or_create_shadow_node(
+        &mut self,
+        mount_index: usize,
+        relative_path: PathBuf,
+        metadata: &fs::Metadata,
+    ) -> u64 {
+        let key = ShadowKey {
+            mount: mount_index,
+            relative_path: relative_path.clone(),
+        };
+        if let Some(inode) = self.shadow_inodes.get(&key).copied() {
+            if let Some(node) = self.nodes.get_mut(&inode) {
+                node.mode = metadata.mode();
+                node.uid = metadata.uid();
+                node.gid = metadata.gid();
+                node.cached_attr = Some(attr_from_metadata(inode, metadata));
+            }
+            return inode;
+        }
+
+        let inode = self.allocate_inode();
+        self.insert_node(Node {
+            inode,
+            kind: NodeKind::Shadow {
+                mount: mount_index,
+                relative_path: relative_path.clone(),
+            },
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            lookup_count: 0,
+            cached_attr: Some(attr_from_metadata(inode, metadata)),
+        });
+        self.shadow_inodes.insert(key, inode);
+        inode
+    }
+
+    fn entry_for_shadow_metadata(
+        &mut self,
+        mount_index: usize,
+        relative_path: PathBuf,
+        metadata: &fs::Metadata,
+    ) -> Entry {
+        let inode = self.get_or_create_shadow_node(mount_index, relative_path, metadata);
+        let node = self
+            .nodes
+            .get_mut(&inode)
+            .expect("shadow node must exist after insertion");
+        node.lookup_count = node.lookup_count.saturating_add(1);
+        node.cached_attr = Some(attr_from_metadata(inode, metadata));
+        Entry {
+            inode,
+            generation: 0,
+            attr: attr_from_metadata(inode, metadata),
+            attr_timeout: ATTR_TTL,
+            entry_timeout: ENTRY_TTL,
+        }
+    }
+
     fn entry_for_host_metadata(
         &mut self,
         mount_index: usize,
@@ -787,7 +930,7 @@ impl Namespace {
                 MountKind::Dir => libc::DT_DIR as u32,
                 MountKind::File => libc::DT_REG as u32,
             },
-            NodeKind::Host { .. } => {
+            NodeKind::Host { .. } | NodeKind::Shadow { .. } => {
                 let metadata = self
                     .host_metadata_for(node)?
                     .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
@@ -1043,7 +1186,8 @@ impl FileSystem for ComposedFs {
             .get(&inode)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
         let Some((mount_index, relative_path)) = namespace
-            .host_file_location(node)
+            .shadow_file_location(node)
+            .or_else(|| namespace.host_file_location(node))
             .or_else(|| namespace.host_location(node))
         else {
             if valid.is_empty() {
@@ -1054,7 +1198,6 @@ impl FileSystem for ComposedFs {
         if setattr_wants_mutation(valid) {
             namespace.ensure_mount_writable(mount_index)?;
         }
-        let mount = namespace.host_mount(mount_index)?;
         let open_flags = if valid.contains(SetattrValid::SIZE) {
             libc::O_RDWR
         } else if matches!(node.kind, NodeKind::MountRoot { mount } if matches!(namespace.mounts[mount].kind, MountKind::Dir))
@@ -1065,7 +1208,18 @@ impl FileSystem for ComposedFs {
         } else {
             libc::O_RDONLY
         };
-        let file = open_host_file_for_io(mount, &relative_path, open_flags, 0)?;
+        let file = if matches!(node.kind, NodeKind::Shadow { .. }) {
+            let shadow_relative = namespace.shadow_relative_path(mount_index, &relative_path)?;
+            open_beneath_for_io(
+                namespace.shadow_root(mount_index)?.as_raw_fd(),
+                &shadow_relative,
+                open_flags,
+                0,
+            )?
+        } else {
+            let mount = namespace.host_mount(mount_index)?;
+            open_host_file_for_io(mount, &relative_path, open_flags, 0)?
+        };
         apply_setattr(&file, attr, valid)?;
         let metadata = fstat_file(&file)?;
         Ok((attr_from_metadata(inode, &metadata), ATTR_TTL))
@@ -1118,18 +1272,51 @@ impl FileSystem for ComposedFs {
             }
         }
         if let Some((mount_index, relative_path)) = namespace.host_location(node) {
-            let mount = namespace
-                .mounts
-                .get(mount_index)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            let host_entries = read_dir_beneath(mount.root.as_raw_fd(), &relative_path)?;
+            let (host_root_fd, has_shadow_root) = {
+                let mount = namespace
+                    .mounts
+                    .get(mount_index)
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+                (mount.root.as_raw_fd(), mount.shadow_root.is_some())
+            };
+            let host_entries = read_dir_beneath(host_root_fd, &relative_path)?;
             for entry in host_entries {
                 let child_relative = relative_path.join(&entry.name);
+                if namespace.filtered_path(mount_index, &child_relative)? {
+                    continue;
+                }
                 let child_inode =
                     namespace.get_or_create_host_node(mount_index, child_relative, &entry.metadata);
                 listed
                     .entry(entry.name)
                     .or_insert((child_inode, dirent_type_from_mode(entry.metadata.mode())));
+            }
+            if has_shadow_root {
+                let shadow_parent = namespace.shadow_relative_path(mount_index, &relative_path)?;
+                match read_dir_beneath(
+                    namespace.shadow_root(mount_index)?.as_raw_fd(),
+                    &shadow_parent,
+                ) {
+                    Ok(shadow_entries) => {
+                        for entry in shadow_entries {
+                            let child_relative = relative_path.join(&entry.name);
+                            if !namespace.filtered_path(mount_index, &child_relative)? {
+                                continue;
+                            }
+                            let child_inode = namespace.get_or_create_shadow_node(
+                                mount_index,
+                                child_relative,
+                                &entry.metadata,
+                            );
+                            listed.entry(entry.name).or_insert((
+                                child_inode,
+                                dirent_type_from_mode(entry.metadata.mode()),
+                            ));
+                        }
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
 
@@ -1162,6 +1349,26 @@ impl FileSystem for ComposedFs {
             .nodes
             .get(&inode)
             .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+        if let Some((mount_index, relative_path)) = namespace.shadow_file_location(node) {
+            if open_flags_want_write(flags) {
+                namespace.ensure_mount_writable(mount_index)?;
+            }
+            namespace.ensure_shadow_parent(mount_index, &relative_path)?;
+            let shadow_relative = namespace.shadow_relative_path(mount_index, &relative_path)?;
+            let file = open_beneath_for_io(
+                namespace.shadow_root(mount_index)?.as_raw_fd(),
+                &shadow_relative,
+                flags as i32,
+                0,
+            )?;
+            let lock_path = namespace
+                .shadow_root_path(mount_index)?
+                .join(&shadow_relative);
+            drop(namespace);
+            let handle =
+                self.insert_file_handle(inode, file, open_flags_want_write(flags), lock_path)?;
+            return Ok((Some(handle), OpenOptions::empty()));
+        }
         let Some((mount_index, relative_path)) = namespace.host_file_location(node) else {
             return Err(io::Error::from_raw_os_error(libc::EISDIR));
         };
@@ -1200,9 +1407,30 @@ impl FileSystem for ComposedFs {
         let mut namespace = self.namespace.write().expect("namespace lock poisoned");
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
-        let mount = namespace.host_mount(mount_index)?;
         let create_flags = flags as i32 | libc::O_CREAT;
         let create_mode = mode & !umask;
+        if namespace.filtered_path(mount_index, &relative_path)? {
+            namespace.ensure_shadow_parent(mount_index, &relative_path)?;
+            let shadow_relative = namespace.shadow_relative_path(mount_index, &relative_path)?;
+            let file = open_beneath_for_io(
+                namespace.shadow_root(mount_index)?.as_raw_fd(),
+                &shadow_relative,
+                create_flags,
+                create_mode,
+            )?;
+            let metadata = fstat_file(&file)?;
+            let lock_path = namespace
+                .shadow_root_path(mount_index)?
+                .join(&shadow_relative);
+            let entry = namespace.entry_for_shadow_metadata(mount_index, relative_path, &metadata);
+            let inode = entry.inode;
+            drop(namespace);
+
+            let handle =
+                self.insert_file_handle(inode, file, open_flags_want_write(flags), lock_path)?;
+            return Ok((entry, Some(handle), OpenOptions::empty()));
+        }
+        let mount = namespace.host_mount(mount_index)?;
         let file = open_beneath_for_io(
             mount.root.as_raw_fd(),
             &relative_path,
@@ -1307,6 +1535,14 @@ impl FileSystem for ComposedFs {
         let namespace = self.namespace.read().expect("namespace lock poisoned");
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
+        if namespace.filtered_path(mount_index, &relative_path)? {
+            let shadow_relative = namespace.shadow_relative_path(mount_index, &relative_path)?;
+            return unlink_beneath(
+                namespace.shadow_root(mount_index)?.as_raw_fd(),
+                &shadow_relative,
+                false,
+            );
+        }
         let mount = namespace.host_mount(mount_index)?;
         unlink_beneath(mount.root.as_raw_fd(), &relative_path, false)
     }
@@ -1344,8 +1580,26 @@ impl FileSystem for ComposedFs {
             return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         namespace.ensure_mount_writable(old_mount)?;
-        let mount = namespace.host_mount(old_mount)?;
-        rename_beneath(mount.root.as_raw_fd(), &old_relative, &new_relative, flags)
+        let old_filtered = namespace.filtered_path(old_mount, &old_relative)?;
+        let new_filtered = namespace.filtered_path(new_mount, &new_relative)?;
+        match (old_filtered, new_filtered) {
+            (true, true) => {
+                namespace.ensure_shadow_parent(new_mount, &new_relative)?;
+                let old_shadow = namespace.shadow_relative_path(old_mount, &old_relative)?;
+                let new_shadow = namespace.shadow_relative_path(new_mount, &new_relative)?;
+                rename_beneath(
+                    namespace.shadow_root(old_mount)?.as_raw_fd(),
+                    &old_shadow,
+                    &new_shadow,
+                    flags,
+                )
+            }
+            (true, false) | (false, true) => Err(io::Error::from_raw_os_error(libc::EXDEV)),
+            (false, false) => {
+                let mount = namespace.host_mount(old_mount)?;
+                rename_beneath(mount.root.as_raw_fd(), &old_relative, &new_relative, flags)
+            }
+        }
     }
 
     fn link(
@@ -1368,6 +1622,9 @@ impl FileSystem for ComposedFs {
         };
         let (new_mount, new_relative) = namespace.host_child_location(newparent, newname)?;
         if old_mount != new_mount {
+            return Err(io::Error::from_raw_os_error(libc::EXDEV));
+        }
+        if namespace.filtered_path(new_mount, &new_relative)? {
             return Err(io::Error::from_raw_os_error(libc::EXDEV));
         }
         namespace.ensure_mount_writable(old_mount)?;
@@ -2506,6 +2763,8 @@ mod tests {
                 dir_mode: "0555".to_string(),
             }),
             protected_guest_paths: Vec::new(),
+            shadow_root: None,
+            filters: Vec::new(),
         }
     }
 
@@ -4987,6 +5246,180 @@ mod tests {
             ),
             Some(libc::EBADF)
         );
+    }
+
+    fn manifest_with_shadow_filter(
+        host_root: &Path,
+        shadow_root: &Path,
+        access: AccessMode,
+    ) -> Manifest {
+        let mut manifest = manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            host_root,
+            access,
+        )]);
+        manifest.shadow_root = Some(shadow_root.display().to_string());
+        manifest.filters = vec![FilterSpec {
+            mount_id: Some("workspace".to_string()),
+            suffixes: vec!["-shm".to_string()],
+            action: FilterAction::HideAndShadow,
+        }];
+        manifest
+    }
+
+    #[test]
+    fn filtered_shadow_hides_host_file_and_redirects_guest_writes() {
+        let test_dir = TestDir::new("filtered-shadow-basic");
+        let root = test_dir.path.join("root");
+        let shadow = test_dir.path.join("shadow");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("state.sqlite-shm"), b"host-shm").expect("host shm");
+        fs::write(root.join("visible.txt"), b"visible").expect("visible");
+        let namespace =
+            Namespace::from_manifest(&manifest_with_shadow_filter(&root, &shadow, AccessMode::Rw))
+                .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        assert_eq!(
+            raw_error(
+                lookup(&fs, workspace.inode, "state.sqlite-shm"),
+                "filtered host lookup",
+            ),
+            Some(libc::ENOENT)
+        );
+        let names = fs_readdir_names(&fs, workspace.inode, "").expect("readdir workspace");
+        assert!(names.contains(&"visible.txt".to_string()));
+        assert!(!names.contains(&"state.sqlite-shm".to_string()));
+
+        fs_create_write_release(
+            &fs,
+            workspace.inode,
+            "state.sqlite-shm",
+            b"guest-shm".to_vec(),
+        )
+        .expect("write filtered shadow");
+
+        assert_eq!(
+            fs::read(root.join("state.sqlite-shm")).expect("host shm unchanged"),
+            b"host-shm"
+        );
+        assert_eq!(
+            fs::read(shadow.join("workspace/state.sqlite-shm")).expect("shadow shm"),
+            b"guest-shm"
+        );
+        assert_eq!(
+            fs_read_path(&fs, workspace.inode, "state.sqlite-shm").expect("read shadow"),
+            b"guest-shm"
+        );
+        let names = fs_readdir_names(&fs, workspace.inode, "").expect("readdir workspace");
+        assert!(names.contains(&"state.sqlite-shm".to_string()));
+    }
+
+    #[test]
+    fn filtered_shadow_respects_readonly_mounts() {
+        let test_dir = TestDir::new("filtered-shadow-readonly");
+        let root = test_dir.path.join("root");
+        let shadow = test_dir.path.join("shadow");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("state.sqlite-shm"), b"host-shm").expect("host shm");
+        let namespace =
+            Namespace::from_manifest(&manifest_with_shadow_filter(&root, &shadow, AccessMode::Ro))
+                .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        assert_eq!(
+            raw_error(
+                fs_create_write_release(
+                    &fs,
+                    workspace.inode,
+                    "state.sqlite-shm",
+                    b"guest-shm".to_vec(),
+                ),
+                "readonly filtered create",
+            ),
+            Some(libc::EROFS)
+        );
+        assert_eq!(
+            fs::read(root.join("state.sqlite-shm")).expect("host shm unchanged"),
+            b"host-shm"
+        );
+        assert!(!shadow.join("workspace/state.sqlite-shm").exists());
+    }
+
+    #[test]
+    fn filtered_shadow_rename_and_unlink_operate_on_shadow_only() {
+        let test_dir = TestDir::new("filtered-shadow-rename");
+        let root = test_dir.path.join("root");
+        let shadow = test_dir.path.join("shadow");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("a.sqlite-shm"), b"host-a").expect("host a");
+        let namespace =
+            Namespace::from_manifest(&manifest_with_shadow_filter(&root, &shadow, AccessMode::Rw))
+                .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        fs_create_write_release(&fs, workspace.inode, "a.sqlite-shm", b"guest-a".to_vec())
+            .expect("write shadow a");
+        fs_rename_path(&fs, workspace.inode, "a.sqlite-shm", "b.sqlite-shm")
+            .expect("rename filtered shadow");
+
+        assert_eq!(
+            raw_error(
+                lookup(&fs, workspace.inode, "a.sqlite-shm"),
+                "old shadow lookup"
+            ),
+            Some(libc::ENOENT)
+        );
+        assert_eq!(
+            fs_read_path(&fs, workspace.inode, "b.sqlite-shm").expect("read renamed shadow"),
+            b"guest-a"
+        );
+        assert_eq!(
+            fs::read(root.join("a.sqlite-shm")).expect("host a unchanged"),
+            b"host-a"
+        );
+        assert!(!root.join("b.sqlite-shm").exists());
+
+        fs_unlink_path(&fs, workspace.inode, "b.sqlite-shm").expect("unlink shadow b");
+        assert_eq!(
+            raw_error(
+                lookup(&fs, workspace.inode, "b.sqlite-shm"),
+                "unlinked shadow lookup"
+            ),
+            Some(libc::ENOENT)
+        );
+    }
+
+    #[test]
+    fn filtered_shadow_rejects_crossing_between_host_and_shadow_on_rename() {
+        let test_dir = TestDir::new("filtered-shadow-cross-rename");
+        let root = test_dir.path.join("root");
+        let shadow = test_dir.path.join("shadow");
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(root.join("visible.txt"), b"visible").expect("visible");
+        let namespace =
+            Namespace::from_manifest(&manifest_with_shadow_filter(&root, &shadow, AccessMode::Rw))
+                .expect("build namespace");
+        let fs = ComposedFs::new(namespace);
+        let workspace = lookup(&fs, ROOT_ID, "workspace").expect("lookup workspace");
+
+        assert_eq!(
+            raw_error(
+                fs_rename_path(&fs, workspace.inode, "visible.txt", "state.sqlite-shm"),
+                "rename host to shadow",
+            ),
+            Some(libc::EXDEV)
+        );
+        assert_eq!(
+            fs::read(root.join("visible.txt")).expect("visible"),
+            b"visible"
+        );
+        assert!(!root.join("state.sqlite-shm").exists());
+        assert!(!shadow.join("workspace/state.sqlite-shm").exists());
     }
 
     #[test]

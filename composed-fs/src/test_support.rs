@@ -11,8 +11,8 @@ use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 use virtiofsd::soft_idmap::{GuestGid, GuestUid};
 
 use crate::{
-    AccessMode, ComposedFs, Manifest, MetadataPolicy, MetadataSpec, MountKind, MountSpec,
-    Namespace, SourceClass, SyntheticSpec, DEFAULT_TAG, SCHEMA_VERSION,
+    AccessMode, ComposedFs, FilterSpec, Manifest, MetadataPolicy, MetadataSpec, MountKind,
+    MountSpec, Namespace, SourceClass, SyntheticSpec, DEFAULT_TAG, SCHEMA_VERSION,
 };
 
 pub(crate) struct TestDir {
@@ -116,6 +116,8 @@ pub(crate) fn manifest_with_mounts(mounts: Vec<MountSpec>) -> Manifest {
             dir_mode: "0555".to_string(),
         }),
         protected_guest_paths: Vec::new(),
+        shadow_root: None,
+        filters: Vec::<FilterSpec>::new(),
     }
 }
 

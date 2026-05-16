@@ -187,13 +187,24 @@ Example:
     "/sys",
     "/dev",
     "/var/lib/docker"
+  ],
+  "shadow_root": "/home/user/project/.sandbox/docker-vm/run/composed-shadow",
+  "filters": [
+    {
+      "mount_id": "m0001_workspace",
+      "suffixes": ["-shm"],
+      "action": "hide-and-shadow"
+    }
   ]
 }
 ```
 
 Required mount fields:
 
-- `id`: stable unique mount id for this manifest
+- `id`: stable unique mount id for this manifest. Because filtered shadow
+  storage uses the id as one shadow path component, it must also be a safe
+  single path component: not empty, not `.` or `..`, and containing no `/` or
+  NUL bytes.
 - `guest_path`: absolute normalized guest path exposed inside the composed
   namespace
 - `host_path`: absolute normalized host source path
@@ -205,6 +216,32 @@ Required mount fields:
 - `bind`: whether guest init should bind this path into its final location
 - `metadata.uid_gid`: `host` for v1
 - `metadata.permissions`: `host` for v1
+
+Optional top-level filter fields:
+
+- `shadow_root`: absolute host directory used for filtered guest-local shadow
+  files. Required when `filters` is non-empty. The backend creates it if needed.
+- `filters`: generic host-backed path filters. Each filter has:
+  - `mount_id`: optional mount id. If omitted, the filter applies to all mounts.
+  - `suffixes`: non-empty path-component suffixes such as `-shm` or `-wal`.
+    A host entry whose basename ends with one of these suffixes is filtered.
+  - `action`: currently only `hide-and-shadow`.
+
+`hide-and-shadow` semantics:
+
+- matching host files are hidden from guest `lookup` and `readdir`;
+- guest `create`/write of a matching path is redirected under
+  `shadow_root/<mount-id>/<relative-path>` and does not mutate the host source;
+- once a shadow file exists, guest reads and readdir see the shadow file;
+- unlink and rename between two filtered paths operate on shadow files only;
+- renames or hardlinks crossing between filtered shadow paths and ordinary host
+  paths fail with cross-device-style errors rather than mutating host files;
+- readonly mounts remain readonly: filters do not make an `ro` host mount
+  writable.
+
+This mechanism is intentionally generic. It can be used as a building block for
+fail-closing unsafe sidecars such as SQLite WAL `*-shm` files, but the manifest
+schema does not hard-code SQLite behavior.
 
 Optional future fields should be ignored only when the schema explicitly marks
 them optional. Unknown fields in schema version `1` should fail validation to
