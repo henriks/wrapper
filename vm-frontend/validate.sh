@@ -177,17 +177,6 @@ live_setup_tools() {
 
   rm -rf "${project}"
   mkdir -p "${project}/.sandbox"
-  cat >"${project}/.sandbox/config.json" <<EOF
-{
-  "schema_version": 2,
-  "setup_tool": "codex",
-  "default_command": { "command": "codex", "args": ["--version"] },
-  "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
-  "auth": { "github": false, "aws_profile": null },
-  "shares": [],
-  "published_ports": []
-}
-EOF
 
   local bootstrap_log="${project}/.sandbox/codex-bootstrap.log"
   announce "live-setup-tools: codex bootstrap over public egress/TLS MITM"
@@ -195,15 +184,21 @@ EOF
     --project "${project}" \
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
-    --no-tui 2>&1 | tee "${bootstrap_log}"
-  grep -Fq "agentvm: installing codex CLI with mise" "${bootstrap_log}" || {
-    echo "error: codex bootstrap did not use mise install path" >&2
-    exit 1
-  }
+    --setup-tool codex \
+    --no-tui \
+    -- codex --version 2>&1 | tee "${bootstrap_log}"
   grep -Fq "codex-cli" "${bootstrap_log}" || {
     echo "error: codex bootstrap did not print codex-cli version" >&2
     exit 1
   }
+  grep -Fq '"schema_version": 3' "${project}/.sandbox/config.json" || {
+    echo "error: codex setup did not write schema_version 3 config" >&2
+    exit 1
+  }
+  if grep -Fq 'setup_tool' "${project}/.sandbox/config.json"; then
+    echo "error: codex setup persisted obsolete setup_tool config" >&2
+    exit 1
+  fi
 
   local restart_log="${project}/.sandbox/codex-no-net-restart.log"
   announce "live-setup-tools: codex no-net restart from persisted guest state"
@@ -212,7 +207,8 @@ EOF
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
     --no-tui \
-    --no-net 2>&1 | tee "${restart_log}"
+    --no-net \
+    -- codex --version 2>&1 | tee "${restart_log}"
   grep -Fq "codex-cli" "${restart_log}" || {
     echo "error: codex persisted no-net restart did not print codex-cli version" >&2
     exit 1
@@ -220,13 +216,13 @@ EOF
 
   local metadata_log="${project}/.sandbox/codex-metadata.log"
   announce "live-setup-tools: codex optional package metadata survived payload shutdown"
-  "${agentvm}" launch \
+  "${agentvm}" \
     --project "${project}" \
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
+    --no-tui \
     --no-net \
-    --payload-no-stdin \
-    --payload-script 'set -e; export MISE_TRUSTED_CONFIG_PATHS="$HOME/.config/agentvm/mise"; grep -F "\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\"" "$HOME/.config/agentvm/mise/mise.toml"; grep -F "\"npm:@openai/codex\" = \"latest\"" "$HOME/.config/agentvm/mise/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; mise exec -C "$HOME/.config/agentvm/mise" -- codex --version' \
+    -- bash -c 'set -e; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/.sandbox/mise.toml"; grep -F "\"npm:@openai/codex\" = " "$PWD/.sandbox/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; codex --version' \
     2>&1 | tee "${metadata_log}"
   grep -Fq "codex-cli" "${metadata_log}" || {
     echo "error: codex metadata verification did not print codex-cli version" >&2
@@ -235,17 +231,6 @@ EOF
 
   rm -rf "${pi_project}"
   mkdir -p "${pi_project}/.sandbox"
-  cat >"${pi_project}/.sandbox/config.json" <<EOF
-{
-  "schema_version": 2,
-  "setup_tool": "pi",
-  "default_command": { "command": "pi", "args": ["--version"] },
-  "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
-  "auth": { "github": false, "aws_profile": null },
-  "shares": [],
-  "published_ports": []
-}
-EOF
 
   local pi_bootstrap_log="${pi_project}/.sandbox/pi-bootstrap.log"
   announce "live-setup-tools: pi bootstrap over public egress/TLS MITM"
@@ -253,15 +238,21 @@ EOF
     --project "${pi_project}" \
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
-    --no-tui 2>&1 | tee "${pi_bootstrap_log}"
-  grep -Fq "agentvm: installing pi CLI with mise" "${pi_bootstrap_log}" || {
-    echo "error: pi bootstrap did not use mise install path" >&2
-    exit 1
-  }
+    --setup-tool pi \
+    --no-tui \
+    -- pi --version 2>&1 | tee "${pi_bootstrap_log}"
   grep -Eq '^([[:digit:]]+\.){2}[[:digit:]]+' "${pi_bootstrap_log}" || {
     echo "error: pi bootstrap did not print a semver version" >&2
     exit 1
   }
+  grep -Fq '"schema_version": 3' "${pi_project}/.sandbox/config.json" || {
+    echo "error: pi setup did not write schema_version 3 config" >&2
+    exit 1
+  }
+  if grep -Fq 'setup_tool' "${pi_project}/.sandbox/config.json"; then
+    echo "error: pi setup persisted obsolete setup_tool config" >&2
+    exit 1
+  fi
 
   local pi_restart_log="${pi_project}/.sandbox/pi-no-net-restart.log"
   announce "live-setup-tools: pi no-net restart from persisted guest state"
@@ -270,7 +261,8 @@ EOF
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
     --no-tui \
-    --no-net 2>&1 | tee "${pi_restart_log}"
+    --no-net \
+    -- pi --version 2>&1 | tee "${pi_restart_log}"
   grep -Eq '^([[:digit:]]+\.){2}[[:digit:]]+' "${pi_restart_log}" || {
     echo "error: pi persisted no-net restart did not print a semver version" >&2
     exit 1
@@ -278,13 +270,13 @@ EOF
 
   local pi_metadata_log="${pi_project}/.sandbox/pi-metadata.log"
   announce "live-setup-tools: pi package metadata survived payload shutdown"
-  "${agentvm}" launch \
+  "${agentvm}" \
     --project "${pi_project}" \
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
     --qemu "${qemu}" \
+    --no-tui \
     --no-net \
-    --payload-no-stdin \
-    --payload-script 'set -e; export MISE_TRUSTED_CONFIG_PATHS="$HOME/.config/agentvm/mise"; grep -F "\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\"" "$HOME/.config/agentvm/mise/mise.toml"; grep -F "\"npm:@mariozechner/pi-coding-agent\" = \"latest\"" "$HOME/.config/agentvm/mise/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@mariozechner/pi-coding-agent/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; version=$(mise exec -C "$HOME/.config/agentvm/mise" -- pi --version); case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "unexpected pi version: $version" >&2; exit 1 ;; esac; echo "pi-version=$version"' \
+    -- bash -c 'set -e; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/.sandbox/mise.toml"; grep -F "\"npm:@mariozechner/pi-coding-agent\" = " "$PWD/.sandbox/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@mariozechner/pi-coding-agent/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; version=$(pi --version); case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "unexpected pi version: $version" >&2; exit 1 ;; esac; echo "pi-version=$version"' \
     2>&1 | tee "${pi_metadata_log}"
   grep -Fq "pi-version=" "${pi_metadata_log}" || {
     echo "error: pi metadata verification did not print pi-version" >&2

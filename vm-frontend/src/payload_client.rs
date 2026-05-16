@@ -719,39 +719,9 @@ mod tests {
 
     #[test]
     fn rust_client_runs_real_python_payload_server() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repo root");
-        let server_path = repo_root.join("docker/guest-payload-server.py");
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-
-        let child = match std::process::Command::new("python3")
-            .arg(server_path)
-            .arg("--tcp-host")
-            .arg("127.0.0.1")
-            .arg("--tcp-port")
-            .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => panic!("spawn python payload server: {error}"),
+        let Some((mut child, port)) = start_python_payload_server() else {
+            return;
         };
-        let mut child = ChildGuard(Some(child));
-
-        let mut ready = false;
-        for _ in 0..50 {
-            if ping_payload(("127.0.0.1", port)).is_ok() {
-                ready = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert!(ready, "python payload server did not become ready");
 
         let request = PayloadRequest::new("printf rust-python-ok; exit 6");
         let mut output = Vec::new();
@@ -766,40 +736,29 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_can_run_while_primary_payload_is_active() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repo root");
-        let server_path = repo_root.join("docker/guest-payload-server.py");
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-
-        let child = match std::process::Command::new("python3")
-            .arg(server_path)
-            .arg("--tcp-host")
-            .arg("127.0.0.1")
-            .arg("--tcp-port")
-            .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) => panic!("spawn python payload server: {error}"),
+    fn python_payload_server_gives_interactive_bash_a_controlling_tty() {
+        let Some((mut child, port)) = start_python_payload_server() else {
+            return;
         };
-        let mut child = ChildGuard(Some(child));
 
-        let mut ready = false;
-        for _ in 0..50 {
-            if ping_payload(("127.0.0.1", port)).is_ok() {
-                ready = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert!(ready, "python payload server did not become ready");
+        let request = PayloadRequest::new("bash --noprofile --norc -i -c 'printf bash-ready'");
+        let mut output = Vec::new();
+        let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
+            .expect("interactive bash payload run");
+        let output = String::from_utf8_lossy(&output);
+
+        assert_eq!(exit_code, 0);
+        assert!(output.contains("bash-ready"), "bash output was {output:?}");
+        assert!(!output.contains("cannot set terminal process group"));
+        assert!(!output.contains("no job control"));
+        child.kill_and_wait();
+    }
+
+    #[test]
+    fn diagnostic_can_run_while_primary_payload_is_active() {
+        let Some((mut child, port)) = start_python_payload_server() else {
+            return;
+        };
 
         let primary = thread::spawn(move || {
             let request = PayloadRequest::new("printf primary-start; sleep 1; printf primary-done");
@@ -942,6 +901,44 @@ mod tests {
     fn exit_code_payload_is_required_json() {
         let error = exit_code_from_payload(b"not-json").expect_err("invalid");
         assert!(matches!(error, PayloadClientError::Json(_)));
+    }
+
+    fn start_python_payload_server() -> Option<(ChildGuard, u16)> {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("repo root");
+        let server_path = repo_root.join("docker/guest-payload-server.py");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let child = match std::process::Command::new("python3")
+            .arg(server_path)
+            .arg("--tcp-host")
+            .arg("127.0.0.1")
+            .arg("--tcp-port")
+            .arg(port.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+            Err(error) => panic!("spawn python payload server: {error}"),
+        };
+        let child = ChildGuard(Some(child));
+
+        let mut ready = false;
+        for _ in 0..50 {
+            if ping_payload(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "python payload server did not become ready");
+
+        Some((child, port))
     }
 
     struct ChildGuard(Option<std::process::Child>);

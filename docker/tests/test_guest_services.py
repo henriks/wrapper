@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -169,6 +170,47 @@ class GuestPayloadServerTests(unittest.TestCase):
             thread.join(timeout=5.0)
             self.assertFalse(thread.is_alive())
             self.assertIn(b"payload-ok", output)
+            self.assertEqual(exit_code, 0)
+
+    def test_interactive_bash_payload_has_job_control_tty(self) -> None:
+        if shutil.which("bash") is None:
+            self.skipTest("bash is not installed")
+        client, server = self.socket_pair()
+        with tempfile.TemporaryDirectory() as cwd:
+            thread = threading.Thread(
+                target=payload_server.handle_client,
+                args=(server, threading.Lock()),
+                daemon=True,
+            )
+            thread.start()
+            request = {
+                "script": "bash --noprofile --norc -i -c 'printf bash-ready'",
+                "cwd": cwd,
+                "env": {},
+                "rows": 24,
+                "cols": 80,
+            }
+            send_frame(client, b"R", json.dumps(request).encode("utf-8"))
+
+            output = bytearray()
+            exit_code = None
+            for _ in range(16):
+                frame_type, payload = recv_frame(client)
+                if frame_type == b"O":
+                    output.extend(payload)
+                elif frame_type == b"X":
+                    exit_code = json.loads(payload.decode("utf-8"))["exit_code"]
+                    break
+                elif frame_type == b"F":
+                    self.fail(f"payload failed: {payload!r}")
+
+            client.close()
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+            text = output.decode("utf-8", errors="replace")
+            self.assertIn("bash-ready", text)
+            self.assertNotIn("cannot set terminal process group", text)
+            self.assertNotIn("no job control", text)
             self.assertEqual(exit_code, 0)
 
     def test_diagnostic_request_runs_while_primary_session_lock_is_held(self) -> None:

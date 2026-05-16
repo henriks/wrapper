@@ -132,7 +132,7 @@ Run after rebuilding appliance artifacts and before closing live frontend
 contract work. The live matrix has named scenarios:
 
 - `live-smoke` (also `host-live`/`live`): quick required self-test with the published payload listener.
-- `live-setup-tools`: required Codex and Pi setup-tool bootstrap through the targeted mise config over npm/TLS MITM, then no-net relaunch from persisted guest state and package metadata verification.
+- `live-setup-tools`: required Codex and Pi setup-tool bootstrap through `.sandbox/mise.toml` over npm/TLS MITM, then no-net relaunch from persisted guest state, bare CLI availability, and package metadata verification.
 - `live-hostile`: slower hostile/no-net self-test that probes denied metadata/loopback/DNS behavior.
 - `live-payload`: payload protocol stress self-test with a large request environment and large guest output.
 - `live-dns`: allowed resolver-path and denied/no-net resolver-path self-tests with explicit query diagnostics.
@@ -181,7 +181,7 @@ published payload port, composed virtiofs workspace, guest config filesystem,
 MITM CA bundle exposure without private key exposure, guest DNS lookup,
 SQLite/WAL activity under guest `$HOME`, concurrent host+guest SQLite WAL
 writes against the same workspace database, Docker CLI, Docker bind-mounted
-workspace, setup-tool npm bootstrap, and persisted agent CLI state across
+workspace, one-time setup-tool npm bootstrap, and persisted agent CLI state across
 payload-triggered VM shutdown and relaunch.
 
 For the SQLite concurrency check, the self-test creates

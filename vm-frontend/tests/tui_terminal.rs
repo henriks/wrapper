@@ -88,10 +88,8 @@ fn write_codex_config(project: &TempDir) {
     std::fs::write(
         sandbox.join("config.json"),
         serde_json::json!({
-            "schema_version": 2,
-            "setup_tool": "codex",
-            "default_command": { "command": "codex", "args": [] },
-            "tool_state": { "codex": true, "pi": false },
+            "schema_version": 3,
+            "default_command": { "command": "codex", "args": ["--dangerously-bypass-approvals-and-sandbox"] },
             "network": {
                 "mode": "public",
                 "allowed_domains": [],
@@ -134,7 +132,7 @@ fn config_editor_terminal_keys_update_and_save_config() {
 
     assert!(run.status.success(), "config editor failed: {}", run.output);
     let config = read_config(&project);
-    assert_eq!(config["setup_tool"], "pi");
+    assert!(config.get("setup_tool").is_none());
     assert_eq!(config["default_command"]["command"], "pi");
     assert_eq!(config["network"]["mode"], "none");
     assert_eq!(config["auth"]["github"], true);

@@ -54,14 +54,15 @@ agentvm --setup-tool codex
 agentvm --setup-tool pi
 ```
 
-`--setup-tool codex` writes a Codex-oriented `config.json`: default command
-`codex`, explicit writable `~/.codex` share configuration with project-local
-shadow backing for volatile children, and the package/bootstrap metadata needed
-to install the CLI in the guest.
+`--setup-tool codex` is a convenience operation: it writes a Codex-oriented
+`config.json` with default command `codex --dangerously-bypass-approvals-and-sandbox`,
+explicit writable `~/.codex` share configuration with project-local shadow
+backing for volatile children, and writes `.sandbox/mise.toml` declaring the
+Codex npm tool.
 
-`--setup-tool pi` writes a Pi-oriented `config.json`: default command `pi`, an
-explicit writable `~/.pi` share configuration, and package metadata for
-`@mariozechner/pi-coding-agent`.
+`--setup-tool pi` likewise writes a Pi-oriented `config.json` with default
+command `pi`, explicit writable `~/.pi` share configuration, and writes
+`.sandbox/mise.toml` declaring `@mariozechner/pi-coding-agent`.
 
 Interactive setup can be offered by the TUI when no config exists. Non-TTY mode
 must fail with an actionable message rather than prompting.

@@ -92,6 +92,9 @@ def ensure_home(env: dict[str, str], uid: int | None, gid: int | None) -> None:
 def payload_preexec(uid: int | None, gid: int | None):
     def preexec() -> None:
         os.setsid()
+        if os.isatty(0):
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            os.tcsetpgrp(0, os.getpgrp())
         if uid is None or gid is None:
             return
         if hasattr(os, "setgroups"):

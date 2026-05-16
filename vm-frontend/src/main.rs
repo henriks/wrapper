@@ -291,6 +291,7 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
             &wrapper.project,
             &WrapperSandboxConfig::setup_tool(setup_tool)?,
         )?;
+        write_setup_tool_mise_config(&wrapper.project, setup_tool)?;
     }
     if wrapper.edit_config {
         let config = match read_wrapper_sandbox_config(&wrapper.project)? {
@@ -323,8 +324,16 @@ fn run_wrapper(program: String, args: Vec<String>) -> Result<(), String> {
         if selection.enable_codex {
             let config = WrapperSandboxConfig::codex_default()?;
             write_wrapper_sandbox_config(&project, &config)?;
+            write_setup_tool_mise_config(&project, SetupTool::Codex)?;
             apply_configured_launch_defaults(&mut launch_args, &config, &project, false, false)?;
-            apply_configured_default_command(&mut launch_args, &config);
+            apply_payload_script(
+                &mut launch_args,
+                setup_tool_install_then_exec_script(
+                    &project,
+                    SetupTool::Codex,
+                    payload_script_from_config_command(&config.default_command),
+                ),
+            );
         } else {
             return Err("startup dialog did not select a payload".to_string());
         }
@@ -423,9 +432,13 @@ impl SetupTool {
     }
 
     fn default_command(self) -> ConfigCommand {
-        match self {
-            Self::Codex => ConfigCommand::new("codex"),
-            Self::Pi => ConfigCommand::new("pi"),
+        ConfigCommand {
+            command: self.cli().to_string(),
+            args: self
+                .auto_flags()
+                .iter()
+                .map(|flag| flag.to_string())
+                .collect(),
         }
     }
 
@@ -599,8 +612,6 @@ struct ConfigPort {
 struct WrapperSandboxConfig {
     schema_version: u32,
     #[serde(default)]
-    setup_tool: Option<SetupTool>,
-    #[serde(default)]
     default_command: ConfigCommand,
     #[serde(default)]
     network: ConfigNetwork,
@@ -616,8 +627,7 @@ impl WrapperSandboxConfig {
     fn setup_tool(tool: SetupTool) -> Result<Self, String> {
         let host_home = host_home_dir()?;
         Ok(Self {
-            schema_version: 2,
-            setup_tool: Some(tool),
+            schema_version: 3,
             default_command: tool.default_command(),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
@@ -631,7 +641,7 @@ impl WrapperSandboxConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 2 {
+        if self.schema_version != 3 {
             return Err(format!(
                 "unsupported sandbox config schema_version {}",
                 self.schema_version
@@ -694,11 +704,60 @@ fn parse_wrapper_sandbox_config_text(text: &str) -> Result<WrapperSandboxConfig,
     if schema_version == 1 {
         return parse_legacy_wrapper_sandbox_config(value);
     }
-    if schema_version != 2 {
+    if schema_version == 2 {
+        return parse_v2_wrapper_sandbox_config(value);
+    }
+    if schema_version != 3 {
         return Err(format!("unsupported schema_version {schema_version}"));
+    }
+    if value.get("setup_tool").is_some() {
+        return Err("setup_tool is not a schema_version 3 field; run agentvm --setup-tool codex|pi for one-time setup".to_string());
     }
     normalize_default_command_value(&mut value)?;
     serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn parse_v2_wrapper_sandbox_config(
+    mut value: serde_json::Value,
+) -> Result<WrapperSandboxConfig, String> {
+    let legacy_setup_tool = value
+        .get("setup_tool")
+        .and_then(serde_json::Value::as_str)
+        .map(SetupTool::parse)
+        .transpose()?;
+    value
+        .as_object_mut()
+        .map(|object| object.remove("setup_tool"));
+    value["schema_version"] = serde_json::json!(3);
+    normalize_default_command_value(&mut value)?;
+    if let Some(tool) = legacy_setup_tool {
+        add_legacy_setup_auto_flags(&mut value, tool);
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
+}
+
+fn add_legacy_setup_auto_flags(value: &mut serde_json::Value, tool: SetupTool) {
+    let Some(default_command) = value.get_mut("default_command") else {
+        return;
+    };
+    if default_command
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        != Some(tool.cli())
+    {
+        return;
+    }
+    let Some(args) = default_command
+        .get_mut("args")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for flag in tool.auto_flags().iter().rev() {
+        if !args.iter().any(|arg| arg.as_str() == Some(flag)) {
+            args.insert(0, serde_json::json!(flag));
+        }
+    }
 }
 
 fn parse_legacy_wrapper_sandbox_config(
@@ -717,8 +776,7 @@ fn parse_legacy_wrapper_sandbox_config(
         WrapperSandboxConfig::codex_default()?
     } else {
         WrapperSandboxConfig {
-            schema_version: 2,
-            setup_tool: None,
+            schema_version: 3,
             default_command: ConfigCommand::new(command.clone()),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
@@ -760,6 +818,37 @@ fn write_wrapper_sandbox_config(
         .map_err(|error| format!("failed to serialize sandbox config: {error}"))?;
     fs::write(&path, format!("{text}\n"))
         .map_err(|error| format!("failed to write sandbox config {}: {error}", path.display()))
+}
+
+fn wrapper_mise_config_path(project: &Path) -> PathBuf {
+    project.join(".sandbox/mise.toml")
+}
+
+fn write_setup_tool_mise_config(project: &Path, tool: SetupTool) -> Result<(), String> {
+    let path = wrapper_mise_config_path(project);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create setup-tool mise config directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&path, setup_tool_mise_config_text(tool)).map_err(|error| {
+        format!(
+            "failed to write setup-tool mise config {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn setup_tool_mise_config_text(tool: SetupTool) -> String {
+    format!(
+        "[tools]\n{} = \"{}\"\n{} = \"latest\"\n",
+        toml_basic_string(NODE_HTTP_TOOL),
+        NODE_HTTP_VERSION,
+        toml_basic_string(&format!("npm:{}", tool.package()))
+    )
 }
 
 fn parse_wrapper_args(program: &str, args: &[String]) -> Result<WrapperArgs, String> {
@@ -946,11 +1035,30 @@ fn parse_wrapper_args_with_terminal(
             "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup".to_string(),
         );
     }
-    if let Some(command) = command_override.as_ref() {
+    if let Some(tool) = setup_tool {
+        let final_script = if let Some(command) = command_override.as_ref() {
+            command.script()
+        } else {
+            payload_script_from_config_command(
+                &sandbox_config
+                    .as_ref()
+                    .expect("setup tool config is present")
+                    .default_command,
+            )
+        };
+        apply_payload_script(
+            &mut launch_args,
+            setup_tool_install_then_exec_script(&project, tool, final_script),
+        );
+        tool_selected = true;
+    } else if let Some(command) = command_override.as_ref() {
         apply_wrapper_command_override(&mut launch_args, command);
     } else if let Some(config) = sandbox_config.as_ref() {
         apply_configured_default_command(&mut launch_args, config);
         tool_selected = true;
+    }
+    if setup_tool.is_none() && wrapper_mise_config_path(&project).exists() {
+        wrap_payload_script_with_project_mise(&mut launch_args, &project);
     }
     if !no_net
         && !launch_args.iter().any(|arg| arg == "--no-net")
@@ -1175,17 +1283,6 @@ fn config_share_shadow_backing_path(project: &Path, guest_path: &Path) -> Result
 }
 
 fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
-    if !launch_args.iter().any(|arg| arg == "--payload-script") {
-        if let Some(tool) = config.setup_tool {
-            if config.default_command.command == tool.cli() {
-                apply_payload_script(
-                    launch_args,
-                    setup_tool_payload_script(tool, &config.default_command.args),
-                );
-                return;
-            }
-        }
-    }
     apply_payload_script(
         launch_args,
         payload_script_from_config_command(&config.default_command),
@@ -1198,6 +1295,22 @@ fn apply_wrapper_command_override(launch_args: &mut Vec<String>, command: &Wrapp
 
 fn apply_payload_script(launch_args: &mut Vec<String>, script: String) {
     upsert_launch_arg(launch_args, "--payload-script", script);
+}
+
+fn wrap_payload_script_with_project_mise(launch_args: &mut Vec<String>, project: &Path) {
+    let mut index = 0;
+    while index + 1 < launch_args.len() {
+        if launch_args[index] == "--payload-script" {
+            let script = launch_args[index + 1].clone();
+            launch_args[index + 1] = mise_install_then_exec_script(
+                &wrapper_mise_config_path(project),
+                "agentvm: mise is required to install tools from .sandbox/mise.toml",
+                script,
+            );
+            return;
+        }
+        index += 1;
+    }
 }
 
 fn payload_script_from_config_command(command: &ConfigCommand) -> String {
@@ -3025,57 +3138,60 @@ fn merged_payload_env(
     base
 }
 
-fn setup_tool_payload_script(tool: SetupTool, tool_args: &[String]) -> String {
-    tool_bootstrap_payload_script(tool.cli(), tool.package(), tool.auto_flags(), tool_args)
+const NODE_HTTP_TOOL: &str = "http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]";
+const NODE_HTTP_VERSION: &str = "24.15.0";
+
+fn setup_tool_install_then_exec_script(
+    project: &Path,
+    tool: SetupTool,
+    final_script: String,
+) -> String {
+    mise_install_then_exec_script(
+        &wrapper_mise_config_path(project),
+        &format!("agentvm: mise is required to install {} CLI", tool.cli()),
+        final_script,
+    )
 }
 
-fn tool_bootstrap_payload_script(
-    cli: &str,
-    npm_package: &str,
-    auto_flags: &[&str],
-    tool_args: &[String],
+fn mise_install_then_exec_script(
+    mise_config_path: &Path,
+    missing_mise_message: &str,
+    final_script: String,
 ) -> String {
-    let mut command = Vec::new();
-    command.push(shell_quote(cli));
-    command.extend(auto_flags.iter().map(|flag| shell_quote(flag)));
-    command.extend(tool_args.iter().map(|arg| shell_quote(arg)));
-    const NODE_HTTP_TOOL: &str = "http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]";
-    const NODE_HTTP_VERSION: &str = "24.15.0";
-    let node_http_spec = format!("{NODE_HTTP_TOOL}@{NODE_HTTP_VERSION}");
-    let npm_tool = format!("npm:{npm_package}");
-    let npm_tool_spec = format!("{npm_tool}@latest");
-    let install_message = format!("agentvm: installing {cli} CLI with mise in guest HOME...");
+    let mise_config = mise_config_path.display().to_string();
+    let mise_dir = mise_config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .display()
+        .to_string();
     [
-        r#"export AGENTVM_MISE_DIR="$HOME/.config/agentvm/mise""#.to_string(),
-        r#"export AGENTVM_MISE_BOOTSTRAP_DIR="${TMPDIR:-/tmp}/agentvm-mise-bootstrap""#.to_string(),
-        r#"mkdir -p "$AGENTVM_MISE_DIR" "$AGENTVM_MISE_BOOTSTRAP_DIR""#.to_string(),
-        format!(
-            "printf '%s\\n' '[tools]' {} {} > \"$AGENTVM_MISE_DIR/mise.toml\"",
-            shell_quote(&format!(
-                "{} = \"{}\"",
-                toml_basic_string(NODE_HTTP_TOOL),
-                NODE_HTTP_VERSION
-            )),
-            shell_quote(&format!("{} = \"latest\"", toml_basic_string(&npm_tool)))
-        ),
-        r#"export MISE_TRUSTED_CONFIG_PATHS="$AGENTVM_MISE_DIR${MISE_TRUSTED_CONFIG_PATHS:+:$MISE_TRUSTED_CONFIG_PATHS}""#.to_string(),
+        format!("export AGENTVM_MISE_CONFIG={}", shell_quote(&mise_config)),
+        format!("export AGENTVM_MISE_DIR={}", shell_quote(&mise_dir)),
         "export MISE_YES=true MISE_TERMINAL_PROGRESS=false NPM_CONFIG_PROGRESS=false NPM_CONFIG_AUDIT=false NPM_CONFIG_FUND=false NPM_CONFIG_MAXSOCKETS=1 NPM_CONFIG_FETCH_RETRIES=5 NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000 NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=20000".to_string(),
         format!(
             "if ! command -v mise >/dev/null 2>&1; then printf '%s\\n' {} >&2; exit 127; fi",
-            shell_quote(&format!("agentvm: mise is required to install {cli} CLI"))
+            shell_quote(missing_mise_message)
         ),
-        format!(
-            "if ! MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false mise exec -C \"$AGENTVM_MISE_DIR\" -- {} --version >/dev/null 2>&1; then printf '%s\\n' {} >&2; mise install --quiet --force --yes --jobs 1 -C \"$AGENTVM_MISE_BOOTSTRAP_DIR\" {} || exit $?; mise install --quiet --force --yes --jobs 1 -C \"$AGENTVM_MISE_DIR\" {} || exit $?; fi",
-            shell_quote(cli),
-            shell_quote(&install_message),
-            shell_quote(&node_http_spec),
-            shell_quote(&npm_tool_spec),
-        ),
+        r#"if [ ! -f "$AGENTVM_MISE_CONFIG" ]; then printf '%s\n' "agentvm: missing mise config $AGENTVM_MISE_CONFIG" >&2; exit 1; fi"#.to_string(),
+        r#"AGENTVM_MISE_SPECS=$(python3 - "$AGENTVM_MISE_CONFIG" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], 'rb') as fh:
+    data = tomllib.load(fh)
+for tool, version in data.get('tools', {}).items():
+    if not isinstance(version, str):
+        raise SystemExit(f'unsupported non-string mise tool version for {tool}')
+    print(f'{tool}@{version}')
+PY
+)"#.to_string(),
+        r#"set -- $AGENTVM_MISE_SPECS"#.to_string(),
+        r#"if [ "$#" -eq 0 ]; then printf '%s\n' "agentvm: no tools declared in $AGENTVM_MISE_CONFIG" >&2; exit 1; fi"#.to_string(),
+        "mise --no-config install --yes --jobs 1 \"$@\" || exit $?".to_string(),
         "hash -r 2>/dev/null || true".to_string(),
         format!(
-            "exec mise exec -C \"$AGENTVM_MISE_DIR\" -- sh -c {} sh \"$PWD\" {}",
-            shell_quote("cd \"$1\" && shift && exec \"$@\""),
-            command.join(" ")
+            "exec mise --no-config exec \"$@\" -- sh -c {} sh \"$PWD\" {}",
+            shell_quote("cd \"$1\" && shift && exec /bin/sh -c \"$1\""),
+            shell_quote(&final_script),
         ),
     ]
     .join(" && ")
@@ -4080,8 +4196,7 @@ mod tests {
         }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
-                && window[1].contains("\"npm:@openai/codex\" = \"latest\"")
-                && window[1].contains("codex --dangerously-bypass-approvals-and-sandbox")
+                && window[1] == "exec codex --dangerously-bypass-approvals-and-sandbox"
         }));
     }
 
@@ -4112,53 +4227,59 @@ mod tests {
         }));
         assert!(args.launch_args.windows(2).any(|window| {
             window[0] == "--payload-script"
-                && window[1].contains("\"npm:@mariozechner/pi-coding-agent\" = \"latest\"")
-                && window[1].contains("exec \"$@\"")
-                && window[1].contains(" pi")
+                && window[1].contains(".sandbox/mise.toml")
+                && window[1].contains("mise --no-config install --yes --jobs 1")
+                && window[1].contains("exec pi")
         }));
     }
 
     #[test]
-    fn setup_tool_pi_bootstrap_script_is_idempotent_and_quotes_args() {
-        let script = setup_tool_payload_script(
-            SetupTool::Pi,
-            &["--model".to_string(), "claude 3.5".to_string()],
-        );
+    fn setup_tool_pi_script_installs_project_mise_tools_then_runs_plain_command() {
+        let final_script = payload_script_from_config_command(&ConfigCommand {
+            command: "pi".to_string(),
+            args: vec!["--model".to_string(), "claude 3.5".to_string()],
+        });
+        let script =
+            setup_tool_install_then_exec_script(Path::new("/project"), SetupTool::Pi, final_script);
 
         assert!(script.contains("command -v mise >/dev/null 2>&1"));
-        assert!(script.contains("\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\""));
-        assert!(script.contains("http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]@24.15.0"));
-        assert!(script.contains("\"npm:@mariozechner/pi-coding-agent\" = \"latest\""));
-        assert!(
-            script.contains("MISE_AUTO_INSTALL=false MISE_EXEC_AUTO_INSTALL=false mise exec -C")
-        );
-        assert!(script.contains("mise install --quiet --force --yes --jobs 1 -C"));
+        assert!(script.contains("AGENTVM_MISE_CONFIG=/project/.sandbox/mise.toml"));
+        assert!(script.contains("mise --no-config install --yes --jobs 1 \"$@\""));
+        assert!(!script.contains("mise --no-config install --quiet"));
         assert!(script.contains("MISE_TERMINAL_PROGRESS=false"));
         assert!(script.contains("NPM_CONFIG_PROGRESS=false"));
         assert!(script.contains("NPM_CONFIG_MAXSOCKETS=1"));
         assert!(script.contains("agentvm: mise is required to install pi CLI"));
-        assert!(script.contains("agentvm: installing pi CLI with mise in guest HOME"));
-        assert!(script.contains("--model 'claude 3.5'"));
-        assert!(script.contains("MISE_TRUSTED_CONFIG_PATHS=\"$AGENTVM_MISE_DIR"));
+        assert!(!script.contains("agentvm: installing pi CLI with mise"));
+        assert!(script.contains("exec /bin/sh -c"));
+        assert!(script.contains("exec pi --model 'claude 3.5'"));
     }
 
     #[test]
-    fn codex_setup_tool_bootstrap_script_uses_expected_package_flags_and_args() {
-        let script = setup_tool_payload_script(
+    fn codex_setup_tool_script_uses_project_mise_and_persists_auto_flags() {
+        let final_script = payload_script_from_config_command(&ConfigCommand {
+            command: "codex".to_string(),
+            args: vec![
+                "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                "--profile".to_string(),
+                "work account".to_string(),
+            ],
+        });
+        let script = setup_tool_install_then_exec_script(
+            Path::new("/project"),
             SetupTool::Codex,
-            &["--profile".to_string(), "work account".to_string()],
+            final_script,
         );
 
         assert!(script.contains("command -v mise >/dev/null 2>&1"));
-        assert!(script.contains("\"http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]\" = \"24.15.0\""));
-        assert!(script.contains("http:node[url=https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz]@24.15.0"));
-        assert!(script.contains("\"npm:@openai/codex\" = \"latest\""));
-        assert!(script.contains("codex --version >/dev/null 2>&1"));
-        assert!(script.contains("mise install --quiet --force --yes --jobs 1 -C"));
+        assert!(script.contains("AGENTVM_MISE_CONFIG=/project/.sandbox/mise.toml"));
+        assert!(script.contains("mise --no-config install --yes --jobs 1 \"$@\""));
+        assert!(!script.contains("mise --no-config install --quiet"));
         assert!(script.contains("agentvm: mise is required to install codex CLI"));
-        assert!(script.contains("agentvm: installing codex CLI with mise in guest HOME"));
-        assert!(script.contains("--dangerously-bypass-approvals-and-sandbox"));
-        assert!(script.contains("--profile 'work account'"));
+        assert!(!script.contains("agentvm: installing codex CLI with mise"));
+        assert!(script.contains(
+            "exec codex --dangerously-bypass-approvals-and-sandbox --profile 'work account'"
+        ));
     }
 
     #[test]
@@ -4243,8 +4364,7 @@ mod tests {
         write_wrapper_sandbox_config(
             &project,
             &WrapperSandboxConfig {
-                schema_version: 2,
-                setup_tool: None,
+                schema_version: 3,
                 default_command: ConfigCommand::new("bash"),
                 network: ConfigNetwork {
                     mode: ConfigNetworkMode::Allowlist,
@@ -4318,8 +4438,7 @@ mod tests {
         write_wrapper_sandbox_config(
             &project,
             &WrapperSandboxConfig {
-                schema_version: 2,
-                setup_tool: None,
+                schema_version: 3,
                 default_command: ConfigCommand::new("bash"),
                 network: ConfigNetwork::default(),
                 auth: ConfigAuth::default(),
@@ -4386,8 +4505,7 @@ mod tests {
         write_wrapper_sandbox_config(
             &project,
             &WrapperSandboxConfig {
-                schema_version: 2,
-                setup_tool: None,
+                schema_version: 3,
                 default_command: ConfigCommand::new("bash"),
                 network: ConfigNetwork::default(),
                 auth: ConfigAuth::default(),
@@ -4444,8 +4562,7 @@ mod tests {
     #[test]
     fn config_share_shadow_validation_accepts_readonly_and_rejects_escaping_paths() {
         let readonly_shadow = WrapperSandboxConfig {
-            schema_version: 2,
-            setup_tool: None,
+            schema_version: 3,
             default_command: ConfigCommand::new("bash"),
             network: ConfigNetwork::default(),
             auth: ConfigAuth::default(),
@@ -4491,7 +4608,7 @@ mod tests {
     fn config_share_shadow_json_uses_string_array_not_objects() {
         let config: WrapperSandboxConfig = serde_json::from_str(
             r#"{
-                "schema_version": 2,
+                "schema_version": 3,
                 "default_command": { "command": "bash", "args": [] },
                 "shares": [{
                     "host_path": "/tmp/host",
@@ -4505,7 +4622,7 @@ mod tests {
         assert_eq!(config.shares[0].shadows, vec!["tmp".to_string()]);
 
         let object_form = r#"{
-            "schema_version": 2,
+            "schema_version": 3,
             "default_command": { "command": "bash", "args": [] },
             "shares": [{
                 "host_path": "/tmp/host",
@@ -4612,9 +4729,13 @@ mod tests {
 
         let text = std::fs::read_to_string(wrapper_sandbox_config_path(&project)).expect("config");
         let value: serde_json::Value = serde_json::from_str(&text).expect("json");
-        assert_eq!(value["schema_version"], 2);
-        assert_eq!(value["setup_tool"], "codex");
+        assert_eq!(value["schema_version"], 3);
+        assert!(value.get("setup_tool").is_none());
         assert_eq!(value["default_command"]["command"], "codex");
+        assert_eq!(
+            value["default_command"]["args"],
+            serde_json::json!(["--dangerously-bypass-approvals-and-sandbox"])
+        );
         assert!(value.get("tool_state").is_none());
         assert_eq!(value["network"]["mode"], "public");
         let host_home = host_home_dir().expect("host home");
@@ -4792,8 +4913,7 @@ mod tests {
         write_wrapper_sandbox_config(
             &project,
             &WrapperSandboxConfig {
-                schema_version: 2,
-                setup_tool: None,
+                schema_version: 3,
                 default_command: ConfigCommand {
                     command: "bash".to_string(),
                     args: vec!["-l".to_string()],

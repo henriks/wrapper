@@ -210,7 +210,6 @@ impl ConfigEditor {
         match self.config.default_command.command.as_str() {
             "codex" => self.apply_setup_tool(SetupTool::Pi),
             "pi" => {
-                self.config.setup_tool = None;
                 self.config.default_command = ConfigCommand::new("bash");
                 self.config.shares.clear();
             }
@@ -285,16 +284,8 @@ impl ConfigEditor {
             ConfigNetworkMode::None => "none",
             ConfigNetworkMode::Allowlist => "allowlist",
         };
-        let setup = self
-            .config
-            .setup_tool
-            .map(|tool| match tool {
-                SetupTool::Codex => "codex",
-                SetupTool::Pi => "pi",
-            })
-            .unwrap_or("custom");
         let body = format!(
-            "Default: {} {}\nSetup: {setup}\nNetwork: {network}\nAllowlist: {}\nGitHub auth: {}\nAWS profile: {}\nShares: {}\nPublished ports: {}\n\n[C] command  [N] network  [G] github  [D] sample rw share  [P] sample port\n[Enter/S] save  [Esc/Q] cancel",
+            "Default: {} {}\nNetwork: {network}\nAllowlist: {}\nGitHub auth: {}\nAWS profile: {}\nShares: {}\nPublished ports: {}\n\n[C] command  [N] network  [G] github  [D] sample rw share  [P] sample port\n[Enter/S] save  [Esc/Q] cancel",
             self.config.default_command.command,
             self.config.default_command.args.join(" "),
             self.config.network.allowed_domains.join(", "),
@@ -967,7 +958,6 @@ mod tests {
             editor.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
             ConfigEditorResult::Redraw
         );
-        assert_eq!(editor.config.setup_tool, Some(SetupTool::Pi));
         assert_eq!(editor.config.default_command.command, "pi");
         let pi_share = editor.config.shares.first().expect("pi share");
         assert!(pi_share.host_path.ends_with("/.pi"));

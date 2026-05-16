@@ -5,22 +5,21 @@
 ## Compatibility Rules
 
 - `schema_version` is required.
-- The current written format is `schema_version: 2`.
-- Readers still accept the legacy `schema_version: 1` shape and migrate it in memory. Do not remove config-file compatibility without an explicit migration plan.
+- The current written format is `schema_version: 3`.
+- Readers still accept the legacy `schema_version: 1` and `schema_version: 2` shapes and migrate them in memory. Do not remove config-file compatibility without an explicit migration plan.
 - Do not repurpose existing fields. Add new optional fields with safe defaults when extending the format.
 - Keep this document, `WrapperSandboxConfig` in `vm-frontend/src/main.rs`, and tests in sync whenever the config format changes.
 
-## Version 2 Shape
+## Version 3 Shape
 
 All fields except `schema_version` have defaults when omitted.
 
 ```json
 {
-  "schema_version": 2,
-  "setup_tool": "codex",
+  "schema_version": 3,
   "default_command": {
     "command": "codex",
-    "args": []
+    "args": ["--dangerously-bypass-approvals-and-sandbox"]
   },
   "network": {
     "mode": "public",
@@ -47,16 +46,9 @@ All fields except `schema_version` have defaults when omitted.
 
 ### `schema_version`
 
-Required integer. Must be `2` for the current format.
+Required integer. Must be `3` for the current written format.
 
-### `setup_tool`
-
-Optional string or `null`. Supported values:
-
-- `"codex"`: use the Codex setup recipe. If `default_command.command` is `"codex"`, launch through the recipe bootstrap script for `@openai/codex`.
-- `"pi"`: use the Pi setup recipe. If `default_command.command` is `"pi"`, launch through the recipe bootstrap script for `@mariozechner/pi-coding-agent`.
-
-`setup_tool` selects recipe bootstrap behavior. Setup writes explicit `shares` for tool state needs; runtime mount composition remains generic.
+There is no setup-tool selector or installation metadata in the durable config. `agentvm --setup-tool codex|pi` is a convenience operation: it writes normal durable defaults and shares here, and writes tool installation declarations to `.sandbox/mise.toml`. Launches that find `.sandbox/mise.toml` run `mise install` against that file before the payload and execute the payload under `mise exec`, so shells launched through the wrapper can run the declared tools normally.
 
 ### `default_command`
 
@@ -119,9 +111,8 @@ Example: writable host `~/.codex`, but project-local guest `~/.codex/tmp`:
 
 ```json
 {
-  "schema_version": 2,
-  "setup_tool": "codex",
-  "default_command": { "command": "codex", "args": [] },
+  "schema_version": 3,
+  "default_command": { "command": "codex", "args": ["--dangerously-bypass-approvals-and-sandbox"] },
   "network": { "mode": "public", "allowed_domains": [], "allowed_hosts": [], "allowed_ips": [] },
   "auth": { "github": false, "aws_profile": null },
   "shares": [
@@ -149,7 +140,13 @@ Array of host-to-guest TCP port mappings:
 
 Published ports are not applied when effective network mode is `"none"`.
 
-## Legacy Version 1
+## Legacy Versions
+
+### Version 2
+
+The previous version included a persistent `setup_tool` field that selected launch-time bootstrap behavior. The reader accepts version 2 for compatibility and migrates it in memory to version 3 by dropping `setup_tool`. If a version 2 Codex setup default relied on implicit approval/sandbox flags, those flags are moved into `default_command.args` during migration. New writes use version 3 and never include `setup_tool`.
+
+### Version 1
 
 The legacy shape is read for compatibility only:
 
