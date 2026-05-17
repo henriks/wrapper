@@ -1,6 +1,6 @@
 ---
 id: wra-bjaa
-status: in_progress
+status: closed
 deps: [wra-lcbk]
 links: [wra-yl7i, wra-38ai]
 created: 2026-05-16T16:09:38Z
@@ -125,3 +125,7 @@ Started wra-bjaa-guest-service-prereqs loop for remaining wra-lcbk prerequisite 
 **2026-05-16T21:57:40Z**
 
 Ralph iteration 10 summary: prerequisite chain is still blocked on appliance rebuild/required validation for docker/guest-payload-server.py. wra-g0uv and wra-dky9 are closed. wra-sum7 is implemented offline but depends on wra-38ai; wra-38ai fix is implemented and guest-services validation passed, but source freshness is stale and required validation has not been rerun with rebuilt appliance. wra-lcbk remains blocked by wra-sum7.
+
+**2026-05-17T06:03:40Z**
+
+Epic closure: all scoped child tickets are now closed. Host-side async-boundary work landed earlier with required validation while preserving single smoltcp ownership. Guest-service prerequisite bounds are closed after rebuilt-appliance required validation. wra-lcbk completed as a spike: added docker/guest-service-rust-spike.md and deferred the risky Rust/Tokio guest binary/default switch into explicit follow-ups wra-dz2y -> wra-n0xc -> wra-y335. No new guest binary or appliance startup change was introduced by the spike; ./vm-frontend/validate.sh docs passed after the doc-only update, and the full required gate passed immediately beforehand after the appliance rebuild.

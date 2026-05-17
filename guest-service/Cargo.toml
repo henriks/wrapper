@@ -1,0 +1,15 @@
+[package]
+name = "agentvm-guest-service"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "agentvm_guest_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentvm-guest-service"
+path = "src/main.rs"
+
+[dependencies]

@@ -10,7 +10,7 @@ usage: vm-frontend/validate.sh <tier>
 
 tiers:
   required    Run the required validation gate: docs drift check, formatting,
-              offline tests, fuzz target compilation, then host live validation.
+              offline tests, guest service tests, fuzz target compilation, then host live validation.
   full        Alias for required.
   fast        Run normal offline Rust tests for composed-fs and vm-frontend.
   fmt         Run rustfmt checks for Rust crates and fuzz targets.
@@ -59,6 +59,8 @@ announce() {
 fast() {
   announce "offline tests: composed-fs"
   cargo test --manifest-path composed-fs/Cargo.toml --offline
+  announce "offline tests: guest-service"
+  cargo test --manifest-path guest-service/Cargo.toml --offline
   announce "offline tests: vm-frontend"
   cargo test --manifest-path vm-frontend/Cargo.toml --offline
 }
@@ -66,6 +68,8 @@ fast() {
 fmt_check() {
   announce "rustfmt: composed-fs"
   cargo fmt --manifest-path composed-fs/Cargo.toml --check
+  announce "rustfmt: guest-service"
+  cargo fmt --manifest-path guest-service/Cargo.toml --check
   announce "rustfmt: vm-frontend"
   cargo fmt --manifest-path vm-frontend/Cargo.toml --check
   announce "rustfmt: vm-frontend fuzz targets"

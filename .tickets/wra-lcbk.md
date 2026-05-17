@@ -1,6 +1,6 @@
 ---
 id: wra-lcbk
-status: open
+status: closed
 deps: [wra-g0uv, wra-sum7, wra-dky9]
 links: [wra-dky9, wra-sum7, wra-g0uv]
 created: 2026-05-16T16:13:56Z
@@ -57,3 +57,7 @@ Prerequisite status after Ralph iteration 10: wra-g0uv and wra-dky9 are closed. 
 **2026-05-17T06:00:20Z**
 
 wra-sum7 and wra-38ai are now closed after rebuilt-appliance required validation passed. wra-lcbk is ready. Pausing before starting because this spike is appliance-sensitive and may add a Rust/Tokio guest-service binary and packaging/appliance changes.
+
+**2026-05-17T06:03:32Z**
+
+Spike completed without adding a guest binary or changing appliance startup. Added docker/guest-service-rust-spike.md capturing the bounded Python baseline, Rust service semantics to preserve, packaging/source freshness risks, Tokio/offline dependency constraint, and staged opt-in migration plan. Created follow-ups: wra-dz2y (repo-local Rust guest-service protocol crate skeleton), wra-n0xc (opt-in appliance packaging, depends on wra-dz2y), and wra-y335 (parity/live validation before any default switch, depends on wra-n0xc). Ran ./vm-frontend/validate.sh docs; latest full required gate passed immediately before this doc-only spike continuation after appliance rebuild.
