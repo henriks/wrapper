@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pcap_file::pcap::{PcapHeader, PcapPacket, PcapWriter as RawPcapWriter};
 use pcap_file::{DataLink, Endianness};
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_MAX_FRAME_LEN: u32 = 65_535;
 
@@ -67,6 +69,32 @@ impl VmnetStreamEndpoint {
             Err(error) => Err(error),
         }
     }
+
+    pub async fn accept_one_tokio(&self) -> io::Result<QemuFrameIo<tokio::net::UnixStream>> {
+        self.listener.set_nonblocking(true)?;
+        let async_listener = AsyncFd::new(BorrowedRawFd {
+            fd: self.listener.as_raw_fd(),
+        })?;
+        loop {
+            if let Some(frame_io) = self.accept_ready()? {
+                let stream = tokio::net::UnixStream::from_std(frame_io.into_inner())?;
+                return Ok(QemuFrameIo::new(stream, DEFAULT_MAX_FRAME_LEN));
+            }
+            let mut ready = async_listener.readable().await?;
+            ready.clear_ready();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BorrowedRawFd {
+    fd: RawFd,
+}
+
+impl AsRawFd for BorrowedRawFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
 }
 
 #[derive(Debug)]
@@ -78,10 +106,7 @@ pub struct QemuFrameIo<T> {
 
 pub type VmnetFrameIo = QemuFrameIo<UnixStream>;
 
-impl<T> QemuFrameIo<T>
-where
-    T: Read + Write,
-{
+impl<T> QemuFrameIo<T> {
     pub fn new(stream: T, max_frame_len: u32) -> Self {
         Self {
             stream,
@@ -90,6 +115,39 @@ where
         }
     }
 
+    fn pop_buffered_frame(&mut self) -> Result<Option<Vec<u8>>, VmnetStreamError> {
+        if self.read_buf.len() < 4 {
+            return Ok(None);
+        }
+        let length = u32::from_be_bytes(
+            self.read_buf[0..4]
+                .try_into()
+                .expect("length prefix is four bytes"),
+        );
+        if length == 0 || length > self.max_frame_len {
+            return Err(VmnetStreamError::InvalidFrameLength {
+                length,
+                max: self.max_frame_len,
+            });
+        }
+        let frame_end = 4 + length as usize;
+        if self.read_buf.len() < frame_end {
+            return Ok(None);
+        }
+        let frame = self.read_buf[4..frame_end].to_vec();
+        self.read_buf.drain(..frame_end);
+        Ok(Some(frame))
+    }
+
+    pub fn into_inner(self) -> T {
+        self.stream
+    }
+}
+
+impl<T> QemuFrameIo<T>
+where
+    T: Read + Write,
+{
     pub fn read_frame(&mut self) -> Result<Option<Vec<u8>>, VmnetStreamError> {
         let Some(length_bytes) = read_exact_or_eof(&mut self.stream, 4)? else {
             return Ok(None);
@@ -129,30 +187,6 @@ where
         }
     }
 
-    fn pop_buffered_frame(&mut self) -> Result<Option<Vec<u8>>, VmnetStreamError> {
-        if self.read_buf.len() < 4 {
-            return Ok(None);
-        }
-        let length = u32::from_be_bytes(
-            self.read_buf[0..4]
-                .try_into()
-                .expect("length prefix is four bytes"),
-        );
-        if length == 0 || length > self.max_frame_len {
-            return Err(VmnetStreamError::InvalidFrameLength {
-                length,
-                max: self.max_frame_len,
-            });
-        }
-        let frame_end = 4 + length as usize;
-        if self.read_buf.len() < frame_end {
-            return Ok(None);
-        }
-        let frame = self.read_buf[4..frame_end].to_vec();
-        self.read_buf.drain(..frame_end);
-        Ok(Some(frame))
-    }
-
     pub fn write_frame(&mut self, frame: &[u8]) -> Result<(), VmnetStreamError> {
         let length = u32::try_from(frame.len()).map_err(|_| VmnetStreamError::FrameTooLarge {
             length: usize::MAX,
@@ -168,10 +202,6 @@ where
         self.stream.write_all(frame)?;
         Ok(())
     }
-
-    pub fn into_inner(self) -> T {
-        self.stream
-    }
 }
 
 impl<T> QemuFrameIo<T>
@@ -180,6 +210,58 @@ where
 {
     pub fn raw_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
+    }
+}
+
+impl<T> QemuFrameIo<T>
+where
+    T: AsyncRead + Unpin,
+{
+    pub async fn read_frame_async(&mut self) -> Result<Option<Vec<u8>>, VmnetStreamError> {
+        if let Some(frame) = self.pop_buffered_frame()? {
+            return Ok(Some(frame));
+        }
+
+        let mut chunk = [0; 8192];
+        loop {
+            let count = self.stream.read(&mut chunk).await?;
+            if count == 0 {
+                return if self.read_buf.is_empty() {
+                    Ok(None)
+                } else if self.read_buf.len() < 4 {
+                    Err(VmnetStreamError::TruncatedLength {
+                        received: self.read_buf.len(),
+                    })
+                } else {
+                    Err(VmnetStreamError::TruncatedFrame)
+                };
+            }
+            self.read_buf.extend_from_slice(&chunk[..count]);
+            if let Some(frame) = self.pop_buffered_frame()? {
+                return Ok(Some(frame));
+            }
+        }
+    }
+}
+
+impl<T> QemuFrameIo<T>
+where
+    T: AsyncWrite + Unpin,
+{
+    pub async fn write_frame_async(&mut self, frame: &[u8]) -> Result<(), VmnetStreamError> {
+        let length = u32::try_from(frame.len()).map_err(|_| VmnetStreamError::FrameTooLarge {
+            length: usize::MAX,
+            max: self.max_frame_len,
+        })?;
+        if length == 0 || length > self.max_frame_len {
+            return Err(VmnetStreamError::FrameTooLarge {
+                length: frame.len(),
+                max: self.max_frame_len,
+            });
+        }
+        self.stream.write_all(&length.to_be_bytes()).await?;
+        self.stream.write_all(frame).await?;
+        Ok(())
     }
 }
 
@@ -290,6 +372,7 @@ mod tests {
     use crate::test_support::{ReadStep, ScriptedStream};
     use proptest::prelude::*;
     use std::io::Cursor;
+    use std::time::Duration;
 
     fn ethernet_frame() -> Vec<u8> {
         vec![
@@ -322,6 +405,95 @@ mod tests {
             frame.len() as u32
         );
         assert_eq!(&bytes[4..], frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn async_decodes_big_endian_qemu_frame() {
+        let frame = ethernet_frame();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(&encoded)
+            .await
+            .expect("write encoded frame");
+
+        let mut io = QemuFrameIo::new(reader, DEFAULT_MAX_FRAME_LEN);
+        assert_eq!(
+            io.read_frame_async().await.expect("read frame"),
+            Some(frame)
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_accepts_tokio_qemu_stream() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = dir.path().join("vmnet.sock");
+        let endpoint = VmnetStreamEndpoint::bind(&socket_path).expect("bind endpoint");
+        let frame = ethernet_frame();
+        let client_path = socket_path.clone();
+        let client_frame = frame.clone();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::UnixStream::connect(client_path)
+                .await
+                .expect("connect endpoint");
+            stream
+                .write_all(&(client_frame.len() as u32).to_be_bytes())
+                .await
+                .expect("write frame length");
+            stream
+                .write_all(&client_frame)
+                .await
+                .expect("write frame payload");
+        });
+
+        let mut io = tokio::time::timeout(Duration::from_secs(1), endpoint.accept_one_tokio())
+            .await
+            .expect("accept timeout")
+            .expect("accept tokio stream");
+        assert_eq!(
+            io.read_frame_async().await.expect("read async frame"),
+            Some(frame)
+        );
+        client.await.expect("client task");
+    }
+
+    #[tokio::test]
+    async fn async_encodes_big_endian_qemu_frame() {
+        let frame = ethernet_frame();
+        let (mut reader, writer) = tokio::io::duplex(1024);
+        let mut io = QemuFrameIo::new(writer, DEFAULT_MAX_FRAME_LEN);
+
+        io.write_frame_async(&frame).await.expect("write frame");
+        drop(io);
+
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .expect("read encoded frame");
+        assert_eq!(
+            u32::from_be_bytes(bytes[..4].try_into().unwrap()),
+            frame.len() as u32
+        );
+        assert_eq!(&bytes[4..], frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn async_rejects_truncated_length_without_treating_as_clean_eof() {
+        let (mut writer, reader) = tokio::io::duplex(1024);
+        writer
+            .write_all(&[0, 0])
+            .await
+            .expect("write partial length");
+        drop(writer);
+        let mut io = QemuFrameIo::new(reader, DEFAULT_MAX_FRAME_LEN);
+
+        assert!(matches!(
+            io.read_frame_async().await,
+            Err(VmnetStreamError::TruncatedLength { received: 2 })
+        ));
     }
 
     #[test]

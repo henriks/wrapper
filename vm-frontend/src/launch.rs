@@ -27,7 +27,9 @@ use crate::runtime_manifest::{
     write_runtime_manifests, write_runtime_manifests_with_config_mounts, ManifestSourceClass,
     RuntimeManifestSummary, RuntimeMount,
 };
-use crate::supervisor::{LaunchSupervisor, SupervisorTaskController, SupervisorTaskName};
+use crate::supervisor::{
+    LaunchSupervisor, SupervisorShutdown, SupervisorTaskController, SupervisorTaskName,
+};
 use crate::vmnet_runtime::serve_vmnet_gateway;
 use crate::{
     FrontendConfig, GuestNetwork, ManagedTask, ProcessSpec, RuntimePaths, ToolPaths, VmArtifacts,
@@ -620,19 +622,49 @@ pub async fn run_supervised_qemu_process_with_services_async(
     controller: &SupervisorTaskController,
     services: Vec<SupervisedBlockingService>,
 ) -> Result<QemuExit, LaunchError> {
+    run_supervised_qemu_process_with_services_and_shutdown_async(
+        config,
+        policy,
+        process,
+        qemu_timeout,
+        controller,
+        services,
+        None,
+    )
+    .await
+}
+
+pub async fn run_supervised_qemu_process_with_services_and_shutdown_async(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+    services: Vec<SupervisedBlockingService>,
+    shutdown_rx: Option<watch::Receiver<SupervisorShutdown>>,
+) -> Result<QemuExit, LaunchError> {
     let mut child =
         spawn_supervised_qemu_process_with_state_async(config, policy, process, controller).await?;
-    let exit = wait_for_qemu_or_service_failure(
+    let completion = wait_for_qemu_or_service_failure(
         config,
         policy,
         &mut child,
         qemu_timeout,
         controller,
         services,
+        shutdown_rx,
     )
     .await?;
-    write_qemu_exit_state(config, policy, &exit)?;
-    Ok(exit)
+    match completion {
+        SupervisedQemuCompletion::Exit(exit) => {
+            write_qemu_exit_state(config, policy, &exit)?;
+            Ok(exit)
+        }
+        SupervisedQemuCompletion::SupervisorShutdown { exit, reason } => {
+            write_supervisor_shutdown_state(config, policy, &exit, &reason)?;
+            Ok(exit)
+        }
+    }
 }
 
 async fn spawn_supervised_qemu_process_with_state_async(
@@ -676,6 +708,11 @@ async fn finish_supervised_qemu_wait(
     }
 }
 
+enum SupervisedQemuCompletion {
+    Exit(QemuExit),
+    SupervisorShutdown { exit: QemuExit, reason: String },
+}
+
 async fn wait_for_qemu_or_service_failure(
     config: &FrontendConfig,
     policy: &VmnetPolicy,
@@ -683,32 +720,35 @@ async fn wait_for_qemu_or_service_failure(
     qemu_timeout: Option<Duration>,
     controller: &SupervisorTaskController,
     services: Vec<SupervisedBlockingService>,
-) -> Result<QemuExit, LaunchError> {
-    if services.is_empty() {
-        return finish_supervised_qemu_wait(child, qemu_timeout, controller).await;
-    }
-
+    shutdown_rx: Option<watch::Receiver<SupervisorShutdown>>,
+) -> Result<SupervisedQemuCompletion, LaunchError> {
     let service_controllers = service_controllers(&services);
     let service_completion = wait_for_first_service_completion(services);
+    let shutdown = wait_for_optional_supervisor_shutdown(shutdown_rx);
     tokio::pin!(service_completion);
+    tokio::pin!(shutdown);
     if let Some(timeout) = qemu_timeout {
         tokio::select! {
             status = child.wait() => {
                 let exit = QemuExit { status: status.map_err(LaunchError::Io)?, timed_out: false };
                 publish_supervised_qemu_exit(controller, &exit)?;
                 cancel_unfinished_services(&service_controllers, None, "qemu exited");
-                Ok(exit)
+                Ok(SupervisedQemuCompletion::Exit(exit))
             }
             _ = tokio::time::sleep(timeout) => {
                 let exit = kill_timed_out_qemu(child).await?;
                 publish_supervised_qemu_exit(controller, &exit)?;
                 cancel_unfinished_services(&service_controllers, None, "qemu timed out");
-                Ok(exit)
+                Ok(SupervisedQemuCompletion::Exit(exit))
             }
             service_result = &mut service_completion => {
                 let (service_name, service_result) = service_result?;
                 cancel_unfinished_services(&service_controllers, Some(service_name), "peer service failed");
-                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await
+                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await.map(SupervisedQemuCompletion::Exit)
+            }
+            shutdown = &mut shutdown => {
+                let shutdown = shutdown.expect("shutdown future is pending forever when no receiver is configured");
+                terminate_qemu_after_supervisor_shutdown(child, controller, &service_controllers, shutdown).await
             }
         }
     } else {
@@ -717,12 +757,16 @@ async fn wait_for_qemu_or_service_failure(
                 let exit = QemuExit { status: status.map_err(LaunchError::Io)?, timed_out: false };
                 publish_supervised_qemu_exit(controller, &exit)?;
                 cancel_unfinished_services(&service_controllers, None, "qemu exited");
-                Ok(exit)
+                Ok(SupervisedQemuCompletion::Exit(exit))
             }
             service_result = &mut service_completion => {
                 let (service_name, service_result) = service_result?;
                 cancel_unfinished_services(&service_controllers, Some(service_name), "peer service failed");
-                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await
+                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await.map(SupervisedQemuCompletion::Exit)
+            }
+            shutdown = &mut shutdown => {
+                let shutdown = shutdown.expect("shutdown future is pending forever when no receiver is configured");
+                terminate_qemu_after_supervisor_shutdown(child, controller, &service_controllers, shutdown).await
             }
         }
     }
@@ -796,6 +840,51 @@ async fn kill_timed_out_qemu(child: &mut TokioChild) -> Result<QemuExit, LaunchE
             timed_out: true,
         })
         .map_err(LaunchError::Io)
+}
+
+async fn wait_for_optional_supervisor_shutdown(
+    mut shutdown_rx: Option<watch::Receiver<SupervisorShutdown>>,
+) -> Option<SupervisorShutdown> {
+    let Some(receiver) = shutdown_rx.as_mut() else {
+        std::future::pending::<()>().await;
+        return None;
+    };
+    loop {
+        let current = receiver.borrow().clone();
+        if current.is_requested() {
+            return Some(current);
+        }
+        if receiver.changed().await.is_err() {
+            return None;
+        }
+    }
+}
+
+async fn terminate_qemu_after_supervisor_shutdown(
+    child: &mut TokioChild,
+    controller: &SupervisorTaskController,
+    service_controllers: &[(SupervisorTaskName, SupervisorTaskController, Option<watch::Sender<bool>>)],
+    shutdown: SupervisorShutdown,
+) -> Result<SupervisedQemuCompletion, LaunchError> {
+    let reason = shutdown
+        .reason()
+        .unwrap_or("supervisor shutdown requested")
+        .to_string();
+    cancel_unfinished_services(service_controllers, None, &reason);
+    let _ = controller.mark_cancelled(reason.clone());
+    let status = if let Some(status) = child.try_wait().map_err(LaunchError::Io)? {
+        status
+    } else {
+        child.start_kill().map_err(LaunchError::Io)?;
+        child.wait().await.map_err(LaunchError::Io)?
+    };
+    Ok(SupervisedQemuCompletion::SupervisorShutdown {
+        exit: QemuExit {
+            status,
+            timed_out: false,
+        },
+        reason,
+    })
 }
 
 async fn terminate_qemu_after_service_failure(

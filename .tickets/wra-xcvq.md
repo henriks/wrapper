@@ -35,3 +35,7 @@ Async-boundary refinement from follow-up three-agent review: option 1 should not
 **2026-05-17T19:01:39Z**
 
 Continuation-2 iteration 20 final status: closed wra-1esa after required validation; most foundational option-1 Tokio-boundary tickets are closed (workspace/modules/errors/tracing/supervisor/protocol/async payload client/async launch/docker proxy/vmnet core/self-test CLI/CLI compatibility). Remaining option-1 children are wra-662v in_progress, wra-f762 open, wra-yl7i open, and wra-0a0r open. Next recommended priority is resolving wra-662v scope/opt-in Rust appliance validation, then selecting a large remaining boundary ticket deliberately rather than starting broad work at the end of this loop.
+
+**2026-05-17T20:40:15Z**
+
+Closed vmnet poller follow-up wra-avuf after live validation. Production vmnet now uses the Tokio async owner loop with direct service channels, async QEMU stream I/O, timer sleep, and snapshot-wide AsyncFd readiness; RuntimePoller, VmnetServiceWakeup/notifier bridge, and vmnet_poller module were deleted. ./vm-frontend/validate.sh required passed after cleanup. Remaining open option-1 children: wra-662v (blocked on Rust opt-in appliance rebuild/live validation), wra-0a0r, and wra-yl7i.

@@ -186,7 +186,7 @@ impl HostIngressListenerSet {
     }
 
     #[cfg(test)]
-    fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
+    pub(crate) fn local_addrs(&self) -> std::io::Result<Vec<SocketAddr>> {
         self.listeners
             .iter()
             .map(|listener| listener.listener.local_addr())

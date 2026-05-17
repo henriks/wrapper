@@ -46,6 +46,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "supervisor_control_message"
+path = "fuzz_targets/supervisor_control_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "composed_manifest_shape"
 path = "fuzz_targets/composed_manifest_shape.rs"
 test = false

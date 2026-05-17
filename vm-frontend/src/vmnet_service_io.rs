@@ -9,11 +9,7 @@
 //! implementation.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, ErrorKind, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 
 use crate::dns_proxy::{DnsForwardRequest, DnsUpstream, DnsUpstreamError};
 use crate::tcp_gateway::{TcpConnectError, TcpDestination, TcpUpstreamConnector};
@@ -25,8 +21,6 @@ use hickory_proto::op::Message;
 pub enum VmnetServiceIoKind {
     DnsLookup,
     TcpConnect,
-    HostIngress,
-    UpstreamSession,
     CertificateWorker,
 }
 
@@ -39,7 +33,6 @@ pub struct VmnetServiceToken(u64);
 pub enum VmnetServiceCommand {
     DnsLookup(VmnetDnsLookupCommand),
     TcpConnect(VmnetTcpConnectCommand),
-    ByteIo(VmnetByteIoCommand),
     Cancel(VmnetServiceCancel),
 }
 
@@ -48,7 +41,6 @@ impl VmnetServiceCommand {
         match self {
             Self::DnsLookup(command) => command.token,
             Self::TcpConnect(command) => command.token,
-            Self::ByteIo(command) => command.token,
             Self::Cancel(command) => command.token,
         }
     }
@@ -57,7 +49,6 @@ impl VmnetServiceCommand {
         match self {
             Self::DnsLookup(_) => VmnetServiceIoKind::DnsLookup,
             Self::TcpConnect(_) => VmnetServiceIoKind::TcpConnect,
-            Self::ByteIo(command) => command.kind,
             Self::Cancel(command) => command.kind,
         }
     }
@@ -75,19 +66,6 @@ pub struct VmnetTcpConnectCommand {
     pub destination: TcpDestination,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmnetByteIoCommand {
-    pub token: VmnetServiceToken,
-    pub kind: VmnetServiceIoKind,
-    pub operation: VmnetByteIoOperation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmnetByteIoOperation {
-    Read { max_bytes: usize },
-    Write { bytes: Vec<u8>, max_bytes: usize },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmnetServiceCancel {
     pub token: VmnetServiceToken,
@@ -103,7 +81,6 @@ pub struct VmnetServiceCancel {
 pub enum VmnetServiceCompletion<C> {
     DnsLookup(VmnetDnsLookupCompletion),
     TcpConnect(VmnetTcpConnectCompletion<C>),
-    ByteIo(VmnetByteIoCompletion),
     Cancelled(VmnetServiceCancel),
 }
 
@@ -112,7 +89,6 @@ impl<C> VmnetServiceCompletion<C> {
         match self {
             Self::DnsLookup(completion) => completion.token,
             Self::TcpConnect(completion) => completion.token,
-            Self::ByteIo(completion) => completion.token,
             Self::Cancelled(completion) => completion.token,
         }
     }
@@ -121,7 +97,6 @@ impl<C> VmnetServiceCompletion<C> {
         match self {
             Self::DnsLookup(_) => VmnetServiceIoKind::DnsLookup,
             Self::TcpConnect(_) => VmnetServiceIoKind::TcpConnect,
-            Self::ByteIo(completion) => completion.kind,
             Self::Cancelled(completion) => completion.kind,
         }
     }
@@ -137,34 +112,6 @@ pub struct VmnetDnsLookupCompletion {
 pub struct VmnetTcpConnectCompletion<C> {
     pub token: VmnetServiceToken,
     pub result: Result<C, TcpConnectError>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmnetByteIoCompletion {
-    pub token: VmnetServiceToken,
-    pub kind: VmnetServiceIoKind,
-    pub result: VmnetByteIoResult,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmnetByteIoResult {
-    Read(VmnetByteReadResult),
-    Write(VmnetByteWriteResult),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmnetByteReadResult {
-    Data(Vec<u8>),
-    Closed,
-    WouldBlock,
-    Failed(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmnetByteWriteResult {
-    Written(usize),
-    WouldBlock,
-    Failed(String),
 }
 
 impl VmnetServiceToken {
@@ -267,65 +214,6 @@ impl<T> Default for VmnetServicePending<T> {
     }
 }
 
-/// Pollable wakeup used by service workers to notify the vmnet owner.
-#[derive(Debug)]
-pub struct VmnetServiceWakeup {
-    reader: UnixStream,
-    writer: UnixStream,
-}
-
-impl VmnetServiceWakeup {
-    pub fn new() -> io::Result<Self> {
-        let (reader, writer) = UnixStream::pair()?;
-        reader.set_nonblocking(true)?;
-        writer.set_nonblocking(true)?;
-        Ok(Self { reader, writer })
-    }
-
-    pub fn reader_fd(&self) -> RawFd {
-        self.reader.as_raw_fd()
-    }
-
-    pub fn notifier(&self) -> io::Result<VmnetServiceNotifier> {
-        Ok(VmnetServiceNotifier {
-            writer: self.writer.try_clone()?,
-        })
-    }
-
-    pub fn drain(&mut self) -> io::Result<usize> {
-        let mut total = 0;
-        let mut buffer = [0_u8; 64];
-        loop {
-            match self.reader.read(&mut buffer) {
-                Ok(0) => return Ok(total),
-                Ok(count) => total += count,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(total),
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
-/// Cloneable service-side notifier half for `VmnetServiceWakeup`.
-#[derive(Debug)]
-pub struct VmnetServiceNotifier {
-    writer: UnixStream,
-}
-
-impl VmnetServiceNotifier {
-    pub fn notify(&mut self) -> io::Result<()> {
-        loop {
-            match self.writer.write(&[1]) {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
-
 /// Result of executing one command in a DNS-capable service worker.
 #[derive(Debug)]
 pub enum VmnetDnsServiceExecution<C> {
@@ -385,107 +273,6 @@ where
     }
 }
 
-/// Result of executing one command in a byte-IO-capable service worker.
-#[derive(Debug)]
-pub enum VmnetByteIoServiceExecution<C> {
-    Completed(VmnetServiceCompletion<C>),
-    Unsupported(VmnetServiceCommand),
-}
-
-pub fn execute_byte_io_service_command<C>(
-    command: VmnetServiceCommand,
-    connection: &mut (impl Read + Write),
-) -> VmnetByteIoServiceExecution<C> {
-    match command {
-        VmnetServiceCommand::ByteIo(command) => {
-            let result = match command.operation {
-                VmnetByteIoOperation::Read { max_bytes } => {
-                    VmnetByteIoResult::Read(execute_byte_io_read(connection, max_bytes))
-                }
-                VmnetByteIoOperation::Write { bytes, max_bytes } => {
-                    VmnetByteIoResult::Write(execute_byte_io_write(connection, &bytes, max_bytes))
-                }
-            };
-            VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(
-                VmnetByteIoCompletion {
-                    token: command.token,
-                    kind: command.kind,
-                    result,
-                },
-            ))
-        }
-        VmnetServiceCommand::Cancel(cancel)
-            if matches!(
-                cancel.kind,
-                VmnetServiceIoKind::HostIngress | VmnetServiceIoKind::UpstreamSession
-            ) =>
-        {
-            VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::Cancelled(cancel))
-        }
-        command => VmnetByteIoServiceExecution::Unsupported(command),
-    }
-}
-
-fn execute_byte_io_read(connection: &mut impl Read, max_bytes: usize) -> VmnetByteReadResult {
-    if max_bytes == 0 {
-        return VmnetByteReadResult::WouldBlock;
-    }
-    let mut buffer = vec![0; max_bytes.min(64 * 1024)];
-    match connection.read(&mut buffer) {
-        Ok(0) => VmnetByteReadResult::Closed,
-        Ok(count) => {
-            buffer.truncate(count);
-            VmnetByteReadResult::Data(buffer)
-        }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => VmnetByteReadResult::WouldBlock,
-        Err(error) => VmnetByteReadResult::Failed(error.to_string()),
-    }
-}
-
-fn execute_byte_io_write(
-    connection: &mut impl Write,
-    bytes: &[u8],
-    max_bytes: usize,
-) -> VmnetByteWriteResult {
-    if max_bytes == 0 || bytes.is_empty() {
-        return VmnetByteWriteResult::Written(0);
-    }
-    match connection.write(&bytes[..bytes.len().min(max_bytes)]) {
-        Ok(count) => VmnetByteWriteResult::Written(count),
-        Err(error) if error.kind() == ErrorKind::WouldBlock => VmnetByteWriteResult::WouldBlock,
-        Err(error) => VmnetByteWriteResult::Failed(error.to_string()),
-    }
-}
-
-/// Result of one byte-IO service task step over bounded owner/service queues.
-#[derive(Debug)]
-pub enum VmnetByteIoServiceStep<C> {
-    Idle,
-    Completed,
-    Unsupported(VmnetServiceCommand),
-    CompletionQueueFull(VmnetServiceQueueFull<VmnetServiceCompletion<C>>),
-}
-
-pub fn run_byte_io_service_owner_step<Pending, C>(
-    service: &mut VmnetServiceOwner<Pending, C>,
-    connection: &mut (impl Read + Write),
-) -> VmnetByteIoServiceStep<C> {
-    let Some(command) = service.service_recv_command() else {
-        return VmnetByteIoServiceStep::Idle;
-    };
-    match execute_byte_io_service_command(command, connection) {
-        VmnetByteIoServiceExecution::Completed(completion) => {
-            match service.service_complete(completion) {
-                Ok(()) => VmnetByteIoServiceStep::Completed,
-                Err(full) => VmnetByteIoServiceStep::CompletionQueueFull(full),
-            }
-        }
-        VmnetByteIoServiceExecution::Unsupported(command) => {
-            VmnetByteIoServiceStep::Unsupported(command)
-        }
-    }
-}
-
 /// Result of one DNS service task step over the bounded owner/service queues.
 #[derive(Debug)]
 pub enum VmnetDnsServiceStep<C> {
@@ -513,135 +300,120 @@ pub fn run_dns_service_owner_step<Pending, C>(
     }
 }
 
-pub struct VmnetServiceWorkerHandle<C> {
-    command_tx: SyncSender<VmnetServiceCommand>,
-    completion_rx: Receiver<VmnetServiceCompletion<C>>,
-    join: JoinHandle<()>,
+pub struct VmnetAsyncServiceWorkerHandle<C> {
+    command_tx: tokio::sync::mpsc::Sender<VmnetServiceCommand>,
+    completion_rx: tokio::sync::mpsc::Receiver<VmnetServiceCompletion<C>>,
+    join: tokio::task::JoinHandle<()>,
 }
 
-pub type VmnetDnsWorkerHandle<C> = VmnetServiceWorkerHandle<C>;
-pub type VmnetTcpConnectWorkerHandle<C> = VmnetServiceWorkerHandle<C>;
-pub type VmnetByteIoWorkerHandle<C = ()> = VmnetServiceWorkerHandle<C>;
+pub type VmnetAsyncDnsWorkerHandle<C> = VmnetAsyncServiceWorkerHandle<C>;
+pub type VmnetAsyncTcpConnectWorkerHandle<C> = VmnetAsyncServiceWorkerHandle<C>;
 
-impl<C> VmnetServiceWorkerHandle<C> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VmnetAsyncServiceDrain {
+    pub completions: usize,
+    pub disconnected: bool,
+}
+
+impl<C> VmnetAsyncServiceWorkerHandle<C> {
     pub fn try_send_command(
         &self,
         command: VmnetServiceCommand,
-    ) -> Result<(), TrySendError<VmnetServiceCommand>> {
+    ) -> Result<(), tokio::sync::mpsc::error::TrySendError<VmnetServiceCommand>> {
         self.command_tx.try_send(command)
     }
 
-    pub fn try_recv_completion(&self) -> Result<VmnetServiceCompletion<C>, TryRecvError> {
+    pub fn try_recv_completion(
+        &mut self,
+    ) -> Result<VmnetServiceCompletion<C>, tokio::sync::mpsc::error::TryRecvError> {
         self.completion_rx.try_recv()
     }
 
-    pub fn shutdown(self) -> thread::Result<()> {
+    pub async fn recv_completion(&mut self) -> Option<VmnetServiceCompletion<C>> {
+        self.completion_rx.recv().await
+    }
+
+    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         let Self {
             command_tx,
             completion_rx: _,
             join,
         } = self;
         drop(command_tx);
-        join.join()
+        join.await
     }
 }
 
-pub fn spawn_dns_service_worker<C, U>(
+pub fn spawn_dns_service_task<C, U>(
     upstream: U,
-    mut notifier: VmnetServiceNotifier,
     limits: VmnetServiceIoLimits,
-) -> Result<VmnetDnsWorkerHandle<C>, VmnetServiceIoLimitError>
+) -> Result<VmnetAsyncDnsWorkerHandle<C>, VmnetServiceIoLimitError>
 where
     C: Send + 'static,
-    U: DnsUpstream + Send + 'static,
+    U: DnsUpstream + Send + Sync + 'static,
 {
     let limits = limits.validate()?;
-    let (command_tx, command_rx) = mpsc::sync_channel(limits.command_capacity);
-    let (completion_tx, completion_rx) = mpsc::sync_channel(limits.completion_capacity);
-    let join = thread::spawn(move || {
-        while let Ok(command) = command_rx.recv() {
-            let VmnetDnsServiceExecution::Completed(completion) =
-                execute_dns_service_command::<C>(command, &upstream)
-            else {
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(limits.command_capacity);
+    let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(limits.completion_capacity);
+    let upstream = Arc::new(upstream);
+    let join = tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            let upstream = Arc::clone(&upstream);
+            let execution = match tokio::task::spawn_blocking(move || {
+                execute_dns_service_command::<C>(command, upstream.as_ref())
+            })
+            .await
+            {
+                Ok(execution) => execution,
+                Err(_) => break,
+            };
+            let VmnetDnsServiceExecution::Completed(completion) = execution else {
                 continue;
             };
             if completion_tx.try_send(completion).is_err() {
                 break;
             }
-            if notifier.notify().is_err() {
-                break;
-            }
         }
     });
-    Ok(VmnetServiceWorkerHandle {
+    Ok(VmnetAsyncServiceWorkerHandle {
         command_tx,
         completion_rx,
         join,
     })
 }
 
-pub fn spawn_tcp_connect_service_worker<T>(
+pub fn spawn_tcp_connect_service_task<T>(
     connector: T,
-    mut notifier: VmnetServiceNotifier,
     limits: VmnetServiceIoLimits,
-) -> Result<VmnetTcpConnectWorkerHandle<T::Connection>, VmnetServiceIoLimitError>
+) -> Result<VmnetAsyncTcpConnectWorkerHandle<T::Connection>, VmnetServiceIoLimitError>
 where
-    T: TcpUpstreamConnector + Send + 'static,
+    T: TcpUpstreamConnector + Send + Sync + 'static,
     T::Connection: Send + 'static,
 {
     let limits = limits.validate()?;
-    let (command_tx, command_rx) = mpsc::sync_channel(limits.command_capacity);
-    let (completion_tx, completion_rx) = mpsc::sync_channel(limits.completion_capacity);
-    let join = thread::spawn(move || {
-        while let Ok(command) = command_rx.recv() {
-            let VmnetTcpConnectServiceExecution::Completed(completion) =
-                execute_tcp_connect_service_command(command, &connector)
-            else {
+    let (command_tx, mut command_rx) = tokio::sync::mpsc::channel(limits.command_capacity);
+    let (completion_tx, completion_rx) = tokio::sync::mpsc::channel(limits.completion_capacity);
+    let connector = Arc::new(connector);
+    let join = tokio::spawn(async move {
+        while let Some(command) = command_rx.recv().await {
+            let connector = Arc::clone(&connector);
+            let execution = match tokio::task::spawn_blocking(move || {
+                execute_tcp_connect_service_command(command, connector.as_ref())
+            })
+            .await
+            {
+                Ok(execution) => execution,
+                Err(_) => break,
+            };
+            let VmnetTcpConnectServiceExecution::Completed(completion) = execution else {
                 continue;
             };
             if completion_tx.try_send(completion).is_err() {
                 break;
             }
-            if notifier.notify().is_err() {
-                break;
-            }
         }
     });
-    Ok(VmnetServiceWorkerHandle {
-        command_tx,
-        completion_rx,
-        join,
-    })
-}
-
-pub fn spawn_byte_io_service_worker<C, R>(
-    mut connection: R,
-    mut notifier: VmnetServiceNotifier,
-    limits: VmnetServiceIoLimits,
-) -> Result<VmnetByteIoWorkerHandle<C>, VmnetServiceIoLimitError>
-where
-    C: Send + 'static,
-    R: Read + Write + Send + 'static,
-{
-    let limits = limits.validate()?;
-    let (command_tx, command_rx) = mpsc::sync_channel(limits.command_capacity);
-    let (completion_tx, completion_rx) = mpsc::sync_channel(limits.completion_capacity);
-    let join = thread::spawn(move || {
-        while let Ok(command) = command_rx.recv() {
-            let VmnetByteIoServiceExecution::Completed(completion) =
-                execute_byte_io_service_command::<C>(command, &mut connection)
-            else {
-                continue;
-            };
-            if completion_tx.try_send(completion).is_err() {
-                break;
-            }
-            if notifier.notify().is_err() {
-                break;
-            }
-        }
-    });
-    Ok(VmnetServiceWorkerHandle {
+    Ok(VmnetAsyncServiceWorkerHandle {
         command_tx,
         completion_rx,
         join,
@@ -735,6 +507,43 @@ impl<Pending, C> VmnetServiceOwner<Pending, C> {
                 command,
                 error,
             }),
+        }
+    }
+
+    pub fn submit_to_async_worker(
+        &mut self,
+        pending: Pending,
+        build_command: impl FnOnce(&Pending, VmnetServiceToken) -> VmnetServiceCommand,
+        worker: &VmnetAsyncServiceWorkerHandle<C>,
+    ) -> Result<
+        VmnetServiceToken,
+        VmnetServiceSubmitError<
+            Pending,
+            tokio::sync::mpsc::error::TrySendError<VmnetServiceCommand>,
+        >,
+    > {
+        self.submit_to(pending, build_command, |command| {
+            worker.try_send_command(command.clone())
+        })
+    }
+
+    pub fn drain_from_async_worker(
+        &mut self,
+        worker: &mut VmnetAsyncServiceWorkerHandle<C>,
+    ) -> Result<VmnetAsyncServiceDrain, VmnetServiceQueueFull<VmnetServiceCompletion<C>>> {
+        let mut drain = VmnetAsyncServiceDrain::default();
+        loop {
+            match worker.try_recv_completion() {
+                Ok(completion) => {
+                    self.service_complete(completion)?;
+                    drain.completions += 1;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return Ok(drain),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    drain.disconnected = true;
+                    return Ok(drain);
+                }
+            }
         }
     }
 
@@ -934,7 +743,7 @@ impl<Command, Completion> VmnetServiceIoQueues<Command, Completion> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
+    use std::time::Duration;
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Command {
@@ -1053,7 +862,7 @@ mod tests {
         assert_eq!(VmnetServiceIoKind::DnsLookup, VmnetServiceIoKind::DnsLookup);
         assert_ne!(
             VmnetServiceIoKind::TcpConnect,
-            VmnetServiceIoKind::HostIngress
+            VmnetServiceIoKind::DnsLookup
         );
     }
 
@@ -1127,33 +936,6 @@ mod tests {
             Some("dns-context")
         );
         assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn service_wakeup_is_pollable_and_drainable() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut notifier = wakeup.notifier().expect("notifier");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-
-        notifier.notify().expect("notify");
-        let events = poller
-            .poll(Some(Duration::from_millis(100)))
-            .expect("poll wakeup");
-
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain") > 0);
-        assert_eq!(wakeup.drain().expect("second drain"), 0);
     }
 
     #[test]
@@ -1389,209 +1171,13 @@ mod tests {
                 domain: Some("example.com".to_string()),
             },
         });
-        let byte_io = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-            token: VmnetServiceToken::new(9),
-            kind: VmnetServiceIoKind::HostIngress,
-            operation: VmnetByteIoOperation::Read { max_bytes: 1024 },
-        });
-
         assert_eq!(dns.token(), VmnetServiceToken::new(7));
         assert_eq!(dns.kind(), VmnetServiceIoKind::DnsLookup);
         assert_eq!(connect.token(), VmnetServiceToken::new(8));
         assert_eq!(connect.kind(), VmnetServiceIoKind::TcpConnect);
-        assert_eq!(byte_io.token(), VmnetServiceToken::new(9));
-        assert_eq!(byte_io.kind(), VmnetServiceIoKind::HostIngress);
     }
 
-    #[test]
-    fn byte_io_executor_caps_read_and_write_sizes() {
-        let mut connection = ByteIoConnection::new(b"abcdef".to_vec());
-        let read = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-            token: VmnetServiceToken::new(51),
-            kind: VmnetServiceIoKind::HostIngress,
-            operation: VmnetByteIoOperation::Read { max_bytes: 3 },
-        });
-
-        let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(read_completion)) =
-            execute_byte_io_service_command::<()>(read, &mut connection)
-        else {
-            panic!("expected byte-io read completion");
-        };
-        assert_eq!(read_completion.token, VmnetServiceToken::new(51));
-        assert_eq!(read_completion.kind, VmnetServiceIoKind::HostIngress);
-        assert_eq!(
-            read_completion.result,
-            VmnetByteIoResult::Read(VmnetByteReadResult::Data(b"abc".to_vec()))
-        );
-
-        let write = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-            token: VmnetServiceToken::new(52),
-            kind: VmnetServiceIoKind::UpstreamSession,
-            operation: VmnetByteIoOperation::Write {
-                bytes: b"012345".to_vec(),
-                max_bytes: 4,
-            },
-        });
-        let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(
-            write_completion,
-        )) = execute_byte_io_service_command::<()>(write, &mut connection)
-        else {
-            panic!("expected byte-io write completion");
-        };
-        assert_eq!(write_completion.token, VmnetServiceToken::new(52));
-        assert_eq!(write_completion.kind, VmnetServiceIoKind::UpstreamSession);
-        assert_eq!(
-            write_completion.result,
-            VmnetByteIoResult::Write(VmnetByteWriteResult::Written(4))
-        );
-        assert_eq!(connection.written, b"0123");
-    }
-
-    #[test]
-    fn byte_io_executor_reports_would_block_and_cancel_without_io() {
-        let mut connection = WouldBlockByteIoConnection;
-        let read = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-            token: VmnetServiceToken::new(53),
-            kind: VmnetServiceIoKind::HostIngress,
-            operation: VmnetByteIoOperation::Read { max_bytes: 8 },
-        });
-        let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(completion)) =
-            execute_byte_io_service_command::<()>(read, &mut connection)
-        else {
-            panic!("expected byte-io completion");
-        };
-        assert_eq!(
-            completion.result,
-            VmnetByteIoResult::Read(VmnetByteReadResult::WouldBlock)
-        );
-
-        let cancel = VmnetServiceCommand::Cancel(VmnetServiceCancel {
-            token: VmnetServiceToken::new(54),
-            kind: VmnetServiceIoKind::UpstreamSession,
-        });
-        let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::Cancelled(cancelled)) =
-            execute_byte_io_service_command::<()>(cancel, &mut connection)
-        else {
-            panic!("expected byte-io cancel completion");
-        };
-        assert_eq!(cancelled.token, VmnetServiceToken::new(54));
-        assert_eq!(cancelled.kind, VmnetServiceIoKind::UpstreamSession);
-    }
-
-    #[derive(Debug)]
-    struct ByteIoConnection {
-        readable: Vec<u8>,
-        written: Vec<u8>,
-    }
-
-    impl ByteIoConnection {
-        fn new(readable: Vec<u8>) -> Self {
-            Self {
-                readable,
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl Read for ByteIoConnection {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            if self.readable.is_empty() {
-                return Ok(0);
-            }
-            let count = buffer.len().min(self.readable.len());
-            buffer[..count].copy_from_slice(&self.readable[..count]);
-            self.readable.drain(..count);
-            Ok(count)
-        }
-    }
-
-    impl Write for ByteIoConnection {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-            self.written.extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Debug)]
-    struct WouldBlockByteIoConnection;
-
-    impl Read for WouldBlockByteIoConnection {
-        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::from(ErrorKind::WouldBlock))
-        }
-    }
-
-    impl Write for WouldBlockByteIoConnection {
-        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
-            Err(io::Error::from(ErrorKind::WouldBlock))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    proptest! {
-        #[test]
-        fn proptest_byte_io_executor_caps_arbitrary_read_write_lengths(
-            data in proptest::collection::vec(any::<u8>(), 0..8192),
-            write_bytes in proptest::collection::vec(any::<u8>(), 0..8192),
-            read_max in 0usize..9000,
-            write_max in 0usize..9000,
-        ) {
-            let mut read_connection = ByteIoConnection::new(data.clone());
-            let read = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-                token: VmnetServiceToken::new(71),
-                kind: VmnetServiceIoKind::HostIngress,
-                operation: VmnetByteIoOperation::Read { max_bytes: read_max },
-            });
-            let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(read_completion)) =
-                execute_byte_io_service_command::<()>(read, &mut read_connection)
-            else {
-                panic!("expected byte-io read completion");
-            };
-            let expected_read = data
-                .iter()
-                .copied()
-                .take(read_max.min(64 * 1024))
-                .collect::<Vec<_>>();
-            let expected_read_result = if read_max == 0 {
-                VmnetByteIoResult::Read(VmnetByteReadResult::WouldBlock)
-            } else if expected_read.is_empty() {
-                VmnetByteIoResult::Read(VmnetByteReadResult::Closed)
-            } else {
-                VmnetByteIoResult::Read(VmnetByteReadResult::Data(expected_read))
-            };
-            prop_assert_eq!(read_completion.result, expected_read_result);
-
-            let mut write_connection = ByteIoConnection::new(Vec::new());
-            let write = VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-                token: VmnetServiceToken::new(72),
-                kind: VmnetServiceIoKind::UpstreamSession,
-                operation: VmnetByteIoOperation::Write {
-                    bytes: write_bytes.clone(),
-                    max_bytes: write_max,
-                },
-            });
-            let VmnetByteIoServiceExecution::Completed(VmnetServiceCompletion::ByteIo(write_completion)) =
-                execute_byte_io_service_command::<()>(write, &mut write_connection)
-            else {
-                panic!("expected byte-io write completion");
-            };
-            let expected_write_len = write_bytes.len().min(write_max);
-            prop_assert_eq!(
-                write_completion.result,
-                VmnetByteIoResult::Write(VmnetByteWriteResult::Written(expected_write_len))
-            );
-            prop_assert_eq!(&write_connection.written, &write_bytes[..expected_write_len]);
-        }
-    }
-
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct StaticDnsUpstream {
         response: Message,
     }
@@ -1670,6 +1256,165 @@ mod tests {
         assert_eq!(cancelled.kind, VmnetServiceIoKind::DnsLookup);
     }
 
+    #[tokio::test]
+    async fn async_dns_service_task_completes_lookup_without_wakeup_fd() {
+        let token = VmnetServiceToken::new(35);
+        let response = Message::query();
+        let mut worker = spawn_dns_service_task::<(), _>(
+            StaticDnsUpstream {
+                response: response.clone(),
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+
+        worker
+            .try_send_command(example_dns_command(token))
+            .expect("send dns command");
+
+        let completion = tokio::time::timeout(Duration::from_secs(1), worker.recv_completion())
+            .await
+            .expect("completion timeout")
+            .expect("completion");
+        let VmnetServiceCompletion::DnsLookup(completion) = completion else {
+            panic!("expected DNS completion");
+        };
+        assert_eq!(completion.token, token);
+        assert_eq!(completion.result.expect("dns response"), response);
+        worker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_dns_service_task_skips_unsupported_commands_and_rejects_zero_capacity() {
+        assert!(matches!(
+            spawn_dns_service_task::<(), _>(PanicDnsUpstream, VmnetServiceIoLimits::new(0, 1),),
+            Err(VmnetServiceIoLimitError::ZeroCommandCapacity)
+        ));
+        let mut worker = spawn_dns_service_task::<(), _>(
+            StaticDnsUpstream {
+                response: Message::query(),
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        worker
+            .try_send_command(example_tcp_connect_command(VmnetServiceToken::new(36)))
+            .expect("send unsupported command");
+        worker
+            .try_send_command(VmnetServiceCommand::Cancel(VmnetServiceCancel {
+                token: VmnetServiceToken::new(37),
+                kind: VmnetServiceIoKind::DnsLookup,
+            }))
+            .expect("send cancel");
+
+        let completion = tokio::time::timeout(Duration::from_secs(1), worker.recv_completion())
+            .await
+            .expect("completion timeout")
+            .expect("completion");
+        let VmnetServiceCompletion::Cancelled(cancelled) = completion else {
+            panic!("expected cancellation completion");
+        };
+        assert_eq!(cancelled.token, VmnetServiceToken::new(37));
+        assert_eq!(cancelled.kind, VmnetServiceIoKind::DnsLookup);
+        assert!(matches!(
+            worker.try_recv_completion(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        worker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_adapter_submits_dns_and_drains_owner_completion() {
+        let token = VmnetServiceToken::new(0);
+        let response = Message::query();
+        let mut owner =
+            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(2, 2)).expect("owner");
+        let mut worker = spawn_dns_service_task::<(), _>(
+            StaticDnsUpstream {
+                response: response.clone(),
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+
+        let submitted = owner
+            .submit_to_async_worker(
+                "pending".to_string(),
+                |_pending, token| example_dns_command(token),
+                &worker,
+            )
+            .expect("submit to async worker");
+        assert_ne!(submitted, token);
+        assert_eq!(owner.pending_len(), 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drain = owner
+                    .drain_from_async_worker(&mut worker)
+                    .expect("drain async worker");
+                if drain.completions == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion timeout");
+        let completion = owner.owner_recv_completion().expect("owner completion");
+        assert_eq!(completion.token(), submitted);
+        let VmnetServiceCompletion::DnsLookup(completion) = completion else {
+            panic!("expected DNS completion");
+        };
+        assert_eq!(completion.result.expect("dns response"), response);
+        assert_eq!(owner.pending_len(), 1);
+        assert_eq!(
+            owner.remove_pending_for_completion(&VmnetServiceCompletion::Cancelled(
+                VmnetServiceCancel {
+                    token: submitted,
+                    kind: VmnetServiceIoKind::DnsLookup,
+                },
+            )),
+            Some("pending".to_string())
+        );
+        worker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_adapter_preserves_pending_when_command_channel_is_full() {
+        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
+        let (_completion_tx, completion_rx) = tokio::sync::mpsc::channel(1);
+        let worker = VmnetAsyncServiceWorkerHandle {
+            command_tx,
+            completion_rx,
+            join: tokio::spawn(async {}),
+        };
+        let mut owner =
+            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(1, 1)).expect("owner");
+
+        owner
+            .submit_to_async_worker(
+                "queued".to_string(),
+                |_pending, token| example_dns_command(token),
+                &worker,
+            )
+            .expect("initial submit");
+        let error = owner
+            .submit_to_async_worker(
+                "rejected".to_string(),
+                |_pending, token| example_dns_command(token),
+                &worker,
+            )
+            .expect_err("full async command channel");
+
+        assert_eq!(error.pending, "rejected");
+        assert!(matches!(
+            error.error,
+            tokio::sync::mpsc::error::TrySendError::Full(_)
+        ));
+        assert_eq!(owner.pending_len(), 1);
+        worker.shutdown().await.expect("shutdown");
+    }
+
     #[test]
     fn dns_service_executor_leaves_non_dns_commands_for_other_workers() {
         let command = VmnetServiceCommand::TcpConnect(VmnetTcpConnectCommand {
@@ -1714,14 +1459,6 @@ mod tests {
                 port: 443,
                 domain: Some("example.com".to_string()),
             },
-        })
-    }
-
-    fn example_byte_read_command(token: VmnetServiceToken) -> VmnetServiceCommand {
-        VmnetServiceCommand::ByteIo(VmnetByteIoCommand {
-            token,
-            kind: VmnetServiceIoKind::HostIngress,
-            operation: VmnetByteIoOperation::Read { max_bytes: 4 },
         })
     }
 
@@ -1800,6 +1537,113 @@ mod tests {
         assert_eq!(command.kind(), VmnetServiceIoKind::DnsLookup);
     }
 
+    #[tokio::test]
+    async fn async_tcp_connect_service_task_completes_connect_without_wakeup_fd() {
+        let token = VmnetServiceToken::new(45);
+        let mut worker = spawn_tcp_connect_service_task(
+            StaticTcpConnector { result: Ok("conn") },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        worker
+            .try_send_command(example_tcp_connect_command(token))
+            .expect("send tcp command");
+
+        let completion = tokio::time::timeout(Duration::from_secs(1), worker.recv_completion())
+            .await
+            .expect("completion timeout")
+            .expect("completion");
+        let VmnetServiceCompletion::TcpConnect(completion) = completion else {
+            panic!("expected TCP connect completion");
+        };
+        assert_eq!(completion.token, token);
+        assert_eq!(completion.result.expect("connection"), "conn");
+        worker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_tcp_connect_service_task_skips_unsupported_commands_and_rejects_zero_capacity() {
+        assert!(matches!(
+            spawn_tcp_connect_service_task(
+                StaticTcpConnector { result: Ok("conn") },
+                VmnetServiceIoLimits::new(1, 0),
+            ),
+            Err(VmnetServiceIoLimitError::ZeroCompletionCapacity)
+        ));
+        let mut worker = spawn_tcp_connect_service_task(
+            StaticTcpConnector { result: Ok("conn") },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        worker
+            .try_send_command(example_dns_command(VmnetServiceToken::new(46)))
+            .expect("send unsupported command");
+        worker
+            .try_send_command(VmnetServiceCommand::Cancel(VmnetServiceCancel {
+                token: VmnetServiceToken::new(47),
+                kind: VmnetServiceIoKind::TcpConnect,
+            }))
+            .expect("send cancel");
+
+        let completion = tokio::time::timeout(Duration::from_secs(1), worker.recv_completion())
+            .await
+            .expect("completion timeout")
+            .expect("completion");
+        let VmnetServiceCompletion::Cancelled(cancelled) = completion else {
+            panic!("expected cancellation completion");
+        };
+        assert_eq!(cancelled.token, VmnetServiceToken::new(47));
+        assert_eq!(cancelled.kind, VmnetServiceIoKind::TcpConnect);
+        assert!(matches!(
+            worker.try_recv_completion(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        worker.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_adapter_submits_tcp_connect_and_drains_owner_completion() {
+        let mut owner =
+            VmnetServiceOwner::<String, &'static str>::new(VmnetServiceIoLimits::new(2, 2))
+                .expect("owner");
+        let mut worker = spawn_tcp_connect_service_task(
+            StaticTcpConnector { result: Ok("conn") },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        let submitted = owner
+            .submit_to_async_worker(
+                "pending".to_string(),
+                |_pending, token| example_tcp_connect_command(token),
+                &worker,
+            )
+            .expect("submit to async worker");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drain = owner
+                    .drain_from_async_worker(&mut worker)
+                    .expect("drain async worker");
+                if drain.completions == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion timeout");
+        let completion = owner.owner_recv_completion().expect("owner completion");
+        assert_eq!(completion.token(), submitted);
+        let VmnetServiceCompletion::TcpConnect(completion) = completion else {
+            panic!("expected TCP connect completion");
+        };
+        assert_eq!(completion.result.expect("connection"), "conn");
+        assert_eq!(owner.pending_len(), 1);
+        worker.shutdown().await.expect("shutdown");
+    }
+
     #[test]
     fn dns_service_owner_step_moves_command_to_completion_queue() {
         let mut owner =
@@ -1873,365 +1717,6 @@ mod tests {
     }
 
     #[test]
-    fn spawned_dns_worker_completes_and_wakes_owner() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let response = Message::query();
-        let worker = spawn_dns_service_worker::<(), _>(
-            StaticDnsUpstream {
-                response: response.clone(),
-            },
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("spawn worker");
-        let mut owner =
-            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(1, 1)).expect("owner");
-        let token = owner
-            .submit_to(
-                "pending".to_string(),
-                |_item, token| example_dns_command(token),
-                |command| worker.try_send_command(command.clone()),
-            )
-            .expect("submit to worker");
-
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let completion = worker.try_recv_completion().expect("completion");
-        assert_eq!(completion.token(), token);
-        let VmnetServiceCompletion::DnsLookup(completion) = completion else {
-            panic!("expected DNS completion");
-        };
-        assert_eq!(completion.result.expect("response"), response);
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn spawned_dns_worker_rejects_zero_capacity_limits() {
-        let wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        assert!(matches!(
-            spawn_dns_service_worker::<(), _>(
-                StaticDnsUpstream {
-                    response: Message::query(),
-                },
-                wakeup.notifier().expect("notifier"),
-                VmnetServiceIoLimits::new(0, 1),
-            ),
-            Err(VmnetServiceIoLimitError::ZeroCommandCapacity)
-        ));
-    }
-
-    #[test]
-    fn spawned_tcp_connect_worker_completes_and_wakes_owner() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let worker = spawn_tcp_connect_service_worker(
-            StaticTcpConnector { result: Ok("conn") },
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("spawn worker");
-        let mut owner =
-            VmnetServiceOwner::<String, &'static str>::new(VmnetServiceIoLimits::new(1, 1))
-                .expect("owner");
-        let token = owner
-            .submit_to(
-                "pending".to_string(),
-                |_item, token| example_tcp_connect_command(token),
-                |command| worker.try_send_command(command.clone()),
-            )
-            .expect("submit to worker");
-
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let completion = worker.try_recv_completion().expect("completion");
-        assert_eq!(completion.token(), token);
-        let VmnetServiceCompletion::TcpConnect(completion) = completion else {
-            panic!("expected TCP connect completion");
-        };
-        assert_eq!(completion.result.expect("connection"), "conn");
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn spawned_tcp_connect_worker_shutdown_does_not_block_on_full_completion_queue() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let worker = spawn_tcp_connect_service_worker(
-            StaticTcpConnector { result: Ok("conn") },
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(1, 1),
-        )
-        .expect("spawn worker");
-
-        worker
-            .try_send_command(example_tcp_connect_command(VmnetServiceToken::new(1)))
-            .expect("first command");
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll first completion wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        worker
-            .try_send_command(example_tcp_connect_command(VmnetServiceToken::new(2)))
-            .expect("second command");
-
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn byte_io_service_owner_step_moves_command_to_completion_queue() {
-        let mut owner =
-            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(2, 2)).expect("owner");
-        let token = owner
-            .submit("pending".to_string(), |_item, token| {
-                example_byte_read_command(token)
-            })
-            .expect("submit");
-        let mut connection = ByteIoConnection::new(b"abcdef".to_vec());
-
-        let step = run_byte_io_service_owner_step(&mut owner, &mut connection);
-
-        assert!(matches!(step, VmnetByteIoServiceStep::Completed));
-        assert_eq!(owner.command_len(), 0);
-        assert_eq!(owner.completion_len(), 1);
-        let completion = owner.owner_recv_completion().expect("completion");
-        assert_eq!(completion.token(), token);
-        let VmnetServiceCompletion::ByteIo(completion) = completion else {
-            panic!("expected byte-io completion");
-        };
-        assert_eq!(completion.kind, VmnetServiceIoKind::HostIngress);
-        assert_eq!(
-            completion.result,
-            VmnetByteIoResult::Read(VmnetByteReadResult::Data(b"abcd".to_vec()))
-        );
-    }
-
-    #[test]
-    fn byte_io_service_owner_step_reports_full_completion_queue() {
-        let mut owner =
-            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(2, 1)).expect("owner");
-        owner
-            .service_complete(VmnetServiceCompletion::Cancelled(VmnetServiceCancel {
-                token: VmnetServiceToken::new(98),
-                kind: VmnetServiceIoKind::HostIngress,
-            }))
-            .expect("pre-fill completion queue");
-        let token = owner
-            .submit("pending".to_string(), |_item, token| {
-                example_byte_read_command(token)
-            })
-            .expect("submit");
-        let mut connection = ByteIoConnection::new(b"abcdef".to_vec());
-
-        let step = run_byte_io_service_owner_step(&mut owner, &mut connection);
-
-        let VmnetByteIoServiceStep::CompletionQueueFull(full) = step else {
-            panic!("expected full completion queue");
-        };
-        assert_eq!(full.capacity, 1);
-        assert_eq!(full.item.token(), token);
-        assert_eq!(owner.command_len(), 0);
-        assert_eq!(owner.completion_len(), 1);
-        assert_eq!(owner.pending_len(), 1);
-    }
-
-    #[test]
-    fn byte_io_service_owner_step_idles_without_io() {
-        let mut owner =
-            VmnetServiceOwner::<String, ()>::new(VmnetServiceIoLimits::new(1, 1)).expect("owner");
-        let mut connection = WouldBlockByteIoConnection;
-
-        let step = run_byte_io_service_owner_step(&mut owner, &mut connection);
-
-        assert!(matches!(step, VmnetByteIoServiceStep::Idle));
-    }
-
-    #[test]
-    fn spawned_byte_io_worker_completes_and_wakes_owner() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let worker = spawn_byte_io_service_worker::<(), _>(
-            ByteIoConnection::new(b"service-bytes".to_vec()),
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("spawn worker");
-        worker
-            .try_send_command(example_byte_read_command(VmnetServiceToken::new(61)))
-            .expect("send read command");
-
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let completion = worker.try_recv_completion().expect("completion");
-        assert_eq!(completion.token(), VmnetServiceToken::new(61));
-        let VmnetServiceCompletion::ByteIo(completion) = completion else {
-            panic!("expected byte-io completion");
-        };
-        assert_eq!(completion.kind, VmnetServiceIoKind::HostIngress);
-        assert_eq!(
-            completion.result,
-            VmnetByteIoResult::Read(VmnetByteReadResult::Data(b"serv".to_vec()))
-        );
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn spawned_byte_io_worker_ignores_unsupported_commands_and_keeps_running() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let worker = spawn_byte_io_service_worker::<(), _>(
-            ByteIoConnection::new(b"still-running".to_vec()),
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("spawn worker");
-        worker
-            .try_send_command(example_dns_command(VmnetServiceToken::new(64)))
-            .expect("send unsupported dns command");
-        worker
-            .try_send_command(example_byte_read_command(VmnetServiceToken::new(65)))
-            .expect("send byte read command");
-
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let completion = worker.try_recv_completion().expect("completion");
-        assert_eq!(completion.token(), VmnetServiceToken::new(65));
-        assert!(matches!(completion, VmnetServiceCompletion::ByteIo(_)));
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn spawned_byte_io_worker_shutdown_does_not_block_on_full_completion_queue() {
-        use std::time::Duration;
-
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = crate::vmnet_poller::RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                crate::vmnet_poller::VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                crate::vmnet_poller::VmnetInterest::READABLE,
-            )
-            .expect("register wakeup");
-        let worker = spawn_byte_io_service_worker::<(), _>(
-            ByteIoConnection::new(b"abcdefgh".to_vec()),
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(1, 1),
-        )
-        .expect("spawn worker");
-
-        worker
-            .try_send_command(example_byte_read_command(VmnetServiceToken::new(62)))
-            .expect("first command");
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll first completion wakeup");
-        assert!(events.iter().any(|event| {
-            event.source == crate::vmnet_poller::VmnetEventSource::ServiceIo && event.readable
-        }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        worker
-            .try_send_command(example_byte_read_command(VmnetServiceToken::new(63)))
-            .expect("second command");
-
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn spawned_byte_io_worker_rejects_zero_capacity_limits() {
-        let wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        assert!(matches!(
-            spawn_byte_io_service_worker::<(), _>(
-                ByteIoConnection::new(Vec::new()),
-                wakeup.notifier().expect("notifier"),
-                VmnetServiceIoLimits::new(0, 1),
-            ),
-            Err(VmnetServiceIoLimitError::ZeroCommandCapacity)
-        ));
-    }
-
-    #[test]
-    fn spawned_tcp_connect_worker_rejects_zero_capacity_limits() {
-        let wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        assert!(matches!(
-            spawn_tcp_connect_service_worker(
-                StaticTcpConnector { result: Ok("conn") },
-                wakeup.notifier().expect("notifier"),
-                VmnetServiceIoLimits::new(1, 0),
-            ),
-            Err(VmnetServiceIoLimitError::ZeroCompletionCapacity)
-        ));
-    }
-
-    #[test]
     fn typed_completion_metadata_keeps_application_owner_side() {
         let dns = VmnetServiceCompletion::<()>::DnsLookup(VmnetDnsLookupCompletion {
             token: VmnetServiceToken::new(9),
@@ -2241,17 +1726,9 @@ mod tests {
             token: VmnetServiceToken::new(10),
             kind: VmnetServiceIoKind::TcpConnect,
         });
-        let byte_io = VmnetServiceCompletion::<()>::ByteIo(VmnetByteIoCompletion {
-            token: VmnetServiceToken::new(11),
-            kind: VmnetServiceIoKind::UpstreamSession,
-            result: VmnetByteIoResult::Write(VmnetByteWriteResult::Written(7)),
-        });
-
         assert_eq!(dns.token(), VmnetServiceToken::new(9));
         assert_eq!(dns.kind(), VmnetServiceIoKind::DnsLookup);
         assert_eq!(cancelled.token(), VmnetServiceToken::new(10));
         assert_eq!(cancelled.kind(), VmnetServiceIoKind::TcpConnect);
-        assert_eq!(byte_io.token(), VmnetServiceToken::new(11));
-        assert_eq!(byte_io.kind(), VmnetServiceIoKind::UpstreamSession);
     }
 }

@@ -7,14 +7,10 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clap::Parser;
 use rustix::fs::{Mode, OFlags, ResolveFlags};
-use serde::Deserialize;
-use vhost::vhost_user::Listener;
-use vhost_user_backend::VhostUserDaemon;
 use virtiofsd::filesystem::{
     Context, DirEntry, DirectoryIterator, Entry, Extensions, FileSystem, FsOptions, GetxattrReply,
     ListxattrReply, OpenOptions, SerializableFileSystem, SetattrValid, SetxattrFlags,
@@ -22,176 +18,25 @@ use virtiofsd::filesystem::{
 };
 use virtiofsd::fuse;
 use virtiofsd::soft_idmap::{GuestGid, GuestUid, Id};
-use virtiofsd::vhost_user::VhostUserFsBackendBuilder;
-use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
+
+mod manifest;
+mod server;
+mod state;
+pub use manifest::validate_manifest_json_shape;
+pub use server::{run_cli, serve_vhost_user_fs, ServeConfig};
+
+use manifest::{AccessMode, Manifest, MountKind};
+#[cfg(test)]
+use manifest::{FilterAction, FilterSpec};
+#[cfg(any(test, feature = "fuzzing"))]
+use manifest::{MetadataPolicy, MetadataSpec, MountSpec, SourceClass, SyntheticSpec};
+use state::{FileHandle, HandleTable, LockKey, LockTable};
 
 const SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_TAG: &str = "agentvm";
 pub const DEFAULT_THREAD_POOL_SIZE: usize = 1;
 const ATTR_TTL: Duration = Duration::from_secs(1);
 const ENTRY_TTL: Duration = Duration::from_secs(1);
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    schema_version: u32,
-    #[serde(default)]
-    export_tag: Option<String>,
-    #[serde(default)]
-    created_by: Option<String>,
-    mounts: Vec<MountSpec>,
-    #[serde(default)]
-    synthetic: Option<SyntheticSpec>,
-    #[serde(default)]
-    protected_guest_paths: Vec<String>,
-    #[serde(default)]
-    shadow_root: Option<String>,
-    #[serde(default)]
-    filters: Vec<FilterSpec>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilterSpec {
-    #[serde(default)]
-    mount_id: Option<String>,
-    suffixes: Vec<String>,
-    action: FilterAction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum FilterAction {
-    HideAndShadow,
-}
-
-impl FilterSpec {
-    fn validate(&self) -> io::Result<()> {
-        if self.suffixes.is_empty() {
-            return Err(invalid_input("filter suffixes cannot be empty"));
-        }
-        for suffix in &self.suffixes {
-            if suffix.is_empty() || suffix.contains('/') || suffix.contains('\0') {
-                return Err(invalid_input(format!(
-                    "filter suffix must be a non-empty path-component suffix: {suffix:?}"
-                )));
-            }
-        }
-        match self.action {
-            FilterAction::HideAndShadow => {}
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MountSpec {
-    id: String,
-    guest_path: String,
-    host_path: String,
-    kind: MountKind,
-    access: AccessMode,
-    source_class: SourceClass,
-    required: bool,
-    bind: bool,
-    metadata: MetadataSpec,
-}
-
-impl MountSpec {
-    fn validate(&self) -> io::Result<()> {
-        if self.id.is_empty() {
-            return Err(invalid_input("mount id cannot be empty"));
-        }
-        validate_single_path_component(&self.id).map_err(|_| {
-            invalid_input(format!(
-                "mount id must be a safe path component: {:?}",
-                self.id
-            ))
-        })?;
-        if !self.host_path.starts_with('/') {
-            return Err(invalid_input(format!(
-                "host_path must be absolute for mount {}: {:?}",
-                self.id, self.host_path
-            )));
-        }
-        let _access = match self.access {
-            AccessMode::Ro => "ro",
-            AccessMode::Rw => "rw",
-        };
-        let _source_class = match self.source_class {
-            SourceClass::Workspace => "workspace",
-            SourceClass::PersistentHome => "persistent-home",
-            SourceClass::ToolState => "tool-state",
-            SourceClass::AuthConfig => "auth-config",
-            SourceClass::SystemRo => "system-ro",
-            SourceClass::UserRo => "user-ro",
-            SourceClass::UserRw => "user-rw",
-        };
-        let _required = self.required;
-        let _bind = self.bind;
-        self.metadata.validate();
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum MountKind {
-    Dir,
-    File,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum AccessMode {
-    Ro,
-    Rw,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum SourceClass {
-    Workspace,
-    PersistentHome,
-    ToolState,
-    AuthConfig,
-    SystemRo,
-    UserRo,
-    UserRw,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MetadataSpec {
-    uid_gid: MetadataPolicy,
-    permissions: MetadataPolicy,
-}
-
-impl MetadataSpec {
-    fn validate(&self) {
-        match self.uid_gid {
-            MetadataPolicy::Host => {}
-        }
-        match self.permissions {
-            MetadataPolicy::Host => {}
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum MetadataPolicy {
-    Host,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SyntheticSpec {
-    uid: u32,
-    gid: u32,
-    dir_mode: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeKind {
@@ -262,33 +107,6 @@ struct Namespace {
     synthetic_uid: u32,
     synthetic_gid: u32,
     synthetic_dir_mode: u32,
-}
-
-struct FileHandle {
-    inode: u64,
-    file: File,
-    writable: bool,
-    lock_path: PathBuf,
-    dev: u64,
-    ino: u64,
-}
-
-#[derive(Default)]
-struct HandleTable {
-    next_handle: u64,
-    files: HashMap<u64, FileHandle>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct LockKey {
-    inode: u64,
-    handle: u64,
-    owner: u64,
-}
-
-#[derive(Default)]
-struct LockTable {
-    files: HashMap<LockKey, Arc<File>>,
 }
 
 impl Namespace {
@@ -959,6 +777,34 @@ impl ComposedFs {
         }
     }
 
+    fn namespace_read(&self) -> io::Result<RwLockReadGuard<'_, Namespace>> {
+        self.namespace
+            .read()
+            .map_err(|_| poisoned_lock("namespace"))
+    }
+
+    fn namespace_write(&self) -> io::Result<RwLockWriteGuard<'_, Namespace>> {
+        self.namespace
+            .write()
+            .map_err(|_| poisoned_lock("namespace"))
+    }
+
+    fn handles_read(&self) -> io::Result<RwLockReadGuard<'_, HandleTable>> {
+        self.handles
+            .read()
+            .map_err(|_| poisoned_lock("handle table"))
+    }
+
+    fn handles_write(&self) -> io::Result<RwLockWriteGuard<'_, HandleTable>> {
+        self.handles
+            .write()
+            .map_err(|_| poisoned_lock("handle table"))
+    }
+
+    fn locks_lock(&self) -> io::Result<MutexGuard<'_, LockTable>> {
+        self.locks.lock().map_err(|_| poisoned_lock("lock table"))
+    }
+
     fn insert_file_handle(
         &self,
         inode: u64,
@@ -967,7 +813,7 @@ impl ComposedFs {
         lock_path: PathBuf,
     ) -> io::Result<u64> {
         let metadata = fstat_file(&file)?;
-        let mut handles = self.handles.write().expect("handle table lock poisoned");
+        let mut handles = self.handles_write()?;
         let handle = handles.next_handle;
         handles.next_handle = handles.next_handle.saturating_add(1);
         handles.files.insert(
@@ -990,7 +836,7 @@ impl ComposedFs {
         handle: u64,
         f: impl FnOnce(&FileHandle) -> io::Result<T>,
     ) -> io::Result<T> {
-        let handles = self.handles.read().expect("handle table lock poisoned");
+        let handles = self.handles_read()?;
         let file = handles
             .files
             .get(&handle)
@@ -1007,13 +853,13 @@ impl ComposedFs {
             handle,
             owner,
         };
-        let mut locks = self.locks.lock().expect("lock table poisoned");
+        let mut locks = self.locks_lock()?;
         if let Some(file) = locks.files.get(&key) {
             return Ok(file.clone());
         }
 
         let file = {
-            let handles = self.handles.read().expect("handle table lock poisoned");
+            let handles = self.handles_read()?;
             let handle_file = handles
                 .files
                 .get(&handle)
@@ -1028,20 +874,22 @@ impl ComposedFs {
         Ok(file)
     }
 
-    fn remove_locks_for_owner(&self, inode: u64, handle: u64, owner: u64) {
-        let mut locks = self.locks.lock().expect("lock table poisoned");
+    fn remove_locks_for_owner(&self, inode: u64, handle: u64, owner: u64) -> io::Result<()> {
+        let mut locks = self.locks_lock()?;
         locks.files.remove(&LockKey {
             inode,
             handle,
             owner,
         });
+        Ok(())
     }
 
-    fn remove_locks_for_handle(&self, inode: u64, handle: u64) {
-        let mut locks = self.locks.lock().expect("lock table poisoned");
+    fn remove_locks_for_handle(&self, inode: u64, handle: u64) -> io::Result<()> {
+        let mut locks = self.locks_lock()?;
         locks
             .files
             .retain(|key, _| key.inode != inode || key.handle != handle);
+        Ok(())
     }
 }
 
@@ -1104,7 +952,7 @@ impl FileSystem for ComposedFs {
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
         validate_single_path_component(name)?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let parent_node = namespace
             .nodes
             .get(&parent)
@@ -1147,12 +995,16 @@ impl FileSystem for ComposedFs {
     }
 
     fn forget(&self, _ctx: Context, inode: Self::Inode, count: u64) {
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let Ok(mut namespace) = self.namespace_write() else {
+            return;
+        };
         namespace.forget_inode(inode, count);
     }
 
     fn batch_forget(&self, _ctx: Context, requests: Vec<(Self::Inode, u64)>) {
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let Ok(mut namespace) = self.namespace_write() else {
+            return;
+        };
         for (inode, count) in requests {
             namespace.forget_inode(inode, count);
         }
@@ -1164,7 +1016,7 @@ impl FileSystem for ComposedFs {
         inode: Self::Inode,
         _handle: Option<Self::Handle>,
     ) -> io::Result<(fuse::Attr, Duration)> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1180,7 +1032,7 @@ impl FileSystem for ComposedFs {
         _handle: Option<Self::Handle>,
         valid: SetattrValid,
     ) -> io::Result<(fuse::Attr, Duration)> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1231,7 +1083,7 @@ impl FileSystem for ComposedFs {
         inode: Self::Inode,
         _flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1250,7 +1102,7 @@ impl FileSystem for ComposedFs {
         _size: u32,
         offset: u64,
     ) -> io::Result<Self::DirIter> {
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1344,7 +1196,7 @@ impl FileSystem for ComposedFs {
         _kill_priv: bool,
         flags: u32,
     ) -> io::Result<(Option<Self::Handle>, OpenOptions)> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1404,7 +1256,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         let create_flags = flags as i32 | libc::O_CREAT;
@@ -1449,7 +1301,7 @@ impl FileSystem for ComposedFs {
     }
 
     fn readlink(&self, _ctx: Context, inode: Self::Inode) -> io::Result<Vec<u8>> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1472,7 +1324,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1493,7 +1345,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1519,7 +1371,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1532,7 +1384,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         if namespace.filtered_path(mount_index, &relative_path)? {
@@ -1551,7 +1403,7 @@ impl FileSystem for ComposedFs {
         let name = name
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.host_child_location(parent, name)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1573,7 +1425,7 @@ impl FileSystem for ComposedFs {
         let newname = newname
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (old_mount, old_relative) = namespace.host_child_location(olddir, oldname)?;
         let (new_mount, new_relative) = namespace.host_child_location(newdir, newname)?;
         if old_mount != new_mount {
@@ -1612,7 +1464,7 @@ impl FileSystem for ComposedFs {
         let newname = newname
             .to_str()
             .map_err(|_| io::Error::from_raw_os_error(libc::ENOENT))?;
-        let mut namespace = self.namespace.write().expect("namespace lock poisoned");
+        let mut namespace = self.namespace_write()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1679,8 +1531,7 @@ impl FileSystem for ComposedFs {
         _lock_owner: u64,
     ) -> io::Result<()> {
         self.with_file_handle(inode, handle, |_file| Ok(()))?;
-        self.remove_locks_for_owner(inode, handle, _lock_owner);
-        Ok(())
+        self.remove_locks_for_owner(inode, handle, _lock_owner)
     }
 
     fn fsync(
@@ -1700,7 +1551,7 @@ impl FileSystem for ComposedFs {
     }
 
     fn statfs(&self, _ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1719,7 +1570,7 @@ impl FileSystem for ComposedFs {
     }
 
     fn access(&self, _ctx: Context, inode: Self::Inode, mask: u32) -> io::Result<()> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let node = namespace
             .nodes
             .get(&inode)
@@ -1769,7 +1620,7 @@ impl FileSystem for ComposedFs {
         flags: u32,
         _extra_flags: SetxattrFlags,
     ) -> io::Result<()> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.xattr_location(inode)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1784,7 +1635,7 @@ impl FileSystem for ComposedFs {
         name: &CStr,
         size: u32,
     ) -> io::Result<GetxattrReply> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.xattr_location(inode)?;
         let mount = namespace.host_mount(mount_index)?;
         let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
@@ -1797,7 +1648,7 @@ impl FileSystem for ComposedFs {
         inode: Self::Inode,
         size: u32,
     ) -> io::Result<ListxattrReply> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.xattr_location(inode)?;
         let mount = namespace.host_mount(mount_index)?;
         let file = open_host_file_for_io(mount, &relative_path, libc::O_RDONLY, 0)?;
@@ -1805,7 +1656,7 @@ impl FileSystem for ComposedFs {
     }
 
     fn removexattr(&self, _ctx: Context, inode: Self::Inode, name: &CStr) -> io::Result<()> {
-        let namespace = self.namespace.read().expect("namespace lock poisoned");
+        let namespace = self.namespace_read()?;
         let (mount_index, relative_path) = namespace.xattr_location(inode)?;
         namespace.ensure_mount_writable(mount_index)?;
         let mount = namespace.host_mount(mount_index)?;
@@ -1834,25 +1685,26 @@ impl FileSystem for ComposedFs {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> io::Result<()> {
-        let mut handles = self.handles.write().expect("handle table lock poisoned");
-        let file_inode = handles
-            .files
-            .get(&handle)
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
-            .inode;
-        if file_inode != inode {
-            return Err(io::Error::from_raw_os_error(libc::EBADF));
-        }
-        let file = handles
-            .files
-            .remove(&handle)
-            .expect("handle was checked before removal");
+        let file = {
+            let mut handles = self.handles_write()?;
+            let file_inode = handles
+                .files
+                .get(&handle)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
+                .inode;
+            if file_inode != inode {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            handles
+                .files
+                .remove(&handle)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EBADF))?
+        };
         if flush && file.writable {
             file.file.sync_all()?;
         }
         drop(file);
-        self.remove_locks_for_handle(inode, handle);
-        Ok(())
+        self.remove_locks_for_handle(inode, handle)
     }
 
     fn releasedir(
@@ -1891,134 +1743,6 @@ impl DirectoryIterator for VecDirIter {
             name: entry.name.as_c_str(),
         })
     }
-}
-
-#[derive(Debug, Parser)]
-#[command(
-    name = "agentvm-composed-fs",
-    about = "Serve an AgentVM composed filesystem over vhost-user"
-)]
-struct Args {
-    #[arg(long, value_name = "PATH")]
-    manifest: PathBuf,
-    #[arg(long, value_name = "PATH")]
-    socket_path: PathBuf,
-    #[arg(long, default_value = DEFAULT_TAG)]
-    tag: String,
-    #[arg(long, default_value_t = DEFAULT_THREAD_POOL_SIZE)]
-    thread_pool_size: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServeConfig {
-    pub manifest: PathBuf,
-    pub socket_path: PathBuf,
-    pub tag: String,
-    pub thread_pool_size: usize,
-}
-
-impl ServeConfig {
-    pub fn new(manifest: PathBuf, socket_path: PathBuf) -> Self {
-        Self {
-            manifest,
-            socket_path,
-            tag: String::from(DEFAULT_TAG),
-            thread_pool_size: DEFAULT_THREAD_POOL_SIZE,
-        }
-    }
-}
-
-pub fn run_cli() -> io::Result<()> {
-    let args = Args::parse();
-    serve_vhost_user_fs(ServeConfig {
-        manifest: args.manifest,
-        socket_path: args.socket_path,
-        tag: args.tag,
-        thread_pool_size: args.thread_pool_size,
-    })
-}
-
-pub fn validate_manifest_json_shape(manifest_text: &str) -> io::Result<()> {
-    let manifest: Manifest = serde_json::from_str(manifest_text)
-        .map_err(|error| invalid_input(format!("invalid manifest JSON: {error}")))?;
-    if manifest.schema_version != SCHEMA_VERSION {
-        return Err(invalid_input(format!(
-            "unsupported schema_version {}, expected {}",
-            manifest.schema_version, SCHEMA_VERSION
-        )));
-    }
-    if manifest.mounts.is_empty() {
-        return Err(invalid_input("manifest must contain at least one mount"));
-    }
-    if let Some(synthetic) = &manifest.synthetic {
-        parse_octal_mode(&synthetic.dir_mode)?;
-    }
-
-    let mut normalized_paths = Vec::new();
-    for mount in &manifest.mounts {
-        mount.validate()?;
-        let guest_path = normalize_guest_path(&mount.guest_path)?;
-        if manifest
-            .protected_guest_paths
-            .iter()
-            .any(|protected| protected == &guest_path)
-        {
-            return Err(invalid_input(format!(
-                "mount targets protected guest path: {guest_path}"
-            )));
-        }
-        if guest_path == "/" {
-            return Err(invalid_input("mount guest_path cannot be /"));
-        }
-        if normalized_paths.iter().any(|path| path == &guest_path) {
-            return Err(invalid_input(format!(
-                "duplicate guest_path in manifest: {guest_path}"
-            )));
-        }
-        normalized_paths.push(guest_path);
-    }
-    Ok(())
-}
-
-pub fn serve_vhost_user_fs(config: ServeConfig) -> io::Result<()> {
-    let manifest_text = fs::read_to_string(&config.manifest)?;
-    let manifest: Manifest = serde_json::from_str(&manifest_text)
-        .map_err(|error| invalid_input(format!("invalid manifest JSON: {error}")))?;
-    let namespace = Namespace::from_manifest(&manifest)?;
-    let fs = ComposedFs::new(namespace);
-
-    if let Some(parent) = config.socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let backend = Arc::new(
-        VhostUserFsBackendBuilder::default()
-            .set_thread_pool_size(config.thread_pool_size)
-            .set_tag(Some(config.tag.clone()))
-            .build(fs)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?,
-    );
-    let listener = Listener::new(&config.socket_path, true)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-    let mut daemon = VhostUserDaemon::new(
-        String::from("agentvm-composed-fs"),
-        backend,
-        GuestMemoryAtomic::new(GuestMemoryMmap::new()),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?;
-
-    eprintln!(
-        "agentvm-composed-fs: serving tag {:?} on {}",
-        config.tag,
-        config.socket_path.display()
-    );
-    daemon
-        .start(listener)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
-    daemon
-        .wait()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("{error:?}")))?;
-    Ok(())
 }
 
 fn parse_octal_mode(value: &str) -> io::Result<u32> {
@@ -2708,6 +2432,10 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
 
+fn poisoned_lock(name: &str) -> io::Error {
+    io::Error::other(format!("{name} lock poisoned"))
+}
+
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod fuzz_harness;
 
@@ -2814,6 +2542,22 @@ mod tests {
         }
     }
 
+    fn assert_poison_error(error: io::Error, expected_lock: &str) {
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(
+            error.to_string().contains(expected_lock),
+            "expected poison error for {expected_lock}, got {error}"
+        );
+    }
+
+    fn poison_for_test(action: impl FnOnce()) {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(action));
+        std::panic::set_hook(previous_hook);
+        assert!(result.is_err(), "poisoning action should panic");
+    }
+
     fn byte_lock(lock_type: i32, start: libc::off_t, len: libc::off_t) -> libc::flock {
         libc::flock {
             l_type: lock_type as libc::c_short,
@@ -2891,6 +2635,52 @@ mod tests {
             matches!(raw, Some(code) if code == libc::EACCES || code == libc::EAGAIN),
             "{label} returned unexpected error {error:?}"
         );
+    }
+
+    fn single_mount_filesystem(name: &str) -> (TestDir, PathBuf, ComposedFs) {
+        let test_dir = TestDir::new(name);
+        let root = test_dir.path.join("root");
+        fs::create_dir(&root).expect("create root");
+        fs::write(root.join("file.txt"), b"contents").expect("write file");
+        let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+        )]))
+        .expect("build namespace");
+        let filesystem = ComposedFs::new(namespace);
+        (test_dir, root, filesystem)
+    }
+
+    #[test]
+    fn poisoned_state_locks_return_io_errors_instead_of_panicking() {
+        let (_test_dir, _root, filesystem) = single_mount_filesystem("poison-namespace");
+        poison_for_test(|| {
+            let _guard = filesystem.namespace.write().expect("namespace lock");
+            panic!("poison namespace lock");
+        });
+        let error = filesystem.getattr(ctx(), ROOT_ID, None).unwrap_err();
+        assert_poison_error(error, "namespace");
+
+        let (_test_dir, root, filesystem) = single_mount_filesystem("poison-handles");
+        poison_for_test(|| {
+            let _guard = filesystem.handles.write().expect("handle table lock");
+            panic!("poison handle table lock");
+        });
+        let file = File::open(root.join("file.txt")).expect("open host file");
+        let error = filesystem
+            .insert_file_handle(ROOT_ID, file, false, root.join("file.txt"))
+            .unwrap_err();
+        assert_poison_error(error, "handle table");
+
+        let (_test_dir, _root, filesystem) = single_mount_filesystem("poison-locks");
+        poison_for_test(|| {
+            let _guard = filesystem.locks.lock().expect("lock table lock");
+            panic!("poison lock table lock");
+        });
+        let error = filesystem.remove_locks_for_handle(ROOT_ID, 1).unwrap_err();
+        assert_poison_error(error, "lock table");
     }
 
     fn child_posix_write_lock_conflicts(path: &Path) -> bool {

@@ -7,9 +7,8 @@ Work dependency-aware through the remaining `tk` epic `wra-xcvq` until the epic 
 - `wra-662v` in progress: opt-in Rust/Tokio guest payload service.
   - Implementation exists, default appliance required validation passes, but current `docker/out/artifact-manifest.json` is Python-default and does not include `agentvm_payload_service=rust`.
   - Remaining decision: build/live-smoke Rust opt-in appliance, or explicitly narrow/close implementation ticket with Rust appliance parity/default-switch validation owned by `wra-y335`.
-- `wra-f762` open: replace vmnet poller and service I/O with Tokio actor.
-- `wra-yl7i` open: make TUI a control-socket frontend to the agentvm supervisor.
-- `wra-0a0r` open: refactor composed-fs as bounded blocking vhost/filesystem backend.
+- `wra-yl7i` in progress: make TUI a control-socket frontend to the agentvm supervisor.
+- Recently completed option-1 children include `wra-f762`, follow-up `wra-avuf`, and composed-fs child `wra-0a0r`.
 
 ## Ground rules
 - Use `tk` for ticket state. Start/close child tickets as work begins/completes and add notes for significant findings.
@@ -39,7 +38,355 @@ Work dependency-aware through the remaining `tk` epic `wra-xcvq` until the epic 
   - Rebuild failed because `sudo` requires a password in this environment.
   - Added a `wra-662v` note with the exact user-side Rust opt-in rebuild command needed: `sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh`.
   - `wra-662v` remains open; Python remains default until `wra-y335` passes.
-- [ ] Next: while Rust opt-in rebuild is blocked, start the next useful epic child deliberately, likely `wra-f762` if taking vmnet Tokio actor work, or `wra-0a0r` if preferring bounded-blocking composed-fs cleanup.
+- [x] Iteration 1: started `wra-f762` while Rust opt-in rebuild is blocked.
+  - Added a planning note to keep vmnet/smoltcp synchronous and single-owner, avoid `Arc<Mutex<_>>`, and take deletion/mechanical slices before any broad Tokio actor switch.
+  - Inspected `vmnet_runtime.rs`, `vmnet_poller.rs`, and `vmnet_service_io.rs` for remaining `RuntimePoller`, `VmnetServiceWakeup`, sync worker, and byte-I/O seams.
+- [x] Iteration 1: first `wra-f762` deletion slice.
+  - Removed the unused spawned byte-I/O worker entrypoint from `vm-frontend/src/vmnet_service_io.rs`: deleted `VmnetByteIoWorkerHandle`, `spawn_byte_io_service_worker`, and the worker-thread tests for it.
+  - There was no production caller for that worker; production off-owner service workers remain DNS lookup and TCP connect.
+  - Kept the lower-level byte-I/O command/executor tests for now; further deletion can happen once host/upstream session pump ownership is rechecked.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`.
+- [x] Iteration 2: second `wra-f762` deletion slice.
+  - Removed the remaining generic byte-I/O service command/executor surface from `vm-frontend/src/vmnet_service_io.rs`.
+  - Deleted `VmnetServiceCommand::ByteIo`, `VmnetServiceCompletion::ByteIo`, `VmnetByte*` structs/enums, `HostIngress`/`UpstreamSession` service kinds, byte-I/O owner-step helpers, and the associated tests/proptest.
+  - Production host-ingress/upstream session I/O remains driven by the existing runtime bridge pump helpers; production off-owner service IO is now narrowed to DNS lookup and TCP connect plus cancellation.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`.
+- [x] Iteration 3: first additive Tokio DNS service seam for `wra-f762`.
+  - Added `VmnetAsyncServiceWorkerHandle` and `spawn_dns_service_task` in `vm-frontend/src/vmnet_service_io.rs`.
+  - The new DNS task uses bounded `tokio::sync::mpsc` command/completion channels and needs no `VmnetServiceWakeup` fd.
+  - Blocking `DnsUpstream::exchange` runs inside `tokio::task::spawn_blocking`, so DNS work does not occupy core Tokio workers.
+  - Unsupported commands are skipped and capacity validation matches the existing service limits.
+  - Production `serve_vmnet_gateway` still uses the existing synchronous worker/wakeup path; this slice only establishes and tests the Tokio seam.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_dns_service_task -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 4: matching additive Tokio TCP-connect service seam for `wra-f762`.
+  - Added `VmnetAsyncTcpConnectWorkerHandle` and `spawn_tcp_connect_service_task` in `vm-frontend/src/vmnet_service_io.rs`.
+  - The TCP-connect task uses bounded `tokio::sync::mpsc` command/completion channels and runs blocking `TcpUpstreamConnector::connect` via `tokio::task::spawn_blocking`.
+  - Added tests for successful TCP completion, unsupported command skipping, cancellation, and zero-capacity rejection.
+  - Production `serve_vmnet_gateway` still uses the existing synchronous worker/wakeup path; this keeps the live vmnet path unchanged while the Tokio seam is proven.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_tcp_connect_service_task -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 5: owner-side async service adapter for `wra-f762`.
+  - Added `VmnetServiceOwner::submit_to_async_worker` and `VmnetServiceOwner::drain_from_async_worker`.
+  - `submit_to_async_worker` uses bounded Tokio worker handles while preserving pending-state semantics when `try_send` rejects a command.
+  - `drain_from_async_worker` moves async worker completions back into the owner queue and reports disconnection without taking ownership of vmnet/smoltcp state.
+  - Added DNS and TCP adapter tests plus a full async command-channel preservation test.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_adapter -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 6 reflection checkpoint:
+  - Accomplished so far on `wra-f762`: deleted unused byte-I/O service abstractions, narrowed service I/O to real DNS/TCP-connect work, added bounded Tokio DNS/TCP worker seams, added owner-side async adapter methods, and added vmnet-runtime helper variants/tests that use those async handles while keeping `VmnetCore`/smoltcp single-owner.
+  - Working well: deletion-first and adapter-first slices keep production routing stable while proving each boundary with focused tests. `spawn_blocking` keeps blocking DNS/connect work off core Tokio workers.
+  - Blocking/not working: `wra-662v` still cannot be honestly closed until the user can perform the privileged Rust opt-in appliance rebuild/live validation; production vmnet still uses wakeup-fd worker threads, so `wra-f762` is not done.
+  - Approach adjustment: continue with one more vmnet adapter/prod seam review before flipping production; avoid introducing a broad actor or shared mutable smoltcp state.
+  - Next priorities: decide whether to switch production DNS/TCP service workers to async handles or first simplify the remaining wakeup-fd/thread worker code; then run required validation before closing `wra-f762`.
+- [x] Iteration 6: vmnet-runtime async helper variants/tests for `wra-f762`.
+  - Added `handle_guest_frame_with_async_dns_worker` and `drain_async_dns_worker_completions`.
+  - Added `submit_tcp_connects_to_async_worker` and `drain_async_tcp_connect_worker_completions`.
+  - Added current-thread Tokio tests proving async DNS upstream failure and async TCP connect success are applied on the owner side without moving vmnet/smoltcp ownership.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_ -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 7: production seam review for `wra-f762`.
+  - Inspected production `serve_vmnet_gateway`: it is still a synchronous `RuntimePoller` loop used by both the `vmnet-gateway` CLI and the supervised blocking-service path.
+  - Decision: do not directly flip production from wakeup-fd workers to the new Tokio service tasks yet. Without either an async `select!` loop or a completion notification registered with the sync poller, async worker completions could wait for unrelated fd/timer events.
+  - Added `slow_async_tcp_connect_worker_does_not_block_unrelated_tcp_syn`, proving the async TCP-connect runtime helper keeps blocking connect work on `spawn_blocking` and does not block unrelated owner-side TCP SYN handling.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline slow_async_tcp_connect_worker -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 8: async service completion-notification bridge for `wra-f762`.
+  - Added `spawn_dns_service_task_with_notifier` and `spawn_tcp_connect_service_task_with_notifier`.
+  - These keep the bounded Tokio channel and `spawn_blocking` execution model, but optionally notify a `VmnetServiceWakeup` after a completion is successfully enqueued.
+  - Added poller-backed tests proving async DNS and TCP completions wake the existing `RuntimePoller` service-IO fd.
+  - Production routing remains unchanged. The bridge solves poller wakeup, but production still needs an explicit decision about where the Tokio runtime is owned/driven before switching from sync worker threads.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline notifies_pollable_wakeup -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 9: production runtime-ownership seam and async service-task switch for `wra-f762`.
+  - `serve_vmnet_gateway` now owns a small multi-thread Tokio runtime dedicated to vmnet service I/O.
+  - Production DNS and TCP-connect service I/O now use `spawn_dns_service_task_with_notifier` and `spawn_tcp_connect_service_task_with_notifier` instead of the old wakeup-fd worker threads.
+  - The existing synchronous `RuntimePoller` loop remains the sole owner of `VmnetCore`/smoltcp state; service completion wakeups still arrive via the registered `VmnetServiceWakeup` fd and are drained through the async helper paths.
+  - Blocking DNS and TCP connect calls remain inside `tokio::task::spawn_blocking`.
+  - `default_dns_upstream` now returns a `Send + Sync` trait object so it can cross the async task boundary safely.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 10: removed old synchronous service worker surface for `wra-f762`.
+  - Deleted `VmnetServiceWorkerHandle`, `VmnetDnsWorkerHandle`, `VmnetTcpConnectWorkerHandle`, `spawn_dns_service_worker`, `spawn_tcp_connect_service_worker`, and their `std::sync::mpsc`/thread imports from `vmnet_service_io`.
+  - Removed the old thread-worker tests from `vmnet_service_io`; async notifier/task tests now cover the production service-I/O path.
+  - Removed old sync-worker helper functions from `vmnet_runtime` and adapted the remaining submission coverage to the async worker path.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 11 reflection checkpoint:
+  - Accomplished so far on `wra-f762`: production DNS/TCP service I/O is now Tokio-task based, blocking DNS/connect work runs on Tokio blocking workers, old std::sync::mpsc/thread service workers are deleted, and `VmnetCore`/smoltcp ownership remains single-owner in the vmnet loop.
+  - Working well: small deletion/additive slices kept behavior testable; the completion-wakeup bridge allowed the production sync owner loop to consume Tokio task completions without shared mutable vmnet state.
+  - Blocking/not working: `wra-f762` acceptance is still not fully met because `vmnet_runtime` still uses the synchronous `RuntimePoller`/`VmnetServiceWakeup` bridge rather than a Tokio owner actor/select loop. `wra-662v` also remains blocked on privileged Rust opt-in appliance rebuild/live validation.
+  - Approach adjustment: do not close `wra-f762` yet despite required validation passing; continue with the poller-to-Tokio owner-loop work or explicitly revise/split ticket scope.
+  - Next priorities: inspect `RuntimePoller` replacement seams and decide whether a small async owner-loop path can be introduced without destabilizing live behavior.
+- [x] Iteration 11: broader validation for current `wra-f762` slice.
+  - Ran `./vm-frontend/validate.sh required` after switching production service I/O to Tokio tasks and deleting old sync service workers.
+  - Required validation passed (exit 0), including the live setup-tool scenarios in this environment.
+  - `wra-f762` remains open because the remaining poller/actor acceptance criteria are not satisfied yet.
+- [x] Iteration 12: split remaining vmnet poller/actor work and closed validated service-I/O slice.
+  - Inspected `wra-f762` acceptance and the remaining `RuntimePoller`/`VmnetServiceWakeup` usage.
+  - Created follow-up child ticket `wra-avuf`: “Replace vmnet RuntimePoller owner loop with Tokio readiness”.
+  - `wra-avuf` carries the remaining acceptance: production vmnet path without `vmnet_poller::RuntimePoller`/mio raw-fd registration and without `VmnetServiceWakeup`, while preserving single-owner vmnet state and adding async QEMU/session/timer tests.
+  - Added dependency `wra-avuf -> wra-f762` so implementation order reflects that the Tokio service-I/O migration is the prerequisite.
+  - Closed `wra-f762` based on the explicit split/supersession and prior `./vm-frontend/validate.sh required` pass: service-I/O migration is implemented/validated; poller/actor replacement remains open as `wra-avuf`.
+- [x] Iteration 13: started `wra-avuf` and added the first async owner-loop seam.
+  - Started `wra-avuf`: “Replace vmnet RuntimePoller owner loop with Tokio readiness”.
+  - Added async QEMU frame I/O primitives in `vm-frontend/src/vmnet_stream.rs`: `QemuFrameIo::read_frame_async` and `QemuFrameIo::write_frame_async` for Tokio `AsyncRead`/`AsyncWrite` streams.
+  - The async methods preserve the existing big-endian length-prefix framing, max-frame validation, buffered partial-frame handling, clean EOF, truncated-length, and truncated-frame behavior while leaving synchronous APIs intact.
+  - Added Tokio duplex tests for async decode, async encode, and async truncated-length handling.
+  - Existing proptest coverage continues to exercise arbitrary frame bytes/lengths through the shared buffered parser.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 14: async vmnet owner-loop harness around async frame I/O.
+  - Added `handle_next_async_qemu_frame` in `vmnet_runtime`: reads one async guest frame and applies it on the single owner `VmnetCore`.
+  - Added `write_guest_frames_async`: writes owner-produced frames back through async `QemuFrameIo` while preserving runtime stats and pcap capture behavior.
+  - Added Tokio duplex tests proving a guest TCP SYN can be handled by the async harness and a response frame written back, plus clean EOF handling.
+  - Production `serve_vmnet_gateway` still uses `RuntimePoller`; this slice is a test-level owner-loop seam before production routing changes.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_qemu_frame_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 15: async select harness for QEMU frames plus DNS service completions.
+  - Added `VmnetAsyncQemuDnsEvent` and `next_async_qemu_or_dns_event` in `vmnet_runtime`.
+  - The new seam uses `tokio::select!` over async QEMU frame reads and bounded Tokio DNS worker completions, with no `RuntimePoller` or `VmnetServiceWakeup`.
+  - Added tests proving the harness receives a DNS completion directly from the Tokio service task and applies it on the owner side, and receives a QEMU frame without the poller.
+  - Production `serve_vmnet_gateway` remains unchanged; this is still harness-level coverage toward the future owner actor.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_select_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 16 reflection checkpoint:
+  - Accomplished so far on `wra-avuf`: added async QEMU frame read/write, an async owner-side QEMU frame harness, and `tokio::select!` harness seams for QEMU frames plus DNS and TCP-connect completions.
+  - Working well: harness-level additions continue to prove the future owner actor shape without touching production routing or sharing `VmnetCore`/smoltcp state.
+  - Blocking/not working: production still uses `RuntimePoller`/`VmnetServiceWakeup`; host-ingress/upstream dynamic session readiness and smoltcp timer wakeups are not yet represented in the async harness.
+  - Approach adjustment: keep building coverage for missing wake classes before a production flip. Avoid a broad duplicate runtime; collapse helper shapes once the event set is complete.
+  - Next priorities: add timer-driven polling coverage, then host/upstream session readiness coverage, before attempting production `serve_vmnet_gateway` migration.
+- [x] Iteration 16: async select harness for QEMU frames plus TCP-connect completions.
+  - Added `VmnetAsyncQemuTcpEvent` and `next_async_qemu_or_tcp_event` in `vmnet_runtime`.
+  - The new seam uses `tokio::select!` over async QEMU frame reads and bounded Tokio TCP-connect worker completions, with no `RuntimePoller` or `VmnetServiceWakeup`.
+  - Added a test proving a TCP connect completion is received directly from the Tokio service task and applied on owner-side `TcpProxyBridge` state.
+  - Production `serve_vmnet_gateway` remains unchanged; this is harness-level coverage toward the future owner actor.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_select_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 17: async select harness for QEMU frames plus timer wakeups.
+  - Added `VmnetAsyncQemuTimerEvent` and `next_async_qemu_or_timer_event` in `vmnet_runtime`.
+  - The new seam uses `tokio::select!` over async QEMU frame reads and `tokio::time::sleep`, giving the future owner actor a no-`RuntimePoller` path for smoltcp timer wakeups.
+  - Added tests proving a timer event fires without a poller and that a ready QEMU frame wins over a later timer.
+  - Production `serve_vmnet_gateway` remains unchanged; this is harness-level coverage toward the future owner actor.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_select_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 18: async harness for dynamic host/upstream session fd readiness.
+  - Added `VmnetAsyncFdReadyEvent`, `BorrowedRawFd`, and `next_async_qemu_or_fd_readable` in `vmnet_runtime`.
+  - The new seam uses `tokio::io::unix::AsyncFd` to select over async QEMU frame reads and borrowed fd readability without `RuntimePoller`.
+  - Added tests proving `HostSession` and `UpstreamSession` readiness can be reported without mio/raw-fd registration in `RuntimePoller`.
+  - Production `serve_vmnet_gateway` remains unchanged; this is harness-level coverage toward the future owner actor.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_fd_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 19: async harness for host-listener accept readiness.
+  - Made `HostIngressListenerSet::local_addrs` `pub(crate)` under `cfg(test)` so vmnet runtime tests can connect to a real ephemeral listener without changing production API.
+  - Added `async_fd_harness_reports_host_listener_accept_readiness_without_poller`: binds a nonblocking host listener on port 0, connects to it, observes `VmnetEventSource::HostListener` readiness through `tokio::io::unix::AsyncFd`/`next_async_qemu_or_fd_readable`, then accepts through `HostIngressListenerSet`.
+  - The async harness now covers the current `RuntimePoller` wake classes: QEMU stream frames/EOF, DNS completions, TCP-connect completions, smoltcp timer wakeups, host listeners, host sessions, and upstream sessions.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_fd_harness -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 20: inspected production `serve_vmnet_gateway` and added the first production-prep async write seam.
+  - Production inspection found the next concrete blocker: replacing `RuntimePoller` means the QEMU stream must become a Tokio `AsyncRead`/`AsyncWrite` boundary, but existing proxy/host-ingress pump helpers wrote guest frames through `QemuFrameIo<T: std::io::Read + Write>`.
+  - Added async proxy and host-ingress guest-frame writers plus `pump_proxy_ready_async` and `pump_host_ingress_ready_async`.
+  - These helpers keep gateway/proxy/host-ingress processing synchronous and single-owner while allowing guest-frame writes to use `QemuFrameIo::write_frame_async` on a Tokio stream.
+  - Added `async_event_guest_frame_writers_use_tokio_stream`, proving proxy and host-ingress events write length-prefixed guest frames through a Tokio duplex stream.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_event_guest_frame_writers -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 21 reflection checkpoint.
+  - Accomplished on `wra-avuf`: async QEMU frame read/write, async owner-side frame harness, direct Tokio DNS/TCP completion harnesses, timer harness, `AsyncFd` readiness harnesses for host listeners/host sessions/upstream sessions, and async guest-frame write seams for proxy/host-ingress events.
+  - Working well: the slices keep `VmnetCore`/smoltcp/proxy/host-ingress state synchronous and single-owner while moving only byte-stream readiness and service-completion boundaries toward Tokio.
+  - Blocking/risk: production `serve_vmnet_gateway` still uses `RuntimePoller`/`VmnetServiceWakeup`; the remaining migration must avoid a parallel owner loop or shared mutable state.
+  - Approach adjustment: introduce the production async wrapper from the QEMU stream boundary inward. Keep a synchronous public `serve_vmnet_gateway` wrapper if useful, but let the inner owner loop use Tokio stream I/O, direct service channel selection, `AsyncFd` host/proxy readiness, and timer sleep.
+  - Next priorities: add async QEMU socket accept, then choose/wire the sync-public-wrapper + async-inner production shape.
+- [x] Iteration 21: async QEMU socket accept seam.
+  - Added `VmnetStreamEndpoint::accept_one_tokio`, which uses `tokio::io::unix::AsyncFd` over the existing bound Unix listener fd, reuses `accept_ready`, and converts the accepted nonblocking `UnixStream` to `tokio::net::UnixStream`.
+  - Added `endpoint_accepts_tokio_qemu_stream`, proving async endpoint accept and length-prefixed frame decode through `QemuFrameIo::read_frame_async`.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline endpoint_accepts_tokio_qemu_stream -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 22: chose and wired the minimal production wrapper shape.
+  - Public `serve_vmnet_gateway` now owns an `agentvm-vmnet-runtime` multi-thread Tokio runtime and `block_on`s a private `serve_vmnet_gateway_async` inner.
+  - The async inner currently uses `tokio::task::block_in_place` to run the existing single-owner blocking poller loop, now named `serve_vmnet_gateway_blocking_poller`.
+  - This keeps production behavior staged while establishing the Tokio orchestration boundary that future slices can convert inward.
+  - `RuntimePoller` and `VmnetServiceWakeup` are still present in the blocking inner and must be removed before `wra-avuf` acceptance is met.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 23: moved production vmnet service tasks onto the new owner runtime.
+  - The blocking-poller inner no longer constructs a nested `agentvm-vmnet-service-io` Tokio runtime.
+  - It now enters `tokio::runtime::Handle::current()` from the public `serve_vmnet_gateway` runtime and spawns DNS/TCP-connect tasks there.
+  - `RuntimePoller`/`VmnetServiceWakeup` remain for completion notification while the blocking inner is still in place, but runtime ownership is now single-layered and ready for direct channel selection in the async inner.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 24: added direct service-completion selection seam.
+  - Added `VmnetAsyncServiceCompletionEvent` and `next_async_service_completion` in `vmnet_runtime`.
+  - The new helper uses `tokio::select!` directly over DNS and TCP-connect worker completion channels, with no `RuntimePoller` or `VmnetServiceWakeup`.
+  - Added DNS and TCP tests proving direct channel selection receives completions, applies them on the owner side, and clears pending state.
+  - Production still uses `RuntimePoller`/`VmnetServiceWakeup` in the blocking inner; this slice establishes the no-wakeup service event shape for the next production migration.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_service_completion_select -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 25: added owner-side application for direct async service-completion events.
+  - Added `VmnetAsyncServiceCompletionApply` and `apply_async_service_completion_event`.
+  - The new helper consumes `VmnetAsyncServiceCompletionEvent`, applies DNS/TCP completions on the single owner side, writes resulting guest frames through async `QemuFrameIo`, and returns gateway/proxy events plus disconnect flags/stats.
+  - Added `async_service_completion_apply_writes_dns_guest_frame_without_wakeup_fd`, proving a direct DNS completion writes a length-prefixed response frame without `RuntimePoller`/`VmnetServiceWakeup` and clears pending DNS state.
+  - Production still uses the blocking poller/wakeup bridge; this slice prepares the code that can replace the `service_io` dispatch branch in an async inner.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_service_completion -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 26 reflection checkpoint.
+  - Accomplished on `wra-avuf`: async QEMU stream accept/read/write, direct DNS/TCP service completion wait/apply, smoltcp timer wakeups, host listener readiness, host session readiness, upstream session readiness, and async proxy/host-ingress guest-frame write seams are covered under tests.
+  - Working well: keeping `VmnetCore`/smoltcp/proxy/host-ingress synchronous and single-owner while moving only orchestration and byte-stream boundaries to Tokio continues to produce small, testable slices.
+  - Blocking/risk: production still delegates from the async wrapper to `serve_vmnet_gateway_blocking_poller`, so `RuntimePoller` and `VmnetServiceWakeup` still gate live behavior.
+  - Approach adjustment: avoid adding another parallel full loop; collapse the separate harness shapes into one owner-event wait/apply path and then migrate the existing loop branches into it.
+  - Next priorities: extend the unified owner-event path to fd readiness, then use it as the production async inner loop spine.
+- [x] Iteration 26: unified owner-event select seam.
+  - Added `VmnetAsyncOwnerEvent` and `next_async_owner_event`.
+  - The helper selects over QEMU frame reads, direct DNS/TCP service completions, and timer sleep without `RuntimePoller`/`VmnetServiceWakeup`.
+  - Added tests proving a service completion beats a long timer and a timer fires without poller/wakeup.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_event_select -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 27: extended unified owner-event selection to fd readiness.
+  - `VmnetAsyncOwnerEvent` now includes `FdReadable(VmnetEventSource)`.
+  - `next_async_owner_event` accepts an optional fd readiness source backed by `tokio::io::unix::AsyncFd`, while still selecting over QEMU frames, direct service completions, and timers.
+  - Added tests proving the unified event path reports `HostListener` readiness against a real `HostIngressListenerSet`, plus `HostSession` and `UpstreamSession` readiness using nonblocking `UnixStream` pairs, all without `RuntimePoller`/`VmnetServiceWakeup`.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_event_select -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+  - Production still delegates to `serve_vmnet_gateway_blocking_poller`.
+- [x] Iteration 28: added fd-registration snapshot and richer fd interest model for the async owner-event spine.
+  - Added `VmnetAsyncFdInterest` and `VmnetAsyncFdRegistration` plus `snapshot_async_fd_registrations`.
+  - The snapshot helper collects host listeners, host-ingress sessions, and upstream proxy sessions into fd registrations without `RuntimePoller`.
+  - `next_async_owner_event` now accepts an optional `VmnetAsyncFdRegistration` and can wait for readable or writable readiness via `AsyncFd`.
+  - `VmnetAsyncOwnerEvent` now reports `FdReady { source, readable, writable }`.
+  - Added `async_fd_snapshot_includes_host_listeners_without_poller_registration` and updated owner-event fd tests for the richer event shape.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_fd_snapshot -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_event_select -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+  - Production still delegates to `serve_vmnet_gateway_blocking_poller`.
+- [x] Iteration 29: added deterministic fd scheduling over async fd snapshots.
+  - Added `choose_async_fd_registration` and `async_fd_registration_poll_ready`.
+  - The chooser scans from a cursor for an immediately ready registration using a zero-timeout `libc::poll` check, prefers that ready fd, and otherwise round-robins the next registration while advancing the cursor.
+  - Added tests proving a ready fd later in the snapshot is preferred and that fallback round-robins when no fd is ready.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_fd_registration_choice -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_event_select -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+  - Production still delegates to `serve_vmnet_gateway_blocking_poller`.
+- [x] Iteration 30: added an async-owner production skeleton, not yet wired as live behavior.
+  - Added `serve_vmnet_gateway_async_owner`, mirroring the production initialization and loop shape using Tokio QEMU accept/read/write, direct non-notifier DNS/TCP service tasks on the owner runtime, the unified owner-event wait spine, async fd snapshots/selection, async service-completion application, and async proxy/host-ingress guest-frame writes.
+  - Public `serve_vmnet_gateway` still calls `serve_vmnet_gateway_async`, which continues to `block_in_place` into `serve_vmnet_gateway_blocking_poller`.
+  - `RuntimePoller`/`VmnetServiceWakeup` still gate live behavior.
+  - The skeleton was intentionally not flipped live yet: the current fd wait path still waits on one selected `AsyncFd` at a time, so production needs multi-fd waiting or another safe strategy before removing `RuntimePoller`.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_fd_registration_choice -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+- [x] Iteration 31 reflection checkpoint.
+  - Accomplished on `wra-avuf`: non-live async-owner production skeleton plus unified owner-event path covering QEMU, service completions, timers, fd snapshots, and async guest-frame writes.
+  - Working well: byte-stream/service/timer/fd seams are all tested without moving `VmnetCore`/smoltcp/proxy/host-ingress off the owner.
+  - Blocking/risk: live production still uses `RuntimePoller`/`VmnetServiceWakeup`, and flipping requires safe waiting across the whole fd snapshot.
+  - Approach adjustment: solve multi-fd readiness in the unified event helper rather than relying on one selected `AsyncFd`.
+  - Next priorities: switch the async-owner skeleton to the multi-fd snapshot wait helper, then evaluate wiring it as the live inner.
+- [x] Iteration 31: replaced one-fd waiting in the async-owner spine with snapshot-wide fd waiting.
+  - Added `wait_async_fd_registrations` and `next_async_owner_event_with_fd_snapshot`.
+  - `wait_async_fd_registrations` builds `AsyncFd` wrappers for the fd snapshot, polls all readable/writable interests in one future, and advances the cursor on readiness.
+  - `serve_vmnet_gateway_async_owner` now uses the snapshot-aware event helper instead of one selected registration.
+  - Added `async_owner_event_snapshot_wait_receives_later_ready_fd`, proving a later-ready fd in the snapshot wakes the unified owner event even when an earlier fd is unready.
+  - Focused validation passed: `cargo test --manifest-path vm-frontend/Cargo.toml --offline async_owner_event_snapshot_wait -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo fmt --manifest-path vm-frontend/Cargo.toml -- --check`.
+  - Production still delegates to `serve_vmnet_gateway_blocking_poller`.
+- [x] Iteration 32: wired the async owner loop as the live vmnet inner.
+  - Reviewed the async owner loop against the blocking poller loop at the event/write/accounting level: it preserves single-owner `VmnetCore`/proxy/host-ingress state, event logging, pcap/stat accounting through the async write helpers, direct DNS/TCP completion application, timer polling, host listener readiness, host-session readiness, and upstream-session readiness.
+  - Changed `serve_vmnet_gateway_async` to call `serve_vmnet_gateway_async_owner(config).await` instead of `block_in_place` delegating to `serve_vmnet_gateway_blocking_poller`.
+  - The production entrypoint still has a synchronous public wrapper owning the `agentvm-vmnet-runtime` Tokio runtime, but live vmnet orchestration now uses Tokio QEMU accept/read/write, direct service channels, timer sleep, and snapshot-wide `AsyncFd` readiness instead of `RuntimePoller`/`VmnetServiceWakeup`.
+  - Kept the old blocking poller function temporarily as dead rollback/reference code for the next cleanup slice.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`.
+  - Required/live-capable validation passed after the production flip: `./vm-frontend/validate.sh required`.
+- [x] Iteration 33: removed the dead blocking-poller and service-wakeup fallback code.
+  - Deleted `serve_vmnet_gateway_blocking_poller`, `RuntimeReadyDispatch`, sync poller registration helpers, and their old dispatch tests from `vm-frontend/src/vmnet_runtime.rs`.
+  - Restored `open_host_ingress_session` as a shared helper for the async owner path after deleting the surrounding sync-registration code.
+  - Removed `VmnetServiceWakeup`, `VmnetServiceNotifier`, `spawn_*_service_task_with_notifier`, optional-notifier task plumbing, and notifier/pollable-wakeup tests from `vm-frontend/src/vmnet_service_io.rs`.
+  - Production `vmnet_runtime` no longer references `RuntimePoller` or `VmnetServiceWakeup`; the remaining `vmnet_poller` module is now orphaned except that `VmnetEventSource` is still imported from it.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`.
+- [x] Iteration 34: removed the orphaned `vmnet_poller` module and closed `wra-avuf`.
+  - Moved `VmnetEventSource` into `vmnet_runtime`, narrowed it to the active async fd sources, removed `pub mod vmnet_poller` from `vm-frontend/src/lib.rs`, and deleted `vm-frontend/src/vmnet_poller.rs`.
+  - Confirmed there are no remaining `vmnet_poller`, `RuntimePoller`, `VmnetServiceWakeup`, `VmnetServiceNotifier`, or notifier-task references in `vm-frontend/src`.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_runtime -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_service_io -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline vmnet_stream -- --nocapture`.
+  - Required/live-capable validation passed: `./vm-frontend/validate.sh required`.
+  - Added final `wra-avuf` note and closed the ticket.
+- [x] Iteration 35: selected and started `wra-0a0r` because `wra-662v` remains blocked on privileged Rust opt-in appliance rebuild/live validation.
+  - Inspected `wra-0a0r`, `wra-yl7i`, and `wra-662v` status. `wra-0a0r` is dependency-ready and matches the remaining bounded-blocking backend cleanup goal; `wra-yl7i` is larger lifecycle/control-plane work; `wra-662v` still needs the user-side Rust opt-in appliance rebuild command documented earlier.
+  - Started `wra-0a0r` and added a planning note: keep composed-fs request execution synchronous/bounded blocking; first slice should be mechanical module-boundary cleanup with no Tokio/config semantic changes.
+- [x] Iteration 35: first `wra-0a0r` module-boundary slice.
+  - Extracted the composed-fs vhost-user server/CLI boundary from `composed-fs/src/lib.rs` into new `composed-fs/src/server.rs`.
+  - Public API is preserved via root re-exports of `ServeConfig`, `run_cli`, and `serve_vhost_user_fs`.
+  - `serve_vhost_user_fs` remains a blocking vhost-user server using the existing explicit `thread_pool_size`; no Tokio dependency or config semantics changed.
+  - Focused validation passed: `cargo fmt --manifest-path composed-fs/Cargo.toml`; `cargo test --manifest-path composed-fs/Cargo.toml --offline -- --nocapture`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline exposes_vmnet_runtime_config_for_supervisor -- --nocapture`.
+- [x] Iteration 36 reflection checkpoint.
+  - Accomplished so far: `wra-f762` and `wra-avuf` are closed after live validation; production vmnet now uses the Tokio owner loop without `RuntimePoller`/`VmnetServiceWakeup`; `wra-0a0r` is in progress with the composed-fs server/CLI boundary extracted.
+  - Working well: small deletion/mechanical slices plus focused tests continue to keep behavior stable, and using `tk` notes has kept blocked Rust opt-in validation explicit.
+  - Blocking/not working: `wra-662v` still cannot close until the user can run the privileged Rust opt-in appliance rebuild/live validation, or until we explicitly narrow its scope and hand all live Rust parity to `wra-y335`.
+  - Approach adjustment: continue `wra-0a0r` with bounded-blocking, synchronous backend improvements; avoid a broad composed-fs rewrite and avoid introducing Tokio below the launch/service boundary.
+  - Next priorities: make the vhost worker-pool bounds explicit/tested, then continue small module splits or lock-scope/error-handling cleanup before broader/required validation.
+- [x] Iteration 36: made composed-fs worker-pool bounds explicit in the extracted server boundary.
+  - Added `ServeConfig::validate` in `composed-fs/src/server.rs` so `thread_pool_size == 0` fails fast with `InvalidInput` before manifest parsing or vhost startup.
+  - Added tests documenting the default single bounded-blocking worker and rejecting zero workers.
+  - `serve_vhost_user_fs` still remains a blocking vhost-user server and still passes the configured positive `thread_pool_size` to `VhostUserFsBackendBuilder`.
+  - Focused validation passed: `cargo fmt --manifest-path composed-fs/Cargo.toml`; `cargo test --manifest-path composed-fs/Cargo.toml --offline serve_config -- --nocapture`; `cargo test --manifest-path composed-fs/Cargo.toml --offline --lib -- --nocapture`.
+- [x] Iteration 37: extracted composed-fs manifest schema/validation into its own module.
+  - Moved `Manifest`, mount/filter/synthetic schema types, and `validate_manifest_json_shape` from `composed-fs/src/lib.rs` into new `composed-fs/src/manifest.rs`.
+  - The root module now re-exports `validate_manifest_json_shape` and imports the schema types crate-privately for `Namespace` construction/tests.
+  - Manifest parsing/default/validation semantics are unchanged; this is a mechanical module-boundary split and preserves existing manifest tests/fuzz entry points.
+  - Focused validation passed: `cargo fmt --manifest-path composed-fs/Cargo.toml`; `cargo test --manifest-path composed-fs/Cargo.toml --offline --lib -- --nocapture`.
+- [x] Iteration 38: extracted composed-fs handle/lock table state and reduced panic/lock scope around table access.
+  - Moved `FileHandle`, `HandleTable`, `LockKey`, and `LockTable` from `composed-fs/src/lib.rs` into new crate-private `composed-fs/src/state.rs`.
+  - Added `ComposedFs` lock-access helpers so result-returning paths convert poisoned namespace/handle/lock table locks into `io::Error` instead of panicking.
+  - `forget`/`batch_forget` cannot report errors through the virtiofsd trait, so they now return early on poisoned namespace locks instead of panicking.
+  - Narrowed `release` so the handle-table write lock is dropped before optional `sync_all()` on flush, avoiding a slow host filesystem call while holding the shared handle table lock.
+  - Focused validation passed: `cargo fmt --manifest-path composed-fs/Cargo.toml`; `cargo test --manifest-path composed-fs/Cargo.toml --offline --lib -- --nocapture`.
+- [x] Iteration 39: inspected the user-rebuilt appliance for `wra-662v`.
+  - `docker/out/artifact-manifest.json` is still Python-default: `kernel_cmdline` does not include `agentvm_payload_service=rust`, and the manifest still lists `docker/guest-payload-server.py` rather than a Rust guest-service artifact.
+  - Added a `wra-662v` note documenting that this rebuild does not unblock Rust opt-in live validation; the needed command remains `sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh`.
+- [x] Iteration 39: added focused coverage for the composed-fs lock-poison cleanup.
+  - Added `poisoned_state_locks_return_io_errors_instead_of_panicking`, covering namespace, handle-table, and lock-table poison paths after the new `ComposedFs` lock-access helpers.
+  - Kept the test panic hook quiet while intentionally poisoning locks, so `--nocapture` output stays readable.
+  - Focused validation passed: `cargo fmt --manifest-path composed-fs/Cargo.toml`; `cargo test --manifest-path composed-fs/Cargo.toml --offline poisoned_state_locks -- --nocapture`; `cargo test --manifest-path composed-fs/Cargo.toml --offline --lib -- --nocapture`.
+- [x] Iteration 40: ran required/live-capable validation for `wra-0a0r`.
+  - `./vm-frontend/validate.sh required` passed after the composed-fs server/manifest/state splits, bounded worker validation, lock-poison recovery helpers, and `release` lock-scope cleanup.
+  - This exercised the required gate, including composed-fs/offline tests, fuzz target compilation, docs drift checks, `live-smoke`, and `live-setup-tools` with the current Python-default appliance.
+- [x] Iteration 40: closed `wra-0a0r`.
+  - Added a final ticket note documenting the required validation and acceptance mapping.
+  - Acceptance for the option-1 composed-fs slice is met: filesystem request execution remains synchronous/bounded-blocking; no Tokio dependency or async filesystem execution was introduced; worker-pool sizing is explicit and rejects zero; server/manifest/state module boundaries are extracted; lock poison behavior is covered by a focused test; and existing property/fuzz harness coverage is preserved.
+- [x] Iteration 41 reflection checkpoint.
+  - Accomplished so far: vmnet service I/O and owner-loop work are closed/live-validated (`wra-f762`, `wra-avuf`); composed-fs bounded-blocking backend cleanup is closed/live-validated (`wra-0a0r`); Rust guest-service implementation is substantial but live Rust opt-in appliance validation remains blocked by a Python-default manifest; `wra-yl7i` is now the active dependency-ready child.
+  - Working well: small seams with focused tests and required validation at close keep the architecture moving without shared-state rewrites. Ticket notes clearly preserve rebuild/validation blockers.
+  - Blocking/not working: `wra-662v` cannot honestly close until a Rust opt-in appliance manifest (`agentvm_payload_service=rust`) is built and live-smoked, or the implementation scope is explicitly narrowed with all Rust live parity left to `wra-y335`.
+  - Approach adjustment: proceed with `wra-yl7i` as protocol/boundary-first. Do not flip TUI launch ownership in one step; first define typed control messages, socket path, and client/server seams over the existing `LaunchSupervisor`.
+  - Next priorities: add a minimal local IPC server/client around the typed control protocol, then route status/shutdown through that seam before touching payload viewport behavior.
+- [x] Iteration 41: started `wra-yl7i` and added the first control-protocol seam.
+  - Added `vm-frontend/src/supervisor_control.rs` with a versioned JSON envelope, typed requests/responses for status snapshot, subscription, and shutdown, and `SupervisorControlSnapshot` over existing `LaunchSupervisor` state.
+  - Defined deterministic project-local control socket placement as `RuntimePaths.run_dir/agentvm-control.sock` via `control_socket_path` without changing `.sandbox/config.json` semantics.
+  - Added serde derives to existing supervisor DTOs and `LaunchSupervisor::current_shutdown` for snapshotting.
+  - Added focused protocol/socket-path/snapshot tests and a fuzz target for arbitrary supervisor-control request/response parsing.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture`; `cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message`.
+- [x] Iteration 42: added minimal bounded Unix-socket supervisor-control IPC.
+  - Added `MAX_CONTROL_MESSAGE_BYTES`, `SupervisorControlIoError`, bounded read/write helpers, `bind_control_socket`, `control_client_request`, `serve_control_listener_once`, and `handle_control_connection` to `vm-frontend/src/supervisor_control.rs`.
+  - Implemented `apply_control_request` for status snapshot and shutdown acknowledgement over the typed protocol; `SubscribeStatus` remains an explicit not-implemented error response for a later streaming slice.
+  - Malformed and oversized requests now return typed `Error` responses instead of panicking or reading unbounded input.
+  - Added focused Tokio tests for status snapshot over a real Unix socket, shutdown over a real Unix socket, malformed request handling, and oversized request handling.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture`; `cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message`.
+- [x] Iteration 43: added reusable control-client and sidecar server-loop seams without changing launch/TUI ownership.
+  - Added `SupervisorControlClient` with `status_snapshot()` and `request_shutdown()` convenience methods over the typed Unix-socket protocol, giving future TUI code a small adapter instead of raw request/response calls.
+  - Added `serve_control_listener_until_shutdown`, a sidecar-style accept loop that serves multiple local clients until the existing `LaunchSupervisor` shutdown watch fires.
+  - The server loop spawns per-connection handlers so one slow client cannot block later accepts.
+  - Added a focused test proving the client adapter reads QEMU starting status over a Unix socket, requests shutdown, and the server loop exits on the supervisor shutdown signal.
+  - Deliberately did not wire the sidecar into live launch yet: a live shutdown request should also cancel/terminate the launch path, so exposing the socket before that semantic is wired would be misleading.
+  - Focused validation passed: `cargo fmt --manifest-path vm-frontend/Cargo.toml`; `cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture`; `cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message`.
+- [ ] Next: either wire supervisor-control shutdown into the async launch wait path safely, or add status subscription/event streaming before exposing the socket in live launch/TUI behavior.
 
 ## Reflection
-- Iteration 1: the user rebuild refreshed the default appliance but did not produce a Rust opt-in appliance. Since this process cannot run privileged rebuilds non-interactively, `wra-662v` cannot honestly be closed as Rust opt-in live-validated now. Continue useful epic work, but do not switch the payload-service default or claim Rust appliance parity.
+- Iteration 43: adding the client adapter and shutdown-bound server loop was safer than immediately wiring a live sidecar. The protocol can now support TUI/client code, but live exposure needs shutdown semantics tied to QEMU/service cancellation first; otherwise a control client could observe `Ack` without affecting the VM lifecycle.
+- Iteration 42: the control API now has real local IPC and bounded arbitrary input handling, still without changing live launch/TUI ownership. The next risk is lifecycle placement: bind/remove stale control sockets carefully and keep the listener sidecar subordinate to the existing `LaunchSupervisor`, rather than creating a second owner of VM state.
+- Iteration 41: after closing the vmnet and composed-fs children, the epic is down to one blocked validation child and one active TUI/control-plane child. The right path is protocol/socket seam first, then local IPC, then TUI attachment; avoid combining supervisor ownership and TUI rendering changes in one risky slice.
+- Iteration 40: closing `wra-0a0r` after required validation is reasonable because the ticket's async-boundary goal is satisfied without over-expanding the composed-fs refactor. Further filesystem hardening tickets exist separately (`wra-bcvj`, `wra-qdte`, `wra-zlsn`, etc.), so avoid hiding those scopes inside this option-1 child. Remaining epic work is now the blocked Rust opt-in validation and the TUI/supervisor control-socket frontend.
+- Iteration 39: the appliance rebuild notification was useful, but the manifest confirms it was not the Rust opt-in build needed for `wra-662v`. Stay on `wra-0a0r` unless a Rust opt-in manifest appears. The poison test makes the previous lock-helper slice less implicit; next composed-fs work can either do one more small split or move toward required validation if acceptance is sufficiently narrowed.
+- Iteration 38: the state split and lock helpers are a modest but useful backend cleanup: shared table state is isolated, most production lock-poison panics are now recoverable errors, and `release` no longer holds the handle table lock during flush I/O. Continue carefully; remaining namespace lock-scope work is riskier and should be backed by focused tests.
+- Iteration 37: the manifest split keeps shrinking `lib.rs` without behavior changes. Continue extracting cohesive data-boundary modules before touching lock scopes; when changing lock behavior, require targeted tests because composed-fs semantics are subtle.
+- Iteration 36: composed-fs progress should stay narrow: explicit bounded worker validation is useful, but the high-value remaining work is reducing `lib.rs` and improving lock/error seams without perturbing FUSE behavior. Do not chase a full async transport rewrite.
+- Iteration 35: `wra-0a0r` is the right next child while Rust opt-in appliance validation is blocked. The first slice moved only the server boundary, which reduces `lib.rs` without touching filesystem semantics. Continue with small module splits or clearly tested lock-scope improvements; do not move filesystem request execution onto Tokio.
+- Iteration 34: the vmnet RuntimePoller replacement is now complete and live-validated. The next ticket should avoid expanding vmnet further unless a bug appears; select a remaining child based on dependency/order and keep the same deletion-first discipline.
+- Iteration 33: the deletion slice removed the real dead fallback and wakeup bridge. Keep the next slice equally deletion-focused: avoid preserving `vmnet_poller` just to host `VmnetEventSource`; move that small enum to the runtime module or another active boundary, delete the module/tests, then run required validation.
+- Iteration 32: the live vmnet path now exercises the Tokio owner loop, so the remaining `wra-avuf` work should be deletion-focused: remove the dead blocking poller fallback and any now-unused poller/wakeup imports/tests, then use required validation to decide whether the ticket can close.
+- Iteration 31: the key readiness blocker is addressed in the non-live async-owner skeleton. Before flipping, compare the event/write/accounting behavior to the blocking loop and look for missing event-log/stat/pcap behavior rather than adding new abstractions.
+- Iteration 30: the async-owner loop shape is now concrete enough to review against the blocking loop, but should remain non-live until fd readiness is safe for multiple registrations. The next adjustment should solve multi-fd waiting rather than adding more branches to the skeleton.
+- Iteration 29: fd selection now has explicit deterministic behavior. The zero-timeout readiness check avoids needlessly waiting on an unready fd when another snapshot fd is already ready, while round-robin fallback keeps idle registration selection stable. This is enough structure to begin a production async-inner skeleton.
+- Iteration 28: fd registrations are now explicit data rather than hidden in `RuntimePoller`, which is the right direction. The current wait primitive still accepts one registration at a time, so production needs a small scheduling policy over the snapshot before the poller can be removed cleanly.
+- Iteration 27: the unified owner-event helper now covers all major event classes, but only one fd readiness source per wait. Before production replacement, we either need a small snapshot/round-robin layer for listener/session fds or a minimal first production slice that handles service/timer/QEMU while leaving fd readiness in the blocking path.
+- Iteration 26: a unified owner-event seam is now the right convergence point. It reduces the risk of a parallel full loop by giving production migration one wait primitive to grow, instead of many independent harness helpers.
+- Iteration 25: service completions now have both a direct wait seam and an owner-side apply/write seam. The remaining production challenge is coordinating that direct service wait with QEMU/timer/fd readiness in one async owner loop; avoid adding a second owner path and instead migrate the existing loop branches one by one.
+- Iteration 24: direct service-completion selection is now proven for both DNS and TCP without a wakeup fd. Production can migrate away from `VmnetServiceWakeup` only once the inner loop stops blocking in `RuntimePoller`; the next slice should carve service handling out of that blocking loop rather than adding another parallel abstraction.
+- Iteration 23: removing the nested service runtime was a useful low-risk cleanup after introducing the public Tokio wrapper. The production code still has the poller/wakeup bridge, but Tokio runtime ownership is no longer split between an owner runtime and service runtime.
+- Iteration 22: the public vmnet entrypoint now has the intended sync-wrapper/async-inner shape, but the inner still deliberately delegates to the old blocking poller. This is a small safe production seam; the next value comes from removing the nested service runtime and service wakeup fd so completions flow through Tokio channels directly.
+- Iteration 21: the production migration is now ready to move from harness/prep into an async inner loop shape. The safest plan is not to rewrite core processing; instead keep the existing single-owner body and swap the wait/read/write boundary from `RuntimePoller` to Tokio incrementally.
+- Iteration 20: production migration should be staged around the byte-stream write boundary first. The core/proxy/host ingress work can remain synchronous and single-owner if only the QEMU write side gets async variants; this avoids introducing shared vmnet state or moving socket pump execution to unrelated workers.
+- Iteration 19: host-listener accept readiness now has no-poller harness coverage against a real `HostIngressListenerSet`, completing coverage for the known poller event classes. Next should be a production seam plan rather than more parallel harness shapes.
+- Iteration 18: dynamic host/upstream session readiness now has no-poller harness coverage. The main remaining event class is host-listener accept readiness; after that, production migration can be considered with less risk.
+- Iteration 17: timer wakeups now have no-poller harness coverage. Remaining uncovered `RuntimePoller` event classes are dynamic host listener/session and upstream session readiness; add those before attempting production migration.
+- Iteration 16: TCP-connect completions now have the same no-poller/no-wakeup harness coverage as DNS completions. The next uncovered poller classes are timer wakeups and dynamic socket/listener readiness; those should be handled before production migration.
+- Iteration 15: the harness now covers the first non-QEMU wake source directly via `tokio::select!`, which is the key shape needed to remove `VmnetServiceWakeup`. Next should add TCP-connect completion or timer wakeups so production migration has coverage for all current `RuntimePoller` event classes.
+- Iteration 14: the async harness now proves owner-side frame read/handle/write flow without a poller and without sharing vmnet state. This is the right path toward a Tokio owner actor; next should cover one non-QEMU wake source (service completion or smoltcp timer) in the same controlled harness style.
+- Iteration 13: starting `wra-avuf` with async frame I/O is a low-risk prerequisite for replacing `RuntimePoller`. It creates a tested Tokio byte-stream boundary without moving `VmnetCore` or production routing. Next should continue at harness/test level rather than flipping production.
+- Iteration 12: formal split is the honest path. The service-I/O migration was validated live, but the original `wra-f762` acceptance included a larger poller/actor replacement. Moving that remaining acceptance into `wra-avuf` keeps task state truthful and avoids either over-closing unimplemented work or making the completed/validated service-I/O slice uncloseable.
+- Iteration 11: required validation gives confidence in the service-I/O migration, but ticket acceptance is stricter than the slice completed so far. The right next move is not closure; it is either a careful async owner-loop seam or a formal scope split. Since more code is a liability, first look for ways to remove or adapt `RuntimePoller` mechanically rather than adding a parallel full runtime.
+- Iteration 10: deleting the old thread-worker surface confirms production service I/O is now Tokio-task based rather than parallel old/new implementations. The code still uses a synchronous `RuntimePoller` for the vmnet owner loop, but DNS/TCP service I/O has crossed the Tokio boundary with explicit wakeups and without shared vmnet state.
+- Iteration 9: the smallest viable production seam is now in place: a service-I/O Tokio runtime owned by `serve_vmnet_gateway`, with the existing poller still owning vmnet state and receiving explicit completion wakeups. This avoids a risky full async rewrite while moving DNS/TCP service I/O onto Tokio tasks. Next should delete or clearly isolate the old worker-thread surface if it is now test-only.
+- Iteration 8: the wakeup bridge is useful and tested, but it deliberately does not hide the remaining runtime-liveness issue. A Tokio task only progresses while a runtime is running; production `serve_vmnet_gateway` is currently sync, so the next production slice must choose runtime ownership rather than just swapping constructor calls.
+- Iteration 7: the production seam review found the important integration hazard: the new Tokio worker semantics are tested, but production polling still depends on fd readiness. The next slice should solve completion wakeup explicitly rather than silently polling async channels on unrelated events.
+- Iteration 6: reflection checkpoint confirms the current direction is still sound. The async runtime helpers are now tested at the same layer as the existing wakeup-fd helpers, so the remaining risk is integration with the production poller loop rather than core semantics. Before flipping production, inspect whether the old `VmnetServiceWakeup` path is still needed for any non-DNS/TCP work; if not, a small production switch plus deletion may be viable.
+- Iteration 5: the owner-side async adapter is the right middle layer between raw Tokio worker handles and `vmnet_runtime`: it proves bounded submission, completion draining, and pending-state failure behavior without changing production service routing. Next should be a vmnet-runtime-level helper/test, not a direct production flip.
+- Iteration 4: DNS and TCP connect now both have additive Tokio task seams with bounded channels and blocking work kept on the blocking pool. Because production routing is unchanged, the next risky step should be adapter-level: teach a small owner-side helper to submit/drain through async handles under tests before touching `serve_vmnet_gateway`.
+- Iteration 3: after deleting unused generic byte-I/O paths, adding the DNS Tokio seam is a good controlled step. It proves the intended shape—bounded Tokio channels plus spawn_blocking for potentially blocking DNS—without touching the live-validated poller loop. Next should mirror this for TCP connect or start a runtime adapter behind tests.
+- Iteration 2: deletion continues to be the right first step for `wra-f762`. The old service-IO abstraction no longer claims generic byte I/O that production does not use; this makes the remaining sync worker surface smaller and clearer before replacing it with Tokio channels/tasks. Next work should target one real production worker class (DNS or TCP connect) rather than reintroduce generic abstractions.
+- Iteration 1: the user rebuild refreshed the default appliance but did not produce a Rust opt-in appliance. Since this process cannot run privileged rebuilds non-interactively, `wra-662v` cannot honestly be closed as Rust opt-in live-validated now. Continuing with `wra-f762` is reasonable, but it must stay deletion/mechanical first: the first slice removed an unused byte-I/O worker thread path without changing the live vmnet runtime.

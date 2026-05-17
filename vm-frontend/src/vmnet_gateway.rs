@@ -567,7 +567,7 @@ fn parse_udp_frame(frame: &[u8]) -> Option<UdpFrame<'_>> {
     })
 }
 
-pub(crate) fn default_dns_upstream() -> Box<dyn DnsUpstream + Send> {
+pub(crate) fn default_dns_upstream() -> Box<dyn DnsUpstream + Send + Sync> {
     Box::new(UdpDnsUpstream {
         server: host_dns_server().unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53))),
         timeout: Duration::from_secs(5),

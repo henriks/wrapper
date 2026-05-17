@@ -1,10 +1,12 @@
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
 use crate::{ManagedTask, SupervisorPlan};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SupervisorTaskName {
     ComposedFs,
     ConfigFs,
@@ -25,7 +27,8 @@ impl fmt::Display for SupervisorTaskName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SupervisorTaskKind {
     BlockingComposedFs,
     BlockingConfigFs,
@@ -34,7 +37,7 @@ pub enum SupervisorTaskKind {
     ChildProcess,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorTaskSpec {
     pub name: SupervisorTaskName,
     pub kind: SupervisorTaskKind,
@@ -53,7 +56,8 @@ pub struct SupervisorTaskController {
     status_tx: watch::Sender<SupervisorTaskStatus>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
 pub enum SupervisorTaskStatus {
     Planned,
     Starting,
@@ -63,19 +67,20 @@ pub enum SupervisorTaskStatus {
     Cancelled { reason: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorTaskResult {
     pub name: SupervisorTaskName,
     pub status: SupervisorTaskStatus,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupervisorRunSummary {
     pub shutdown: SupervisorShutdown,
     pub task_results: Vec<SupervisorTaskResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "shutdown", rename_all = "kebab-case")]
 pub enum SupervisorShutdown {
     Running,
     Requested { reason: String },
@@ -198,6 +203,10 @@ impl LaunchSupervisor {
 
     pub fn subscribe_shutdown(&self) -> watch::Receiver<SupervisorShutdown> {
         self.shutdown_rx.clone()
+    }
+
+    pub fn current_shutdown(&self) -> SupervisorShutdown {
+        self.shutdown_rx.borrow().clone()
     }
 
     pub fn request_shutdown(&self, reason: impl Into<String>) {

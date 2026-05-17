@@ -5,6 +5,7 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 * when working on a ticket, add notes for any significant insights gained during implementation
 * when working on a ticket, if encountering details relevant to other tickets, document them in said other tickets
 * if encountering bugs during development, make sure to document them as a bug ticket, instead of working around their impact in an inoptimal way -- that way we can return to them
+* if a ticket you work on has raises unexpected new requirements, or things that feel like they should be addressed, create tickets with the FOLLOW-UP: prefix
 * when done with a ticket, remember to close it
 
 
@@ -13,6 +14,8 @@ This project uses a CLI ticket system for task management. Run `tk help` when yo
 Only care about compatability for the config file. Never keep things like command line argument "for compatability", or do excessively defensive coding.
 
 The `.sandbox/config.json` format is documented in `vm-frontend/config-json.md`. Whenever changing config parsing, serialization, defaults, migration behavior, or any field semantics, update that document and the relevant tests in the same change.
+
+In general, do not care about drastic changes 'breaking production' -- do not introduce intermediary steps or keep old codepaths out of concern for existing users.
 
 # More code is a liability
 

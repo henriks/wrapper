@@ -1,10 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::time::Instant;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, info_span, warn};
 
 use crate::dns_proxy::DnsUpstreamError;
@@ -26,11 +30,10 @@ use crate::vmnet_gateway::{
     UnsupportedProtocol, VmnetDeferredDnsFrame, VmnetGateway, VmnetGatewayError,
     VmnetPendingDnsQuery,
 };
-use crate::vmnet_poller::{RuntimePoller, VmnetEventSource, VmnetInterest};
 use crate::vmnet_service_io::{
-    spawn_dns_service_worker, spawn_tcp_connect_service_worker, VmnetDnsWorkerHandle,
-    VmnetServiceCompletion, VmnetServiceIoLimitError, VmnetServiceIoLimits, VmnetServiceOwner,
-    VmnetServiceToken, VmnetTcpConnectWorkerHandle,
+    spawn_dns_service_task, spawn_tcp_connect_service_task, VmnetAsyncDnsWorkerHandle,
+    VmnetAsyncTcpConnectWorkerHandle, VmnetServiceCompletion, VmnetServiceIoLimitError,
+    VmnetServiceIoLimits, VmnetServiceOwner, VmnetServiceToken,
 };
 use crate::vmnet_stream::{
     FrameRead, PcapWriter, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError,
@@ -100,6 +103,13 @@ pub struct VmnetRuntimeTick {
     pub captured_frames: usize,
     pub gateway_events: Vec<VmnetGatewayEvent>,
     pub proxy_events: Vec<TcpProxyEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum VmnetEventSource {
+    HostListener(usize),
+    HostSession(smoltcp::iface::SocketHandle),
+    UpstreamSession(smoltcp::iface::SocketHandle),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,6 +250,22 @@ where
 pub fn serve_vmnet_gateway(
     config: VmnetRuntimeConfig,
 ) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("agentvm-vmnet-runtime")
+        .build()?;
+    runtime.block_on(serve_vmnet_gateway_async(config))
+}
+
+async fn serve_vmnet_gateway_async(
+    config: VmnetRuntimeConfig,
+) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
+    serve_vmnet_gateway_async_owner(config).await
+}
+
+async fn serve_vmnet_gateway_async_owner(
+    config: VmnetRuntimeConfig,
+) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
     let span = info_span!(
         "vmnet.runtime",
         socket = %config.socket_path.display(),
@@ -251,7 +277,7 @@ pub fn serve_vmnet_gateway(
     let _span_guard = span.enter();
     info!("binding vmnet gateway socket");
     let endpoint = VmnetStreamEndpoint::bind(&config.socket_path)?;
-    let mut frame_io = endpoint.accept_one_nonblocking()?;
+    let mut frame_io = endpoint.accept_one_tokio().await?;
     info!("accepted qemu vmnet stream");
     let started = StdInstant::now();
     let gateway = VmnetGateway::new_with_dns_upstream(
@@ -271,19 +297,12 @@ pub fn serve_vmnet_gateway(
     let mut host_ingress = HostIngressBridge::new();
     let mut host_accept_queue =
         HostIngressAcceptedQueue::new(DEFAULT_HOST_INGRESS_ACCEPT_QUEUE_LIMIT);
-    let mut service_wakeup = crate::vmnet_service_io::VmnetServiceWakeup::new()?;
-    let dns_worker = spawn_dns_service_worker::<(), _>(
-        default_dns_upstream(),
-        service_wakeup.notifier()?,
-        config.service_io_limits,
-    )?;
+    let mut dns_worker =
+        spawn_dns_service_task::<(), _>(default_dns_upstream(), config.service_io_limits)?;
+    let mut tcp_connect_worker =
+        spawn_tcp_connect_service_task(connector, config.service_io_limits)?;
     let mut dns_service =
         VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(config.service_io_limits)?;
-    let tcp_connect_worker = spawn_tcp_connect_service_worker(
-        connector,
-        service_wakeup.notifier()?,
-        config.service_io_limits,
-    )?;
     let mut tcp_connect_service =
         VmnetServiceOwner::<TcpProxyPendingConnect, std::net::TcpStream>::new(
             config.service_io_limits,
@@ -296,101 +315,136 @@ pub fn serve_vmnet_gateway(
     let mut stats = VmnetRuntimeStats::default();
     let mut event_log = open_event_log(config.event_log_path.as_deref())?;
     let mut pcap = open_pcap_capture(&config)?;
-    let mut poller = RuntimePoller::new()?;
-    poller.register_fd(
-        VmnetEventSource::QemuStream,
-        frame_io.raw_fd(),
-        VmnetInterest::READABLE,
-    )?;
-    for (index, fd) in host_listeners.listener_fds().into_iter().enumerate() {
-        poller.register_fd(
-            VmnetEventSource::HostListener(index),
-            fd,
-            VmnetInterest::READABLE,
-        )?;
-    }
-    poller.register_fd(
-        VmnetEventSource::ServiceIo,
-        service_wakeup.reader_fd(),
-        VmnetInterest::READABLE,
-    )?;
+    let mut fd_cursor = 0;
 
     loop {
         let poll_timeout = core.tcp_poll_delay(smoltcp_now(started));
-        let ready_events = poller.poll(poll_timeout)?;
+        let fd_registrations =
+            snapshot_async_fd_registrations(&host_listeners, &host_ingress, &proxy);
+        let event = next_async_owner_event_with_fd_snapshot(
+            &mut frame_io,
+            &mut dns_worker,
+            &mut tcp_connect_worker,
+            poll_timeout,
+            &fd_registrations,
+            &mut fd_cursor,
+        )
+        .await?;
         let now = smoltcp_now(started);
         let mut gateway_events = Vec::new();
         let mut host_events = Vec::new();
         let mut poll_all_host_ingress = false;
-        let dispatch = RuntimeReadyDispatch::from_events(&ready_events);
+        let mut host_listener_ready = Vec::new();
+        let mut host_readable = Vec::new();
+        let mut host_writable = Vec::new();
+        let mut proxy_readable = Vec::new();
+        let mut proxy_writable = Vec::new();
+        let mut proxy_events = Vec::new();
 
-        if ready_events.is_empty() {
-            let guest_frames = core.poll_tcp(now);
-            let mut frame_stats = VmnetRuntimeStats::default();
-            let captured = write_guest_frames(
-                &mut frame_io,
-                &guest_frames,
-                &mut frame_stats,
-                pcap.as_mut(),
-            )?;
-            stats.guest_frames_written += frame_stats.guest_frames_written;
-            let _ = captured;
-            poll_all_host_ingress = true;
-        }
-
-        if dispatch.qemu_read_closed {
-            info!(
-                guest_frames_read = stats.guest_frames_read,
-                guest_frames_written = stats.guest_frames_written,
-                "qemu vmnet stream closed"
-            );
-            return Ok(stats);
-        }
-        if dispatch.qemu_readable {
-            loop {
-                match frame_io.try_read_frame()? {
-                    FrameRead::Frame(frame) => {
-                        stats.guest_frames_read += 1;
-                        poll_all_host_ingress = true;
-                        capture_frame(pcap.as_mut(), &frame)?;
-                        match handle_guest_frame_with_dns_worker(
-                            &mut core,
-                            &mut dns_service,
-                            &dns_worker,
-                            frame,
-                            now,
-                        ) {
-                            VmnetDnsServiceFrame::Immediate(result)
-                            | VmnetDnsServiceFrame::QueueFull(result) => {
-                                if let Some(event) = gateway_event_from_outcome(&result.outcome) {
-                                    gateway_events.push(event);
-                                }
-                                let mut frame_stats = VmnetRuntimeStats::default();
-                                write_guest_frames(
-                                    &mut frame_io,
-                                    &result.guest_frames,
-                                    &mut frame_stats,
-                                    pcap.as_mut(),
-                                )?;
-                                stats.guest_frames_written += frame_stats.guest_frames_written;
-                            }
-                            VmnetDnsServiceFrame::Queued { .. } => {}
+        match event {
+            VmnetAsyncOwnerEvent::QemuEof => {
+                info!(
+                    guest_frames_read = stats.guest_frames_read,
+                    guest_frames_written = stats.guest_frames_written,
+                    "qemu vmnet stream reached EOF"
+                );
+                return Ok(stats);
+            }
+            VmnetAsyncOwnerEvent::QemuFrame(frame) => {
+                stats.guest_frames_read += 1;
+                poll_all_host_ingress = true;
+                capture_frame(pcap.as_mut(), &frame)?;
+                match handle_guest_frame_with_async_dns_worker(
+                    &mut core,
+                    &mut dns_service,
+                    &dns_worker,
+                    frame,
+                    now,
+                ) {
+                    VmnetDnsServiceFrame::Immediate(result)
+                    | VmnetDnsServiceFrame::QueueFull(result) => {
+                        if let Some(event) = gateway_event_from_outcome(&result.outcome) {
+                            gateway_events.push(event);
                         }
+                        let mut frame_stats = VmnetRuntimeStats::default();
+                        let _captured = write_guest_frames_async(
+                            &mut frame_io,
+                            &result.guest_frames,
+                            &mut frame_stats,
+                            pcap.as_mut(),
+                        )
+                        .await?;
+                        stats.guest_frames_written += frame_stats.guest_frames_written;
                     }
-                    FrameRead::WouldBlock => break,
-                    FrameRead::Eof => {
-                        info!(
-                            guest_frames_read = stats.guest_frames_read,
-                            guest_frames_written = stats.guest_frames_written,
-                            "qemu vmnet stream reached EOF"
-                        );
-                        return Ok(stats);
-                    }
+                    VmnetDnsServiceFrame::Queued { .. } => {}
                 }
             }
+            VmnetAsyncOwnerEvent::Service(event) => {
+                let applied = apply_async_service_completion_event(
+                    &mut frame_io,
+                    &mut core,
+                    &mut dns_service,
+                    &mut proxy,
+                    &mut tcp_connect_service,
+                    event,
+                    now,
+                    &mut stats,
+                    pcap.as_mut(),
+                )
+                .await?;
+                let _ = applied.captured_frames;
+                gateway_events.extend(applied.gateway_events);
+                proxy_events.extend(applied.proxy_events);
+                if applied.dns_disconnected {
+                    warn!("vmnet DNS service worker disconnected");
+                }
+                if applied.tcp_disconnected {
+                    warn!("vmnet TCP connect service worker disconnected");
+                }
+            }
+            VmnetAsyncOwnerEvent::Timer => {
+                let guest_frames = core.poll_tcp(now);
+                let mut frame_stats = VmnetRuntimeStats::default();
+                let _captured = write_guest_frames_async(
+                    &mut frame_io,
+                    &guest_frames,
+                    &mut frame_stats,
+                    pcap.as_mut(),
+                )
+                .await?;
+                stats.guest_frames_written += frame_stats.guest_frames_written;
+                poll_all_host_ingress = true;
+            }
+            VmnetAsyncOwnerEvent::FdReady {
+                source,
+                readable,
+                writable,
+            } => match source {
+                VmnetEventSource::HostListener(index) => {
+                    if readable {
+                        host_listener_ready.push(index);
+                    }
+                }
+                VmnetEventSource::HostSession(handle) => {
+                    if readable {
+                        host_readable.push(handle);
+                    }
+                    if writable {
+                        host_writable.push(handle);
+                    }
+                }
+                VmnetEventSource::UpstreamSession(handle) => {
+                    if readable {
+                        proxy_readable.push(handle);
+                    }
+                    if writable {
+                        proxy_writable.push(handle);
+                    }
+                }
+            },
         }
 
-        let mut tcp_connect_events = submit_tcp_connects_to_worker(
+        let tcp_connect_events = submit_tcp_connects_to_async_worker(
             &mut core,
             &mut proxy,
             &mut tcp_connect_service,
@@ -398,33 +452,7 @@ pub fn serve_vmnet_gateway(
             now,
         );
 
-        if dispatch.service_io {
-            let _ = service_wakeup.drain()?;
-            let drain = drain_dns_worker_completions(&mut core, &mut dns_service, &dns_worker);
-            for result in drain.guest_results {
-                if let Some(event) = gateway_event_from_outcome(&result.outcome) {
-                    gateway_events.push(event);
-                }
-                let mut frame_stats = VmnetRuntimeStats::default();
-                write_guest_frames(
-                    &mut frame_io,
-                    &result.guest_frames,
-                    &mut frame_stats,
-                    pcap.as_mut(),
-                )?;
-                stats.guest_frames_written += frame_stats.guest_frames_written;
-            }
-            let drain = drain_tcp_connect_worker_completions(
-                &mut core,
-                &mut proxy,
-                &mut tcp_connect_service,
-                &tcp_connect_worker,
-                now,
-            );
-            tcp_connect_events.extend(drain.events);
-        }
-
-        for index in dispatch.host_listeners {
+        for index in host_listener_ready {
             let batch = host_listeners
                 .accept_ready_limited(index, DEFAULT_HOST_INGRESS_ACCEPTS_PER_LISTENER_PUMP);
             for accepted in batch.accepted {
@@ -452,36 +480,40 @@ pub fn serve_vmnet_gateway(
             let (guest_frames, event) =
                 open_host_ingress_session(&mut core, &mut host_ingress, accepted, now);
             let mut frame_stats = VmnetRuntimeStats::default();
-            write_guest_frames(
+            let _captured = write_guest_frames_async(
                 &mut frame_io,
                 &guest_frames,
                 &mut frame_stats,
                 pcap.as_mut(),
-            )?;
+            )
+            .await?;
             stats.guest_frames_written += frame_stats.guest_frames_written;
             host_events.push(event);
         }
 
-        let mut proxy_pump = pump_proxy_ready(
+        let mut proxy_pump = pump_proxy_ready_async(
             &mut frame_io,
             &mut core,
             &mut proxy,
             now,
-            TcpProxyReadiness::selected(dispatch.proxy_readable, dispatch.proxy_writable),
+            TcpProxyReadiness::selected(proxy_readable, proxy_writable),
             pcap.as_mut(),
-        )?;
+        )
+        .await?;
         stats.guest_frames_written += proxy_pump.guest_frames_written;
         let mut frame_stats = VmnetRuntimeStats::default();
-        write_proxy_event_guest_frames(
+        write_proxy_event_guest_frames_async(
             &mut frame_io,
             &tcp_connect_events,
             &mut frame_stats,
             pcap.as_mut(),
-        )?;
+        )
+        .await?;
         stats.guest_frames_written += frame_stats.guest_frames_written;
         proxy_pump.events.extend(tcp_connect_events);
+        proxy_pump.events.extend(proxy_events);
 
-        let host_pump = pump_host_ingress_ready(
+        let host_pump = pump_host_ingress_ready_async(
             &mut frame_io,
             &mut core,
             &mut host_ingress,
@@ -489,15 +521,13 @@ pub fn serve_vmnet_gateway(
             if poll_all_host_ingress {
                 HostIngressReadiness::all()
             } else {
-                HostIngressReadiness::selected(dispatch.host_readable, dispatch.host_writable)
+                HostIngressReadiness::selected(host_readable, host_writable)
             },
             pcap.as_mut(),
-        )?;
+        )
+        .await?;
         stats.guest_frames_written += host_pump.guest_frames_written;
         host_events.extend(host_pump.events);
-
-        sync_host_ingress_registrations(&mut poller, &host_ingress, &host_events)?;
-        sync_proxy_registrations(&mut poller, &proxy)?;
 
         write_gateway_events(&mut event_log, &gateway_events)?;
         write_proxy_events(&mut event_log, &proxy_pump.events)?;
@@ -505,57 +535,6 @@ pub fn serve_vmnet_gateway(
         stats.gateway_events.extend(gateway_events);
         stats.proxy_events.extend(proxy_pump.events);
         stats.host_ingress_events.extend(host_events);
-    }
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct RuntimeReadyDispatch {
-    qemu_readable: bool,
-    qemu_read_closed: bool,
-    host_listeners: Vec<usize>,
-    host_readable: Vec<smoltcp::iface::SocketHandle>,
-    host_writable: Vec<smoltcp::iface::SocketHandle>,
-    proxy_readable: Vec<smoltcp::iface::SocketHandle>,
-    proxy_writable: Vec<smoltcp::iface::SocketHandle>,
-    service_io: bool,
-}
-
-impl RuntimeReadyDispatch {
-    fn from_events(events: &[crate::vmnet_poller::VmnetReadyEvent]) -> Self {
-        let mut dispatch = Self::default();
-        for ready in events {
-            match ready.source {
-                VmnetEventSource::QemuStream => {
-                    dispatch.qemu_read_closed |= ready.read_closed;
-                    dispatch.qemu_readable |= ready.readable;
-                }
-                VmnetEventSource::HostListener(index) => {
-                    if ready.readable {
-                        dispatch.host_listeners.push(index);
-                    }
-                }
-                VmnetEventSource::HostSession(handle) => {
-                    if ready.readable || ready.read_closed || ready.error {
-                        dispatch.host_readable.push(handle);
-                    }
-                    if ready.writable || ready.write_closed || ready.error {
-                        dispatch.host_writable.push(handle);
-                    }
-                }
-                VmnetEventSource::UpstreamSession(handle) => {
-                    if ready.readable || ready.read_closed || ready.error {
-                        dispatch.proxy_readable.push(handle);
-                    }
-                    if ready.writable || ready.write_closed || ready.error {
-                        dispatch.proxy_writable.push(handle);
-                    }
-                }
-                VmnetEventSource::ServiceIo => {
-                    dispatch.service_io |= ready.readable || ready.read_closed || ready.error;
-                }
-            }
-        }
-        dispatch
     }
 }
 
@@ -592,19 +571,19 @@ fn handle_guest_frame_with_dns_service<C>(
 }
 
 #[allow(dead_code)]
-fn handle_guest_frame_with_dns_worker<C>(
+fn handle_guest_frame_with_async_dns_worker<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
-    worker: &VmnetDnsWorkerHandle<C>,
+    worker: &VmnetAsyncDnsWorkerHandle<C>,
     frame: Vec<u8>,
     now: Instant,
 ) -> VmnetDnsServiceFrame {
     match core.handle_guest_frame_with_deferred_dns(frame, now) {
         VmnetDeferredDnsFrame::Immediate(result) => VmnetDnsServiceFrame::Immediate(result),
-        VmnetDeferredDnsFrame::Forward(pending) => match service.submit_to(
+        VmnetDeferredDnsFrame::Forward(pending) => match service.submit_to_async_worker(
             pending,
             |pending, token| pending.service_command(token),
-            |command| worker.try_send_command(command.clone()),
+            worker,
         ) {
             Ok(token) => VmnetDnsServiceFrame::Queued { token },
             Err(error) => {
@@ -627,9 +606,7 @@ fn apply_dns_service_completion<C>(
         VmnetServiceCompletion::DnsLookup(completion) => {
             Some(core.complete_pending_dns_query(pending, completion.result))
         }
-        VmnetServiceCompletion::TcpConnect(_)
-        | VmnetServiceCompletion::ByteIo(_)
-        | VmnetServiceCompletion::Cancelled(_) => None,
+        VmnetServiceCompletion::TcpConnect(_) | VmnetServiceCompletion::Cancelled(_) => None,
     }
 }
 
@@ -641,10 +618,10 @@ struct VmnetDnsServiceDrain {
 }
 
 #[allow(dead_code)]
-fn drain_dns_worker_completions<C>(
+fn drain_async_dns_worker_completions<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
-    worker: &VmnetDnsWorkerHandle<C>,
+    worker: &mut VmnetAsyncDnsWorkerHandle<C>,
 ) -> VmnetDnsServiceDrain {
     let mut drain = VmnetDnsServiceDrain::default();
     loop {
@@ -654,8 +631,8 @@ fn drain_dns_worker_completions<C>(
                     drain.guest_results.push(result);
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return drain,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return drain,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 drain.disconnected = true;
                 drain
                     .guest_results
@@ -681,11 +658,11 @@ fn fail_pending_dns_service_queries<C>(
 }
 
 #[allow(dead_code)]
-fn submit_tcp_connects_to_worker<T>(
+fn submit_tcp_connects_to_async_worker<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
-    worker: &VmnetTcpConnectWorkerHandle<T::Connection>,
+    worker: &VmnetAsyncTcpConnectWorkerHandle<T::Connection>,
     now: Instant,
 ) -> Vec<TcpProxyEvent>
 where
@@ -697,10 +674,10 @@ where
             TcpProxyConnectPlan::Event(event) => events.push(event),
             TcpProxyConnectPlan::Pending(pending) => {
                 let handle = pending.handle;
-                match service.submit_to(
+                match service.submit_to_async_worker(
                     pending,
                     |pending, token| pending.service_command(token),
-                    |command| worker.try_send_command(command.clone()),
+                    worker,
                 ) {
                     Ok(_) => proxy.mark_connect_pending(handle),
                     Err(error) => {
@@ -755,11 +732,11 @@ struct VmnetTcpConnectServiceDrain {
 }
 
 #[allow(dead_code)]
-fn drain_tcp_connect_worker_completions<T>(
+fn drain_async_tcp_connect_worker_completions<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
-    worker: &VmnetTcpConnectWorkerHandle<T::Connection>,
+    worker: &mut VmnetAsyncTcpConnectWorkerHandle<T::Connection>,
     now: Instant,
 ) -> VmnetTcpConnectServiceDrain
 where
@@ -773,8 +750,8 @@ where
                     core, proxy, service, completion, now,
                 ));
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => return drain,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => return drain,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                 drain.disconnected = true;
                 drain
                     .events
@@ -836,37 +813,6 @@ where
     TcpProxyBridge::with_tls_mitm(connector, authority).map_err(VmnetRuntimeError::from)
 }
 
-fn sync_host_ingress_registrations(
-    poller: &mut RuntimePoller,
-    bridge: &HostIngressBridge<std::net::TcpStream>,
-    events: &[HostIngressEvent],
-) -> Result<(), VmnetRuntimeError> {
-    for event in events {
-        match event {
-            HostIngressEvent::HostClosed { handle, .. }
-            | HostIngressEvent::GuestClosed { handle, .. }
-            | HostIngressEvent::BufferLimitExceeded { handle, .. } => {
-                poller.deregister(VmnetEventSource::HostSession(*handle))?;
-            }
-            _ => {}
-        }
-    }
-    for handle in bridge.session_handles() {
-        let Some(fd) = bridge.session_raw_fd(handle) else {
-            continue;
-        };
-        let Some(interest) = bridge
-            .session_interest(handle)
-            .and_then(|interest| VmnetInterest::new(interest.readable, interest.writable))
-        else {
-            poller.deregister(VmnetEventSource::HostSession(handle))?;
-            continue;
-        };
-        poller.register_fd(VmnetEventSource::HostSession(handle), fd, interest)?;
-    }
-    Ok(())
-}
-
 fn open_host_ingress_session<C>(
     core: &mut VmnetCore<'_>,
     bridge: &mut HostIngressBridge<C>,
@@ -898,24 +844,170 @@ fn open_host_ingress_session<C>(
     }
 }
 
-fn sync_proxy_registrations(
-    poller: &mut RuntimePoller,
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmnetAsyncFdInterest {
+    readable: bool,
+    writable: bool,
+}
+
+impl VmnetAsyncFdInterest {
+    fn new(readable: bool, writable: bool) -> Option<Self> {
+        (readable || writable).then_some(Self { readable, writable })
+    }
+
+    const READABLE: Self = Self {
+        readable: true,
+        writable: false,
+    };
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmnetAsyncFdRegistration {
+    source: VmnetEventSource,
+    fd: RawFd,
+    interest: VmnetAsyncFdInterest,
+}
+
+#[allow(dead_code)]
+fn snapshot_async_fd_registrations(
+    host_listeners: &HostIngressListenerSet,
+    host_ingress: &HostIngressBridge<std::net::TcpStream>,
     proxy: &TcpProxyBridge<MappedTcpConnector>,
-) -> Result<(), VmnetRuntimeError> {
+) -> Vec<VmnetAsyncFdRegistration> {
+    let mut registrations = Vec::new();
+    registrations.extend(host_listeners.listener_fds().into_iter().enumerate().map(
+        |(index, fd)| VmnetAsyncFdRegistration {
+            source: VmnetEventSource::HostListener(index),
+            fd,
+            interest: VmnetAsyncFdInterest::READABLE,
+        },
+    ));
+    for handle in host_ingress.session_handles() {
+        let Some(fd) = host_ingress.session_raw_fd(handle) else {
+            continue;
+        };
+        let Some(interest) = host_ingress
+            .session_interest(handle)
+            .and_then(|interest| VmnetAsyncFdInterest::new(interest.readable, interest.writable))
+        else {
+            continue;
+        };
+        registrations.push(VmnetAsyncFdRegistration {
+            source: VmnetEventSource::HostSession(handle),
+            fd,
+            interest,
+        });
+    }
     for handle in proxy.session_handles() {
         let Some(fd) = proxy.session_raw_fd(handle) else {
             continue;
         };
         let Some(interest) = proxy
             .session_interest(handle)
-            .and_then(|interest| VmnetInterest::new(interest.readable, interest.writable))
+            .and_then(|interest| VmnetAsyncFdInterest::new(interest.readable, interest.writable))
         else {
-            poller.deregister(VmnetEventSource::UpstreamSession(handle))?;
             continue;
         };
-        poller.register_fd(VmnetEventSource::UpstreamSession(handle), fd, interest)?;
+        registrations.push(VmnetAsyncFdRegistration {
+            source: VmnetEventSource::UpstreamSession(handle),
+            fd,
+            interest,
+        });
     }
-    Ok(())
+    registrations
+}
+
+#[allow(dead_code)]
+fn choose_async_fd_registration(
+    registrations: &[VmnetAsyncFdRegistration],
+    cursor: &mut usize,
+) -> Option<VmnetAsyncFdRegistration> {
+    if registrations.is_empty() {
+        *cursor = 0;
+        return None;
+    }
+    let start = *cursor % registrations.len();
+    for offset in 0..registrations.len() {
+        let index = (start + offset) % registrations.len();
+        if async_fd_registration_poll_ready(registrations[index]) {
+            *cursor = (index + 1) % registrations.len();
+            return Some(registrations[index]);
+        }
+    }
+    let index = start;
+    *cursor = (index + 1) % registrations.len();
+    Some(registrations[index])
+}
+
+#[allow(dead_code)]
+fn async_fd_registration_poll_ready(registration: VmnetAsyncFdRegistration) -> bool {
+    let mut events = 0;
+    if registration.interest.readable {
+        events |= libc::POLLIN;
+    }
+    if registration.interest.writable {
+        events |= libc::POLLOUT;
+    }
+    let mut poll_fd = libc::pollfd {
+        fd: registration.fd,
+        events,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` points to one valid pollfd value for the duration of the call.
+    let result = unsafe { libc::poll(&mut poll_fd, 1, 0) };
+    result > 0 && poll_fd.revents != 0
+}
+
+#[allow(dead_code)]
+async fn wait_async_fd_registrations(
+    registrations: &[VmnetAsyncFdRegistration],
+    cursor: &mut usize,
+) -> Result<Option<(VmnetEventSource, bool, bool)>, VmnetRuntimeError> {
+    if registrations.is_empty() {
+        *cursor = 0;
+        return Ok(None);
+    }
+    let start = *cursor % registrations.len();
+    let async_fds = (0..registrations.len())
+        .map(|offset| {
+            let index = (start + offset) % registrations.len();
+            let registration = registrations[index];
+            AsyncFd::new(BorrowedRawFd {
+                fd: registration.fd,
+            })
+            .map(|async_fd| (index, registration, async_fd))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let (index, source, readable, writable) = std::future::poll_fn(|cx| {
+        for (index, registration, async_fd) in &async_fds {
+            if registration.interest.readable {
+                match async_fd.poll_read_ready(cx) {
+                    Poll::Ready(Ok(mut ready)) => {
+                        ready.clear_ready();
+                        return Poll::Ready(Ok((*index, registration.source, true, false)));
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+            if registration.interest.writable {
+                match async_fd.poll_write_ready(cx) {
+                    Poll::Ready(Ok(mut ready)) => {
+                        ready.clear_ready();
+                        return Poll::Ready(Ok((*index, registration.source, false, true)));
+                    }
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+        }
+        Poll::Pending
+    })
+    .await?;
+    *cursor = (index + 1) % registrations.len();
+    Ok(Some((source, readable, writable)))
 }
 
 pub fn pump_proxy_once<T, C>(
@@ -961,6 +1053,36 @@ where
     Ok(pump)
 }
 
+#[allow(dead_code)]
+async fn pump_proxy_ready_async<T, C>(
+    frame_io: &mut QemuFrameIo<T>,
+    core: &mut VmnetCore<'_>,
+    proxy: &mut TcpProxyBridge<C>,
+    now: Instant,
+    readiness: TcpProxyReadiness,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<VmnetProxyPump, VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+    C: TcpUpstreamConnector,
+    C::Connection: Read + Write,
+{
+    let mut pump = VmnetProxyPump::default();
+    for event in proxy.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
+        let mut stats = VmnetRuntimeStats::default();
+        write_proxy_event_guest_frames_async(
+            frame_io,
+            std::slice::from_ref(&event),
+            &mut stats,
+            pcap.as_deref_mut(),
+        )
+        .await?;
+        pump.guest_frames_written += stats.guest_frames_written;
+        pump.events.push(event);
+    }
+    Ok(pump)
+}
+
 fn write_proxy_event_guest_frames<T>(
     frame_io: &mut QemuFrameIo<T>,
     events: &[TcpProxyEvent],
@@ -980,6 +1102,33 @@ where
             for frame in guest_frames {
                 capture_frame(pcap.as_deref_mut(), frame)?;
                 frame_io.write_frame(frame)?;
+                stats.guest_frames_written += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+async fn write_proxy_event_guest_frames_async<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    events: &[TcpProxyEvent],
+    stats: &mut VmnetRuntimeStats,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<(), VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+{
+    for event in events {
+        if let TcpProxyEvent::UpstreamPayload { guest_frames, .. }
+        | TcpProxyEvent::TlsHandshakePayload { guest_frames, .. }
+        | TcpProxyEvent::ConnectFailed { guest_frames, .. }
+        | TcpProxyEvent::TlsMitmFailed { guest_frames, .. }
+        | TcpProxyEvent::BufferLimitExceeded { guest_frames, .. } = event
+        {
+            for frame in guest_frames {
+                capture_frame(pcap.as_deref_mut(), frame)?;
+                frame_io.write_frame_async(frame).await?;
                 stats.guest_frames_written += 1;
             }
         }
@@ -1035,9 +1184,58 @@ where
 {
     let mut pump = VmnetHostIngressPump::default();
     for event in bridge.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
+        write_host_ingress_event_guest_frames(
+            frame_io,
+            std::slice::from_ref(&event),
+            &mut pump,
+            pcap.as_deref_mut(),
+        )?;
+        pump.events.push(event);
+    }
+
+    Ok(pump)
+}
+
+#[allow(dead_code)]
+async fn pump_host_ingress_ready_async<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    core: &mut VmnetCore<'_>,
+    bridge: &mut HostIngressBridge<std::net::TcpStream>,
+    now: Instant,
+    readiness: HostIngressReadiness,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<VmnetHostIngressPump, VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+{
+    let mut pump = VmnetHostIngressPump::default();
+    for event in bridge.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
+        write_host_ingress_event_guest_frames_async(
+            frame_io,
+            std::slice::from_ref(&event),
+            &mut pump,
+            pcap.as_deref_mut(),
+        )
+        .await?;
+        pump.events.push(event);
+    }
+
+    Ok(pump)
+}
+
+fn write_host_ingress_event_guest_frames<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    events: &[HostIngressEvent],
+    pump: &mut VmnetHostIngressPump,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<(), VmnetRuntimeError>
+where
+    T: Read + Write,
+{
+    for event in events {
         if let HostIngressEvent::HostPayload { guest_frames, .. }
         | HostIngressEvent::HostClosed { guest_frames, .. }
-        | HostIngressEvent::BufferLimitExceeded { guest_frames, .. } = &event
+        | HostIngressEvent::BufferLimitExceeded { guest_frames, .. } = event
         {
             for frame in guest_frames {
                 capture_frame(pcap.as_deref_mut(), frame)?;
@@ -1045,10 +1243,33 @@ where
                 pump.guest_frames_written += 1;
             }
         }
-        pump.events.push(event);
     }
+    Ok(())
+}
 
-    Ok(pump)
+#[allow(dead_code)]
+async fn write_host_ingress_event_guest_frames_async<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    events: &[HostIngressEvent],
+    pump: &mut VmnetHostIngressPump,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<(), VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+{
+    for event in events {
+        if let HostIngressEvent::HostPayload { guest_frames, .. }
+        | HostIngressEvent::HostClosed { guest_frames, .. }
+        | HostIngressEvent::BufferLimitExceeded { guest_frames, .. } = event
+        {
+            for frame in guest_frames {
+                capture_frame(pcap.as_deref_mut(), frame)?;
+                frame_io.write_frame_async(frame).await?;
+                pump.guest_frames_written += 1;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn open_event_log(path: Option<&std::path::Path>) -> io::Result<Option<File>> {
@@ -1541,6 +1762,476 @@ where
     Ok(captured)
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmnetAsyncQemuFrameStep {
+    Frame(GuestFrameResult),
+    Eof,
+}
+
+#[allow(dead_code)]
+async fn handle_next_async_qemu_frame<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    core: &mut VmnetCore<'_>,
+    now: Instant,
+) -> Result<VmnetAsyncQemuFrameStep, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    match frame_io.read_frame_async().await? {
+        Some(frame) => Ok(VmnetAsyncQemuFrameStep::Frame(
+            core.handle_guest_frame(frame, now),
+        )),
+        None => Ok(VmnetAsyncQemuFrameStep::Eof),
+    }
+}
+
+#[allow(dead_code)]
+async fn write_guest_frames_async<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    frames: &[Vec<u8>],
+    stats: &mut VmnetRuntimeStats,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<usize, VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+{
+    let mut captured = 0;
+    for frame in frames {
+        capture_frame(pcap.as_deref_mut(), frame)?;
+        captured += usize::from(pcap.is_some());
+        frame_io.write_frame_async(frame).await?;
+        stats.guest_frames_written += 1;
+    }
+    Ok(captured)
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmnetAsyncQemuDnsEvent<C> {
+    QemuFrame(Vec<u8>),
+    QemuEof,
+    DnsCompletion(VmnetServiceCompletion<C>),
+    DnsDisconnected,
+}
+
+#[allow(dead_code)]
+async fn next_async_qemu_or_dns_event<T, C>(
+    frame_io: &mut QemuFrameIo<T>,
+    dns_worker: &mut VmnetAsyncDnsWorkerHandle<C>,
+) -> Result<VmnetAsyncQemuDnsEvent<C>, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    tokio::select! {
+        frame = frame_io.read_frame_async() => {
+            match frame? {
+                Some(frame) => Ok(VmnetAsyncQemuDnsEvent::QemuFrame(frame)),
+                None => Ok(VmnetAsyncQemuDnsEvent::QemuEof),
+            }
+        }
+        completion = dns_worker.recv_completion() => {
+            match completion {
+                Some(completion) => Ok(VmnetAsyncQemuDnsEvent::DnsCompletion(completion)),
+                None => Ok(VmnetAsyncQemuDnsEvent::DnsDisconnected),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmnetAsyncQemuTcpEvent<C> {
+    QemuFrame(Vec<u8>),
+    QemuEof,
+    TcpCompletion(VmnetServiceCompletion<C>),
+    TcpDisconnected,
+}
+
+#[allow(dead_code)]
+async fn next_async_qemu_or_tcp_event<T, C>(
+    frame_io: &mut QemuFrameIo<T>,
+    tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<C>,
+) -> Result<VmnetAsyncQemuTcpEvent<C>, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    tokio::select! {
+        frame = frame_io.read_frame_async() => {
+            match frame? {
+                Some(frame) => Ok(VmnetAsyncQemuTcpEvent::QemuFrame(frame)),
+                None => Ok(VmnetAsyncQemuTcpEvent::QemuEof),
+            }
+        }
+        completion = tcp_worker.recv_completion() => {
+            match completion {
+                Some(completion) => Ok(VmnetAsyncQemuTcpEvent::TcpCompletion(completion)),
+                None => Ok(VmnetAsyncQemuTcpEvent::TcpDisconnected),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmnetAsyncServiceCompletionEvent<DnsC, TcpC> {
+    DnsCompletion(VmnetServiceCompletion<DnsC>),
+    DnsDisconnected,
+    TcpCompletion(VmnetServiceCompletion<TcpC>),
+    TcpDisconnected,
+}
+
+#[allow(dead_code)]
+async fn next_async_service_completion<DnsC, TcpC>(
+    dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
+    tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<TcpC>,
+) -> VmnetAsyncServiceCompletionEvent<DnsC, TcpC> {
+    tokio::select! {
+        completion = dns_worker.recv_completion() => {
+            match completion {
+                Some(completion) => VmnetAsyncServiceCompletionEvent::DnsCompletion(completion),
+                None => VmnetAsyncServiceCompletionEvent::DnsDisconnected,
+            }
+        }
+        completion = tcp_worker.recv_completion() => {
+            match completion {
+                Some(completion) => VmnetAsyncServiceCompletionEvent::TcpCompletion(completion),
+                None => VmnetAsyncServiceCompletionEvent::TcpDisconnected,
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+enum VmnetAsyncOwnerEvent<DnsC, TcpC> {
+    QemuFrame(Vec<u8>),
+    QemuEof,
+    Service(VmnetAsyncServiceCompletionEvent<DnsC, TcpC>),
+    Timer,
+    FdReady {
+        source: VmnetEventSource,
+        readable: bool,
+        writable: bool,
+    },
+}
+
+#[allow(dead_code)]
+async fn wait_async_fd_registration(
+    registration: VmnetAsyncFdRegistration,
+) -> Result<(VmnetEventSource, bool, bool), VmnetRuntimeError> {
+    let async_fd = AsyncFd::new(BorrowedRawFd {
+        fd: registration.fd,
+    })?;
+    match (
+        registration.interest.readable,
+        registration.interest.writable,
+    ) {
+        (true, true) => {
+            tokio::select! {
+                ready = async_fd.readable() => {
+                    let mut ready = ready?;
+                    ready.clear_ready();
+                    Ok((registration.source, true, false))
+                }
+                ready = async_fd.writable() => {
+                    let mut ready = ready?;
+                    ready.clear_ready();
+                    Ok((registration.source, false, true))
+                }
+            }
+        }
+        (true, false) => {
+            let mut ready = async_fd.readable().await?;
+            ready.clear_ready();
+            Ok((registration.source, true, false))
+        }
+        (false, true) => {
+            let mut ready = async_fd.writable().await?;
+            ready.clear_ready();
+            Ok((registration.source, false, true))
+        }
+        (false, false) => unreachable!("empty fd interest is not registered"),
+    }
+}
+
+#[allow(dead_code)]
+async fn next_async_owner_event<T, DnsC, TcpC>(
+    frame_io: &mut QemuFrameIo<T>,
+    dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
+    tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<TcpC>,
+    delay: Option<Duration>,
+    fd_readiness: Option<VmnetAsyncFdRegistration>,
+) -> Result<VmnetAsyncOwnerEvent<DnsC, TcpC>, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    let read_frame = async {
+        match frame_io.read_frame_async().await? {
+            Some(frame) => Ok(VmnetAsyncOwnerEvent::QemuFrame(frame)),
+            None => Ok(VmnetAsyncOwnerEvent::QemuEof),
+        }
+    };
+    let service_completion = next_async_service_completion(dns_worker, tcp_worker);
+    match (delay, fd_readiness) {
+        (Some(delay), Some(registration)) => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
+                ready = wait_async_fd_registration(registration) => {
+                    let (source, readable, writable) = ready?;
+                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
+                }
+            }
+        }
+        (Some(delay), None) => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
+            }
+        }
+        (None, Some(registration)) => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                ready = wait_async_fd_registration(registration) => {
+                    let (source, readable, writable) = ready?;
+                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
+                }
+            }
+        }
+        (None, None) => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn next_async_owner_event_with_fd_snapshot<T, DnsC, TcpC>(
+    frame_io: &mut QemuFrameIo<T>,
+    dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
+    tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<TcpC>,
+    delay: Option<Duration>,
+    fd_registrations: &[VmnetAsyncFdRegistration],
+    fd_cursor: &mut usize,
+) -> Result<VmnetAsyncOwnerEvent<DnsC, TcpC>, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    let read_frame = async {
+        match frame_io.read_frame_async().await? {
+            Some(frame) => Ok(VmnetAsyncOwnerEvent::QemuFrame(frame)),
+            None => Ok(VmnetAsyncOwnerEvent::QemuEof),
+        }
+    };
+    let service_completion = next_async_service_completion(dns_worker, tcp_worker);
+    if fd_registrations.is_empty() {
+        return match delay {
+            Some(delay) => {
+                tokio::select! {
+                    event = read_frame => event,
+                    event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                    _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
+                }
+            }
+            None => {
+                tokio::select! {
+                    event = read_frame => event,
+                    event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                }
+            }
+        };
+    }
+    let fd_ready = wait_async_fd_registrations(fd_registrations, fd_cursor);
+    match delay {
+        Some(delay) => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
+                ready = fd_ready => {
+                    let Some((source, readable, writable)) = ready? else {
+                        return Ok(VmnetAsyncOwnerEvent::Timer);
+                    };
+                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
+                }
+            }
+        }
+        None => {
+            tokio::select! {
+                event = read_frame => event,
+                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
+                ready = fd_ready => {
+                    let Some((source, readable, writable)) = ready? else {
+                        return Ok(VmnetAsyncOwnerEvent::Timer);
+                    };
+                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
+                }
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Default)]
+struct VmnetAsyncServiceCompletionApply {
+    guest_frames_written: usize,
+    captured_frames: usize,
+    gateway_events: Vec<VmnetGatewayEvent>,
+    proxy_events: Vec<TcpProxyEvent>,
+    dns_disconnected: bool,
+    tcp_disconnected: bool,
+}
+
+#[allow(dead_code)]
+async fn apply_async_service_completion_event<T, DnsC, C>(
+    frame_io: &mut QemuFrameIo<T>,
+    core: &mut VmnetCore<'_>,
+    dns_service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, DnsC>,
+    proxy: &mut TcpProxyBridge<C>,
+    tcp_connect_service: &mut VmnetServiceOwner<TcpProxyPendingConnect, C::Connection>,
+    event: VmnetAsyncServiceCompletionEvent<DnsC, C::Connection>,
+    now: Instant,
+    stats: &mut VmnetRuntimeStats,
+    mut pcap: Option<&mut PcapWriter>,
+) -> Result<VmnetAsyncServiceCompletionApply, VmnetRuntimeError>
+where
+    T: AsyncWrite + Unpin,
+    C: TcpUpstreamConnector,
+    C::Connection: Read + Write,
+{
+    let mut applied = VmnetAsyncServiceCompletionApply::default();
+    match event {
+        VmnetAsyncServiceCompletionEvent::DnsCompletion(completion) => {
+            if let Some(result) = apply_dns_service_completion(core, dns_service, completion) {
+                if let Some(event) = gateway_event_from_outcome(&result.outcome) {
+                    applied.gateway_events.push(event);
+                }
+                let mut frame_stats = VmnetRuntimeStats::default();
+                let captured = write_guest_frames_async(
+                    frame_io,
+                    &result.guest_frames,
+                    &mut frame_stats,
+                    pcap.as_deref_mut(),
+                )
+                .await?;
+                stats.guest_frames_written += frame_stats.guest_frames_written;
+                applied.guest_frames_written += frame_stats.guest_frames_written;
+                applied.captured_frames += captured;
+            }
+        }
+        VmnetAsyncServiceCompletionEvent::DnsDisconnected => {
+            applied.dns_disconnected = true;
+        }
+        VmnetAsyncServiceCompletionEvent::TcpCompletion(completion) => {
+            let events = apply_tcp_connect_service_completion(
+                core,
+                proxy,
+                tcp_connect_service,
+                completion,
+                now,
+            );
+            let mut frame_stats = VmnetRuntimeStats::default();
+            write_proxy_event_guest_frames_async(
+                frame_io,
+                &events,
+                &mut frame_stats,
+                pcap.as_deref_mut(),
+            )
+            .await?;
+            stats.guest_frames_written += frame_stats.guest_frames_written;
+            applied.guest_frames_written += frame_stats.guest_frames_written;
+            applied.proxy_events = events;
+        }
+        VmnetAsyncServiceCompletionEvent::TcpDisconnected => {
+            applied.tcp_disconnected = true;
+        }
+    }
+    Ok(applied)
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmnetAsyncQemuTimerEvent {
+    QemuFrame(Vec<u8>),
+    QemuEof,
+    Timer,
+}
+
+#[allow(dead_code)]
+async fn next_async_qemu_or_timer_event<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    delay: Option<Duration>,
+) -> Result<VmnetAsyncQemuTimerEvent, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    let read_frame = async {
+        match frame_io.read_frame_async().await? {
+            Some(frame) => Ok(VmnetAsyncQemuTimerEvent::QemuFrame(frame)),
+            None => Ok(VmnetAsyncQemuTimerEvent::QemuEof),
+        }
+    };
+    if let Some(delay) = delay {
+        tokio::select! {
+            event = read_frame => event,
+            _ = tokio::time::sleep(delay) => Ok(VmnetAsyncQemuTimerEvent::Timer),
+        }
+    } else {
+        read_frame.await
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VmnetAsyncFdReadyEvent {
+    QemuFrame(Vec<u8>),
+    QemuEof,
+    FdReadable(VmnetEventSource),
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct BorrowedRawFd {
+    fd: RawFd,
+}
+
+impl AsRawFd for BorrowedRawFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+#[allow(dead_code)]
+async fn next_async_qemu_or_fd_readable<T>(
+    frame_io: &mut QemuFrameIo<T>,
+    source: VmnetEventSource,
+    fd: RawFd,
+) -> Result<VmnetAsyncFdReadyEvent, VmnetRuntimeError>
+where
+    T: AsyncRead + Unpin,
+{
+    let async_fd = AsyncFd::new(BorrowedRawFd { fd })?;
+    tokio::select! {
+        frame = frame_io.read_frame_async() => {
+            match frame? {
+                Some(frame) => Ok(VmnetAsyncFdReadyEvent::QemuFrame(frame)),
+                None => Ok(VmnetAsyncFdReadyEvent::QemuEof),
+            }
+        }
+        ready = async_fd.readable() => {
+            let mut ready = ready?;
+            ready.clear_ready();
+            Ok(VmnetAsyncFdReadyEvent::FdReadable(source))
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum VmnetRuntimeError {
     Io(io::Error),
@@ -1590,16 +2281,15 @@ mod tests {
     use super::*;
     use crate::dns_proxy::{DnsDecision, DnsLogEntry, DnsUpstream, DnsUpstreamError};
     use crate::host_ingress::{HostIngressBufferKind, HostIngressEvent};
-    use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
+    use crate::network_policy::{HostListener, HostListenerPurpose, VmnetPolicy};
     use crate::tcp_gateway::{TcpAction, TcpConnectError, TcpDecision, TcpDestination};
     use crate::tcp_proxy::{TcpProxyBridge, TcpProxyConnectPlan};
     use crate::test_support;
     use crate::tls_mitm::TlsMitmError;
     use crate::vmnet_gateway::{UdpDenial, UnsupportedProtocol, VmnetGateway};
     use crate::vmnet_service_io::{
-        spawn_dns_service_worker, spawn_tcp_connect_service_worker, VmnetDnsLookupCompletion,
-        VmnetServiceCompletion, VmnetServiceIoLimits, VmnetServiceOwner, VmnetServiceWakeup,
-        VmnetTcpConnectCompletion,
+        spawn_dns_service_task, spawn_tcp_connect_service_task, VmnetDnsLookupCompletion,
+        VmnetServiceCompletion, VmnetServiceIoLimits, VmnetServiceOwner, VmnetTcpConnectCompletion,
     };
     use crate::vmnet_stream::DEFAULT_MAX_FRAME_LEN;
     use crate::GuestNetwork;
@@ -1637,58 +2327,1076 @@ mod tests {
         assert!(result.guest_frames.is_empty());
     }
 
-    #[test]
-    fn runtime_ready_dispatch_classifies_simultaneous_sources() {
-        let handle = smoltcp::iface::SocketHandle::default();
-        let dispatch = RuntimeReadyDispatch::from_events(&[
-            ready(VmnetEventSource::QemuStream).readable(),
-            ready(VmnetEventSource::HostListener(2)).readable(),
-            ready(VmnetEventSource::HostSession(handle)).readable(),
-            ready(VmnetEventSource::UpstreamSession(handle)).writable(),
-        ]);
+    #[tokio::test]
+    async fn async_qemu_frame_harness_handles_guest_frame_and_writes_response() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let (guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut guest_io = QemuFrameIo::new(guest_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
 
-        assert!(dispatch.qemu_readable);
-        assert!(!dispatch.qemu_read_closed);
-        assert_eq!(dispatch.host_listeners, vec![2]);
-        assert_eq!(dispatch.host_readable, vec![handle]);
-        assert!(dispatch.host_writable.is_empty());
-        assert!(dispatch.proxy_readable.is_empty());
-        assert_eq!(dispatch.proxy_writable, vec![handle]);
+        guest_io
+            .write_frame_async(&test_support::tcp_syn_frame(PUBLIC_IP, 80))
+            .await
+            .expect("write guest frame");
+        let step =
+            handle_next_async_qemu_frame(&mut runtime_io, &mut core, Instant::from_millis(1))
+                .await
+                .expect("handle async guest frame");
+        let VmnetAsyncQemuFrameStep::Frame(result) = step else {
+            panic!("expected guest frame result");
+        };
+        assert!(matches!(
+            result.outcome,
+            GuestFrameOutcome::TcpAccepted { .. }
+        ));
+        assert!(!result.guest_frames.is_empty());
+
+        let mut stats = VmnetRuntimeStats::default();
+        write_guest_frames_async(&mut runtime_io, &result.guest_frames, &mut stats, None)
+            .await
+            .expect("write response frames");
+        assert_eq!(stats.guest_frames_written, result.guest_frames.len());
+        let response = tokio::time::timeout(Duration::from_secs(1), guest_io.read_frame_async())
+            .await
+            .expect("response timeout")
+            .expect("read response")
+            .expect("response frame");
+        assert!(!response.is_empty());
     }
 
-    #[test]
-    fn runtime_ready_dispatch_treats_close_and_error_as_session_readiness() {
-        let handle = smoltcp::iface::SocketHandle::default();
-        let dispatch = RuntimeReadyDispatch::from_events(&[
-            ready(VmnetEventSource::QemuStream).read_closed(),
-            ready(VmnetEventSource::HostSession(handle)).error(),
-            ready(VmnetEventSource::UpstreamSession(handle)).read_closed(),
-            ready(VmnetEventSource::UpstreamSession(handle)).write_closed(),
-        ]);
+    #[tokio::test]
+    async fn async_qemu_frame_harness_reports_clean_eof() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let (guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        drop(guest_stream);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
 
-        assert!(dispatch.qemu_read_closed);
-        assert_eq!(dispatch.host_readable, vec![handle]);
-        assert_eq!(dispatch.host_writable, vec![handle]);
-        assert_eq!(dispatch.proxy_readable, vec![handle]);
-        assert_eq!(dispatch.proxy_writable, vec![handle]);
+        let step =
+            handle_next_async_qemu_frame(&mut runtime_io, &mut core, Instant::from_millis(1))
+                .await
+                .expect("handle async eof");
+        assert!(matches!(step, VmnetAsyncQemuFrameStep::Eof));
     }
 
-    #[test]
-    fn runtime_ready_dispatch_marks_service_io_wakeup() {
-        let dispatch =
-            RuntimeReadyDispatch::from_events(&[ready(VmnetEventSource::ServiceIo).readable()]);
+    #[tokio::test]
+    async fn async_event_guest_frame_writers_use_tokio_stream() {
+        let (guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut reader = QemuFrameIo::new(guest_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut writer = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let proxy_frame = vec![0xaa, 0xbb, 0xcc];
+        let host_frame = vec![0x11, 0x22, 0x33, 0x44];
+        let mut proxy_stats = VmnetRuntimeStats::default();
+        let proxy_events = [TcpProxyEvent::UpstreamPayload {
+            handle: smoltcp::iface::SocketHandle::default(),
+            bytes: proxy_frame.len(),
+            guest_frames: vec![proxy_frame.clone()],
+        }];
 
-        assert!(dispatch.service_io);
-        assert!(dispatch.host_readable.is_empty());
-        assert!(dispatch.proxy_readable.is_empty());
-    }
+        write_proxy_event_guest_frames_async(&mut writer, &proxy_events, &mut proxy_stats, None)
+            .await
+            .expect("write proxy guest frame");
+        assert_eq!(proxy_stats.guest_frames_written, 1);
 
-    #[test]
-    fn runtime_ready_dispatch_empty_events_drive_timer_only_poll() {
+        let mut host_pump = VmnetHostIngressPump::default();
+        let host_events = [HostIngressEvent::HostPayload {
+            handle: smoltcp::iface::SocketHandle::default(),
+            guest_port: 8080,
+            bytes: host_frame.len(),
+            guest_frames: vec![host_frame.clone()],
+        }];
+        write_host_ingress_event_guest_frames_async(
+            &mut writer,
+            &host_events,
+            &mut host_pump,
+            None,
+        )
+        .await
+        .expect("write host ingress guest frame");
+        assert_eq!(host_pump.guest_frames_written, 1);
+
         assert_eq!(
-            RuntimeReadyDispatch::from_events(&[]),
-            RuntimeReadyDispatch::default()
+            reader.read_frame_async().await.expect("read proxy frame"),
+            Some(proxy_frame)
         );
+        assert_eq!(
+            reader.read_frame_async().await.expect("read host frame"),
+            Some(host_frame)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_select_harness_receives_dns_completion_without_wakeup_fd() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let mut service =
+            VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
+                .expect("service");
+        let mut worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+
+        let frame = handle_guest_frame_with_async_dns_worker(
+            &mut core,
+            &mut service,
+            &worker,
+            test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
+            Instant::from_millis(1),
+        );
+        assert!(matches!(frame, VmnetDnsServiceFrame::Queued { .. }));
+        assert_eq!(service.pending_len(), 1);
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_dns_event(&mut runtime_io, &mut worker),
+        )
+        .await
+        .expect("select timeout")
+        .expect("select event");
+        let VmnetAsyncQemuDnsEvent::DnsCompletion(completion) = event else {
+            panic!("expected DNS completion event");
+        };
+        let result = apply_dns_service_completion(&mut core, &mut service, completion)
+            .expect("apply DNS completion");
+        let GuestFrameOutcome::DnsQuery { log } = result.outcome else {
+            panic!("expected DNS query outcome");
+        };
+        assert_eq!(log.decision, DnsDecision::UpstreamFailure);
+        assert_eq!(result.guest_frames.len(), 1);
+        assert_eq!(service.pending_len(), 0);
+        worker.shutdown().await.expect("worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_select_harness_receives_qemu_frame_without_poller() {
+        let (mut guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
+        let frame = test_support::tcp_syn_frame(PUBLIC_IP, 80);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        tokio::io::AsyncWriteExt::write_all(&mut guest_stream, &encoded)
+            .await
+            .expect("write qemu frame");
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_dns_event(&mut runtime_io, &mut worker),
+        )
+        .await
+        .expect("select timeout")
+        .expect("select event");
+        let VmnetAsyncQemuDnsEvent::QemuFrame(actual) = event else {
+            panic!("expected qemu frame event");
+        };
+        assert_eq!(actual, frame);
+        worker.shutdown().await.expect("worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_select_harness_receives_tcp_completion_without_wakeup_fd() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        establish_tcp_session(&mut gateway, 80);
+        let active = gateway
+            .active_tcp_sessions()
+            .into_iter()
+            .find(|active| active.session.state == tcp::State::Established)
+            .expect("active tcp session");
+        let mut core = VmnetCore::new(gateway);
+        let mut proxy = TcpProxyBridge::new(PanicTcpConnector);
+        let mut service = VmnetServiceOwner::<TcpProxyPendingConnect, MemoryConnection>::new(
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("service");
+        let mut worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+
+        let submit_events = submit_tcp_connects_to_async_worker(
+            &mut core,
+            &mut proxy,
+            &mut service,
+            &worker,
+            Instant::from_millis(1),
+        );
+        assert!(submit_events.is_empty());
+        assert!(proxy.has_pending_connect(active.handle));
+        assert_eq!(service.pending_len(), 1);
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_tcp_event(&mut runtime_io, &mut worker),
+        )
+        .await
+        .expect("select timeout")
+        .expect("select event");
+        let VmnetAsyncQemuTcpEvent::TcpCompletion(completion) = event else {
+            panic!("expected TCP completion event");
+        };
+        let events = apply_tcp_connect_service_completion(
+            &mut core,
+            &mut proxy,
+            &mut service,
+            completion,
+            Instant::from_millis(2),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::Connected { .. })));
+        assert_eq!(service.pending_len(), 0);
+        assert_eq!(proxy.session_handles(), vec![active.handle]);
+        worker.shutdown().await.expect("worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_service_completion_select_receives_dns_without_wakeup_fd() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let mut service =
+            VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
+                .expect("service");
+        let mut dns_worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        let frame = handle_guest_frame_with_async_dns_worker(
+            &mut core,
+            &mut service,
+            &dns_worker,
+            test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
+            Instant::from_millis(1),
+        );
+        assert!(matches!(frame, VmnetDnsServiceFrame::Queued { .. }));
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_service_completion(&mut dns_worker, &mut tcp_worker),
+        )
+        .await
+        .expect("service completion timeout");
+        let VmnetAsyncServiceCompletionEvent::DnsCompletion(completion) = event else {
+            panic!("expected DNS completion event");
+        };
+        let result = apply_dns_service_completion(&mut core, &mut service, completion)
+            .expect("apply DNS completion");
+        let GuestFrameOutcome::DnsQuery { log } = result.outcome else {
+            panic!("expected DNS query outcome");
+        };
+        assert_eq!(log.decision, DnsDecision::UpstreamFailure);
+        assert_eq!(service.pending_len(), 0);
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_event_select_receives_service_completion_before_timer() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let mut dns_service =
+            VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
+                .expect("dns service");
+        let mut dns_worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+
+        let frame = handle_guest_frame_with_async_dns_worker(
+            &mut core,
+            &mut dns_service,
+            &dns_worker,
+            test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
+            Instant::from_millis(1),
+        );
+        assert!(matches!(frame, VmnetDnsServiceFrame::Queued { .. }));
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_secs(30)),
+                None,
+            ),
+        )
+        .await
+        .expect("owner event timeout")
+        .expect("owner event");
+        let VmnetAsyncOwnerEvent::Service(VmnetAsyncServiceCompletionEvent::DnsCompletion(
+            completion,
+        )) = event
+        else {
+            panic!("expected DNS service completion event");
+        };
+        assert!(apply_dns_service_completion(&mut core, &mut dns_service, completion).is_some());
+        assert_eq!(dns_service.pending_len(), 0);
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_event_select_receives_timer_without_poller_or_wakeup() {
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut dns_worker = spawn_dns_service_task::<MemoryConnection, _>(
+            FailingDnsUpstream,
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_millis(1)),
+                None,
+            ),
+        )
+        .await
+        .expect("owner event timeout")
+        .expect("owner event");
+
+        assert!(matches!(event, VmnetAsyncOwnerEvent::Timer));
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[test]
+    fn async_fd_snapshot_includes_host_listeners_without_poller_registration() {
+        let listeners = HostIngressListenerSet::bind(&[
+            HostListener {
+                host_addr: "127.0.0.1".to_string(),
+                host_port: 0,
+                guest_port: 8080,
+                purpose: HostListenerPurpose::PublishedTcp,
+            },
+            HostListener {
+                host_addr: "127.0.0.1".to_string(),
+                host_port: 0,
+                guest_port: 9090,
+                purpose: HostListenerPurpose::PayloadControl,
+            },
+        ])
+        .expect("bind host listeners");
+        let host_ingress = HostIngressBridge::new();
+        let proxy = TcpProxyBridge::new(MappedTcpConnector {
+            base: StdTcpConnector {
+                timeout: Duration::from_secs(1),
+            },
+            mappings: Vec::new(),
+        });
+
+        let registrations = snapshot_async_fd_registrations(&listeners, &host_ingress, &proxy);
+
+        assert_eq!(registrations.len(), 2);
+        assert_eq!(
+            registrations
+                .iter()
+                .map(|registration| registration.source)
+                .collect::<Vec<_>>(),
+            vec![
+                VmnetEventSource::HostListener(0),
+                VmnetEventSource::HostListener(1)
+            ]
+        );
+        assert!(registrations.iter().all(|registration| {
+            registration.fd >= 0
+                && registration.interest
+                    == VmnetAsyncFdInterest {
+                        readable: true,
+                        writable: false,
+                    }
+        }));
+    }
+
+    #[test]
+    fn async_fd_registration_choice_prefers_ready_fd_from_cursor() {
+        let (_first_writer, first_reader) =
+            std::os::unix::net::UnixStream::pair().expect("first stream pair");
+        let (mut second_writer, second_reader) =
+            std::os::unix::net::UnixStream::pair().expect("second stream pair");
+        first_reader
+            .set_nonblocking(true)
+            .expect("first reader nonblocking");
+        second_reader
+            .set_nonblocking(true)
+            .expect("second reader nonblocking");
+        second_writer
+            .set_nonblocking(true)
+            .expect("second writer nonblocking");
+        std::io::Write::write_all(&mut second_writer, b"ready").expect("write readiness byte");
+        let registrations = [
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(0),
+                fd: first_reader.as_raw_fd(),
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(1),
+                fd: second_reader.as_raw_fd(),
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+        ];
+        let mut cursor = 0;
+
+        let chosen = choose_async_fd_registration(&registrations, &mut cursor)
+            .expect("chosen fd registration");
+
+        assert_eq!(chosen.source, VmnetEventSource::HostListener(1));
+        assert_eq!(cursor, 0);
+    }
+
+    #[test]
+    fn async_fd_registration_choice_round_robins_when_none_ready() {
+        let (_first_writer, first_reader) =
+            std::os::unix::net::UnixStream::pair().expect("first stream pair");
+        let (_second_writer, second_reader) =
+            std::os::unix::net::UnixStream::pair().expect("second stream pair");
+        first_reader
+            .set_nonblocking(true)
+            .expect("first reader nonblocking");
+        second_reader
+            .set_nonblocking(true)
+            .expect("second reader nonblocking");
+        let registrations = [
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(0),
+                fd: first_reader.as_raw_fd(),
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(1),
+                fd: second_reader.as_raw_fd(),
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+        ];
+        let mut cursor = 1;
+
+        let chosen = choose_async_fd_registration(&registrations, &mut cursor)
+            .expect("chosen fd registration");
+
+        assert_eq!(chosen.source, VmnetEventSource::HostListener(1));
+        assert_eq!(cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn async_owner_event_snapshot_wait_receives_later_ready_fd() {
+        let (_first_writer, first_reader) =
+            std::os::unix::net::UnixStream::pair().expect("first stream pair");
+        let (second_writer, second_reader) =
+            std::os::unix::net::UnixStream::pair().expect("second stream pair");
+        first_reader
+            .set_nonblocking(true)
+            .expect("first reader nonblocking");
+        second_reader
+            .set_nonblocking(true)
+            .expect("second reader nonblocking");
+        second_writer
+            .set_nonblocking(true)
+            .expect("second writer nonblocking");
+        let second_fd = second_reader.as_raw_fd();
+        let delayed_writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let mut writer = second_writer;
+            std::io::Write::write_all(&mut writer, b"delayed-ready")
+                .expect("write delayed readiness byte");
+        });
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut dns_worker = spawn_dns_service_task::<MemoryConnection, _>(
+            FailingDnsUpstream,
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        let registrations = [
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(0),
+                fd: first_reader.as_raw_fd(),
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+            VmnetAsyncFdRegistration {
+                source: VmnetEventSource::HostListener(1),
+                fd: second_fd,
+                interest: VmnetAsyncFdInterest::READABLE,
+            },
+        ];
+        let mut cursor = 0;
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event_with_fd_snapshot(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_secs(30)),
+                &registrations,
+                &mut cursor,
+            ),
+        )
+        .await
+        .expect("owner event timeout")
+        .expect("owner event");
+
+        assert!(matches!(
+            event,
+            VmnetAsyncOwnerEvent::FdReady {
+                source: VmnetEventSource::HostListener(1),
+                readable: true,
+                writable: false,
+            }
+        ));
+        assert_eq!(cursor, 0);
+        delayed_writer.await.expect("delayed writer task");
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_event_select_receives_host_listener_fd_readiness() {
+        let listeners = HostIngressListenerSet::bind(&[HostListener {
+            host_addr: "127.0.0.1".to_string(),
+            host_port: 0,
+            guest_port: 8080,
+            purpose: HostListenerPurpose::PublishedTcp,
+        }])
+        .expect("bind host listener");
+        let addr = listeners
+            .local_addrs()
+            .expect("listener local addr")
+            .into_iter()
+            .next()
+            .expect("listener addr");
+        let listener_fd = listeners
+            .listener_fds()
+            .into_iter()
+            .next()
+            .expect("listener fd");
+        let connect = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect to host listener")
+        });
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut dns_worker = spawn_dns_service_task::<MemoryConnection, _>(
+            FailingDnsUpstream,
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_secs(30)),
+                Some(VmnetAsyncFdRegistration {
+                    source: VmnetEventSource::HostListener(0),
+                    fd: listener_fd,
+                    interest: VmnetAsyncFdInterest::READABLE,
+                }),
+            ),
+        )
+        .await
+        .expect("owner event timeout")
+        .expect("owner event");
+
+        assert!(matches!(
+            event,
+            VmnetAsyncOwnerEvent::FdReady {
+                source: VmnetEventSource::HostListener(0),
+                readable: true,
+                writable: false,
+            }
+        ));
+        let batch = listeners.accept_ready_limited(0, 1);
+        assert_eq!(batch.accepted.len(), 1);
+        drop(batch);
+        connect.await.expect("connect task");
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_owner_event_select_receives_session_fd_readiness() {
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut dns_worker = spawn_dns_service_task::<MemoryConnection, _>(
+            FailingDnsUpstream,
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        let handle = smoltcp::iface::SocketHandle::default();
+        let (mut host_writer, host_reader) =
+            std::os::unix::net::UnixStream::pair().expect("host stream pair");
+        host_writer
+            .set_nonblocking(true)
+            .expect("host writer nonblocking");
+        host_reader
+            .set_nonblocking(true)
+            .expect("host reader nonblocking");
+        std::io::Write::write_all(&mut host_writer, b"host-ready")
+            .expect("write host readiness byte");
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_secs(30)),
+                Some(VmnetAsyncFdRegistration {
+                    source: VmnetEventSource::HostSession(handle),
+                    fd: host_reader.as_raw_fd(),
+                    interest: VmnetAsyncFdInterest::READABLE,
+                }),
+            ),
+        )
+        .await
+        .expect("host owner event timeout")
+        .expect("host owner event");
+        assert!(matches!(
+            event,
+            VmnetAsyncOwnerEvent::FdReady {
+                source: VmnetEventSource::HostSession(actual),
+                readable: true,
+                writable: false,
+            } if actual == handle
+        ));
+
+        let (mut upstream_writer, upstream_reader) =
+            std::os::unix::net::UnixStream::pair().expect("upstream stream pair");
+        upstream_writer
+            .set_nonblocking(true)
+            .expect("upstream writer nonblocking");
+        upstream_reader
+            .set_nonblocking(true)
+            .expect("upstream reader nonblocking");
+        std::io::Write::write_all(&mut upstream_writer, b"upstream-ready")
+            .expect("write upstream readiness byte");
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_owner_event(
+                &mut runtime_io,
+                &mut dns_worker,
+                &mut tcp_worker,
+                Some(Duration::from_secs(30)),
+                Some(VmnetAsyncFdRegistration {
+                    source: VmnetEventSource::UpstreamSession(handle),
+                    fd: upstream_reader.as_raw_fd(),
+                    interest: VmnetAsyncFdInterest::READABLE,
+                }),
+            ),
+        )
+        .await
+        .expect("upstream owner event timeout")
+        .expect("upstream owner event");
+        assert!(matches!(
+            event,
+            VmnetAsyncOwnerEvent::FdReady {
+                source: VmnetEventSource::UpstreamSession(actual),
+                readable: true,
+                writable: false,
+            } if actual == handle
+        ));
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_service_completion_apply_writes_dns_guest_frame_without_wakeup_fd() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+        let mut dns_service =
+            VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
+                .expect("dns service");
+        let mut dns_worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+        let mut proxy = TcpProxyBridge::new(FakeConnector {
+            response: Vec::new(),
+            block_reads: 0,
+        });
+        let mut tcp_service = VmnetServiceOwner::<TcpProxyPendingConnect, MemoryConnection>::new(
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("tcp service");
+        let (guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut reader = QemuFrameIo::new(guest_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut writer = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let mut stats = VmnetRuntimeStats::default();
+
+        let frame = handle_guest_frame_with_async_dns_worker(
+            &mut core,
+            &mut dns_service,
+            &dns_worker,
+            test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
+            Instant::from_millis(1),
+        );
+        assert!(matches!(frame, VmnetDnsServiceFrame::Queued { .. }));
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_service_completion(&mut dns_worker, &mut tcp_worker),
+        )
+        .await
+        .expect("service completion timeout");
+        let applied = apply_async_service_completion_event(
+            &mut writer,
+            &mut core,
+            &mut dns_service,
+            &mut proxy,
+            &mut tcp_service,
+            event,
+            Instant::from_millis(2),
+            &mut stats,
+            None,
+        )
+        .await
+        .expect("apply service completion");
+
+        assert_eq!(applied.guest_frames_written, 1);
+        assert_eq!(stats.guest_frames_written, 1);
+        assert_eq!(dns_service.pending_len(), 0);
+        assert!(matches!(
+            applied.gateway_events.as_slice(),
+            [VmnetGatewayEvent::DnsQuery { .. }]
+        ));
+        let response_frame = reader
+            .read_frame_async()
+            .await
+            .expect("read DNS response frame")
+            .expect("DNS response frame");
+        assert!(!response_frame.is_empty());
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_service_completion_select_receives_tcp_without_wakeup_fd() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        establish_tcp_session(&mut gateway, 80);
+        let active = gateway
+            .active_tcp_sessions()
+            .into_iter()
+            .find(|active| active.session.state == tcp::State::Established)
+            .expect("active tcp session");
+        let mut core = VmnetCore::new(gateway);
+        let mut proxy = TcpProxyBridge::new(PanicTcpConnector);
+        let mut service = VmnetServiceOwner::<TcpProxyPendingConnect, MemoryConnection>::new(
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("service");
+        let mut dns_worker = spawn_dns_service_task::<MemoryConnection, _>(
+            FailingDnsUpstream,
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async dns worker");
+        let mut tcp_worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp worker");
+
+        let submit_events = submit_tcp_connects_to_async_worker(
+            &mut core,
+            &mut proxy,
+            &mut service,
+            &tcp_worker,
+            Instant::from_millis(1),
+        );
+        assert!(submit_events.is_empty());
+        assert!(proxy.has_pending_connect(active.handle));
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_service_completion(&mut dns_worker, &mut tcp_worker),
+        )
+        .await
+        .expect("service completion timeout");
+        let VmnetAsyncServiceCompletionEvent::TcpCompletion(completion) = event else {
+            panic!("expected TCP completion event");
+        };
+        let events = apply_tcp_connect_service_completion(
+            &mut core,
+            &mut proxy,
+            &mut service,
+            completion,
+            Instant::from_millis(2),
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::Connected { .. })));
+        assert_eq!(service.pending_len(), 0);
+        assert_eq!(proxy.session_handles(), vec![active.handle]);
+        dns_worker.shutdown().await.expect("dns worker shutdown");
+        tcp_worker.shutdown().await.expect("tcp worker shutdown");
+    }
+
+    #[tokio::test]
+    async fn async_select_harness_receives_timer_without_poller() {
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_timer_event(&mut runtime_io, Some(Duration::from_millis(1))),
+        )
+        .await
+        .expect("select timeout")
+        .expect("select event");
+
+        assert_eq!(event, VmnetAsyncQemuTimerEvent::Timer);
+    }
+
+    #[tokio::test]
+    async fn async_select_harness_prefers_ready_qemu_frame_over_later_timer() {
+        let (mut guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let frame = test_support::tcp_syn_frame(PUBLIC_IP, 80);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        encoded.extend_from_slice(&frame);
+        tokio::io::AsyncWriteExt::write_all(&mut guest_stream, &encoded)
+            .await
+            .expect("write qemu frame");
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_timer_event(&mut runtime_io, Some(Duration::from_secs(30))),
+        )
+        .await
+        .expect("select timeout")
+        .expect("select event");
+
+        assert_eq!(event, VmnetAsyncQemuTimerEvent::QemuFrame(frame));
+    }
+
+    #[tokio::test]
+    async fn async_fd_harness_reports_host_listener_accept_readiness_without_poller() {
+        let listeners = HostIngressListenerSet::bind(&[HostListener {
+            host_addr: "127.0.0.1".to_string(),
+            host_port: 0,
+            guest_port: 8080,
+            purpose: HostListenerPurpose::PublishedTcp,
+        }])
+        .expect("bind host listener");
+        let addr = listeners
+            .local_addrs()
+            .expect("listener local addr")
+            .into_iter()
+            .next()
+            .expect("listener addr");
+        let listener_fd = listeners
+            .listener_fds()
+            .into_iter()
+            .next()
+            .expect("listener fd");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let connect = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect to host listener")
+        });
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_fd_readable(
+                &mut runtime_io,
+                VmnetEventSource::HostListener(0),
+                listener_fd,
+            ),
+        )
+        .await
+        .expect("listener readiness timeout")
+        .expect("listener readiness event");
+
+        assert_eq!(
+            event,
+            VmnetAsyncFdReadyEvent::FdReadable(VmnetEventSource::HostListener(0))
+        );
+        let batch = listeners.accept_ready_limited(0, 1);
+        assert_eq!(batch.accepted.len(), 1);
+        let accepted = batch
+            .accepted
+            .into_iter()
+            .next()
+            .expect("accepted")
+            .expect("accepted connection");
+        assert_eq!(accepted.guest_port, 8080);
+        assert_eq!(accepted.purpose, HostListenerPurpose::PublishedTcp);
+        drop(accepted);
+        connect.await.expect("connect task");
+    }
+
+    #[tokio::test]
+    async fn async_fd_harness_reports_host_session_readiness_without_poller() {
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        std::io::Write::write_all(&mut writer, b"host-ready").expect("write readiness byte");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let source = VmnetEventSource::HostSession(smoltcp::iface::SocketHandle::default());
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_fd_readable(&mut runtime_io, source, reader.as_raw_fd()),
+        )
+        .await
+        .expect("fd readiness timeout")
+        .expect("fd readiness event");
+
+        assert_eq!(event, VmnetAsyncFdReadyEvent::FdReadable(source));
+    }
+
+    #[tokio::test]
+    async fn async_fd_harness_reports_upstream_session_readiness_without_poller() {
+        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().expect("stream pair");
+        writer.set_nonblocking(true).expect("writer nonblocking");
+        reader.set_nonblocking(true).expect("reader nonblocking");
+        std::io::Write::write_all(&mut writer, b"upstream-ready").expect("write readiness byte");
+        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
+        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
+        let source = VmnetEventSource::UpstreamSession(smoltcp::iface::SocketHandle::default());
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_async_qemu_or_fd_readable(&mut runtime_io, source, reader.as_raw_fd()),
+        )
+        .await
+        .expect("fd readiness timeout")
+        .expect("fd readiness event");
+
+        assert_eq!(event, VmnetAsyncFdReadyEvent::FdReadable(source));
     }
 
     #[test]
@@ -1784,8 +3492,8 @@ mod tests {
         assert_eq!(service.command_len(), 1);
     }
 
-    #[test]
-    fn dns_worker_completion_drain_applies_owner_side_response() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_dns_worker_runtime_helper_applies_owner_side_response() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
@@ -1800,46 +3508,35 @@ mod tests {
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
                 .expect("service");
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                VmnetInterest::READABLE,
-            )
-            .expect("register service wakeup");
-        let worker = spawn_dns_service_worker::<(), _>(
-            FailingDnsUpstream,
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("dns worker");
+        let mut worker =
+            spawn_dns_service_task::<(), _>(FailingDnsUpstream, VmnetServiceIoLimits::new(2, 2))
+                .expect("async dns worker");
 
-        let deferred = core.handle_guest_frame_with_deferred_dns(
+        let frame = handle_guest_frame_with_async_dns_worker(
+            &mut core,
+            &mut service,
+            &worker,
             test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
             Instant::from_millis(1),
         );
-        let VmnetDeferredDnsFrame::Forward(pending) = deferred else {
-            panic!("expected deferred dns query");
+        let VmnetDnsServiceFrame::Queued { token } = frame else {
+            panic!("expected queued async DNS service work");
         };
-        let token = match service.submit_to(
-            pending,
-            |pending, token| pending.service_command(token),
-            |command| worker.try_send_command(command.clone()),
-        ) {
-            Ok(token) => token,
-            Err(_) => panic!("submit dns to worker"),
-        };
+        assert_eq!(token.get(), 1);
+        assert_eq!(service.pending_len(), 1);
 
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events
-            .iter()
-            .any(|event| { event.source == VmnetEventSource::ServiceIo && event.readable }));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let drain = drain_dns_worker_completions(&mut core, &mut service, &worker);
+        let drain = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drain =
+                    drain_async_dns_worker_completions(&mut core, &mut service, &mut worker);
+                if !drain.guest_results.is_empty() || drain.disconnected {
+                    break drain;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async DNS completion timeout");
 
         assert!(!drain.disconnected);
         assert_eq!(drain.guest_results.len(), 1);
@@ -1849,87 +3546,7 @@ mod tests {
         assert_eq!(log.decision, DnsDecision::UpstreamFailure);
         assert_eq!(drain.guest_results[0].guest_frames.len(), 1);
         assert_eq!(service.pending_len(), 0);
-        assert_eq!(token.get(), 1);
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn pending_dns_worker_query_does_not_block_unrelated_tcp_syn() {
-        use std::sync::{mpsc, Mutex};
-
-        let network = GuestNetwork::default();
-        let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
-        let gateway = VmnetGateway::new_with_dns_upstream(
-            &policy,
-            &network,
-            Instant::from_millis(0),
-            Box::new(PanicDnsUpstream),
-        )
-        .expect("gateway");
-        let mut core = VmnetCore::new(gateway);
-        let mut service =
-            VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
-                .expect("service");
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                VmnetInterest::READABLE,
-            )
-            .expect("register service wakeup");
-        let (release_tx, release_rx) = mpsc::channel();
-        let worker = spawn_dns_service_worker::<(), _>(
-            BlockingDnsUpstream {
-                release: Mutex::new(release_rx),
-            },
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("dns worker");
-
-        let dns = handle_guest_frame_with_dns_worker(
-            &mut core,
-            &mut service,
-            &worker,
-            test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
-            Instant::from_millis(1),
-        );
-        assert!(matches!(dns, VmnetDnsServiceFrame::Queued { .. }));
-        assert_eq!(service.pending_len(), 1);
-
-        let tcp = handle_guest_frame_with_dns_worker(
-            &mut core,
-            &mut service,
-            &worker,
-            test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, 80),
-            Instant::from_millis(2),
-        );
-        let VmnetDnsServiceFrame::Immediate(tcp_result) = tcp else {
-            panic!("expected immediate TCP owner progress");
-        };
-        assert!(matches!(
-            tcp_result.outcome,
-            GuestFrameOutcome::TcpAccepted { .. }
-        ));
-        assert!(!tcp_result.guest_frames.is_empty());
-        assert_eq!(service.pending_len(), 1);
-
-        release_tx.send(()).expect("release dns worker");
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events
-            .iter()
-            .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let drain = drain_dns_worker_completions(&mut core, &mut service, &worker);
-        assert_eq!(drain.guest_results.len(), 1);
-        assert_eq!(service.pending_len(), 0);
-        worker.shutdown().expect("worker shutdown");
+        worker.shutdown().await.expect("worker shutdown");
     }
 
     #[test]
@@ -2055,8 +3672,8 @@ mod tests {
         assert!(proxy.session_handles().is_empty());
     }
 
-    #[test]
-    fn tcp_connect_worker_submission_marks_pending_and_skips_sync_connect() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_tcp_connect_worker_submission_marks_pending_and_skips_sync_connect() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.allow_ips.push(PUBLIC_IP.to_string());
@@ -2073,19 +3690,17 @@ mod tests {
             VmnetServiceIoLimits::new(2, 2),
         )
         .expect("service");
-        let wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let worker = spawn_tcp_connect_service_worker(
+        let worker = spawn_tcp_connect_service_task(
             FakeConnector {
                 response: Vec::new(),
                 block_reads: 0,
             },
-            wakeup.notifier().expect("notifier"),
             VmnetServiceIoLimits::new(2, 2),
         )
         .expect("tcp connect worker");
 
         let mut core = VmnetCore::new(gateway);
-        let events = submit_tcp_connects_to_worker(
+        let events = submit_tcp_connects_to_async_worker(
             &mut core,
             &mut proxy,
             &mut service,
@@ -2099,11 +3714,11 @@ mod tests {
         assert!(proxy
             .process_gateway(core.gateway_mut(), Instant::from_millis(5))
             .is_empty());
-        worker.shutdown().expect("worker shutdown");
+        worker.shutdown().await.expect("worker shutdown");
     }
 
-    #[test]
-    fn slow_tcp_connect_worker_does_not_block_unrelated_tcp_syn() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_async_tcp_connect_worker_does_not_block_unrelated_tcp_syn() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.allow_ips.push(PUBLIC_IP.to_string());
@@ -2120,29 +3735,19 @@ mod tests {
             VmnetServiceIoLimits::new(2, 2),
         )
         .expect("service");
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                VmnetInterest::READABLE,
-            )
-            .expect("register service wakeup");
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker = spawn_tcp_connect_service_worker(
+        let mut worker = spawn_tcp_connect_service_task(
             BlockingConnector {
                 started: started_tx,
                 release: std::sync::Mutex::new(release_rx),
             },
-            wakeup.notifier().expect("notifier"),
             VmnetServiceIoLimits::new(2, 2),
         )
-        .expect("tcp connect worker");
+        .expect("async tcp connect worker");
 
         let mut core = VmnetCore::new(gateway);
-        let events = submit_tcp_connects_to_worker(
+        let events = submit_tcp_connects_to_async_worker(
             &mut core,
             &mut proxy,
             &mut service,
@@ -2152,9 +3757,19 @@ mod tests {
         assert!(events.is_empty());
         assert_eq!(service.pending_len(), 1);
         assert!(proxy.has_pending_connect(active.handle));
-        started_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("worker started blocked connect");
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                match started_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("async worker start channel disconnected")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("async worker started blocked connect");
 
         let unrelated = core.handle_guest_frame(
             tcp_frame(81, TcpControl::Syn, TcpSeqNumber(700), None, &[]),
@@ -2168,20 +3783,88 @@ mod tests {
         assert_eq!(service.pending_len(), 1);
 
         release_tx.send(()).expect("release tcp connect worker");
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events
+        let drain = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drain = drain_async_tcp_connect_worker_completions(
+                    &mut core,
+                    &mut proxy,
+                    &mut service,
+                    &mut worker,
+                    Instant::from_millis(6),
+                );
+                if !drain.events.is_empty() || drain.disconnected {
+                    break drain;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async TCP completion timeout");
+        assert!(!drain.disconnected);
+        assert!(drain
+            .events
             .iter()
-            .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let drain = drain_tcp_connect_worker_completions(
+            .any(|event| matches!(event, TcpProxyEvent::Connected { .. })));
+        assert_eq!(service.pending_len(), 0);
+        worker.shutdown().await.expect("worker shutdown");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_tcp_connect_worker_runtime_helper_applies_owner_side_success() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        establish_tcp_session(&mut gateway, 80);
+        let active = gateway
+            .active_tcp_sessions()
+            .into_iter()
+            .find(|active| active.session.state == tcp::State::Established)
+            .expect("active tcp session");
+        let mut proxy = TcpProxyBridge::new(PanicTcpConnector);
+        let mut service = VmnetServiceOwner::<TcpProxyPendingConnect, MemoryConnection>::new(
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("service");
+        let mut worker = spawn_tcp_connect_service_task(
+            FakeConnector {
+                response: Vec::new(),
+                block_reads: 0,
+            },
+            VmnetServiceIoLimits::new(2, 2),
+        )
+        .expect("async tcp connect worker");
+        let mut core = VmnetCore::new(gateway);
+
+        let events = submit_tcp_connects_to_async_worker(
             &mut core,
             &mut proxy,
             &mut service,
             &worker,
-            Instant::from_millis(6),
+            Instant::from_millis(4),
         );
+        assert!(events.is_empty());
+        assert_eq!(service.pending_len(), 1);
+        assert!(proxy.has_pending_connect(active.handle));
+
+        let drain = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let drain = drain_async_tcp_connect_worker_completions(
+                    &mut core,
+                    &mut proxy,
+                    &mut service,
+                    &mut worker,
+                    Instant::from_millis(5),
+                );
+                if !drain.events.is_empty() || drain.disconnected {
+                    break drain;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("async TCP completion timeout");
 
         assert!(!drain.disconnected);
         assert!(drain
@@ -2189,95 +3872,8 @@ mod tests {
             .iter()
             .any(|event| matches!(event, TcpProxyEvent::Connected { .. })));
         assert_eq!(service.pending_len(), 0);
-        worker.shutdown().expect("worker shutdown");
-    }
-
-    #[test]
-    fn tcp_connect_worker_completion_drain_applies_owner_side_success() {
-        let network = GuestNetwork::default();
-        let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
-        let mut gateway =
-            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
-        establish_tcp_session(&mut gateway, 80);
-        let mut proxy = TcpProxyBridge::new(FakeConnector {
-            response: Vec::new(),
-            block_reads: 0,
-        });
-        let mut service = VmnetServiceOwner::<TcpProxyPendingConnect, MemoryConnection>::new(
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("service");
-        let mut wakeup = VmnetServiceWakeup::new().expect("wakeup");
-        let mut poller = RuntimePoller::new().expect("poller");
-        poller
-            .register_fd(
-                VmnetEventSource::ServiceIo,
-                wakeup.reader_fd(),
-                VmnetInterest::READABLE,
-            )
-            .expect("register service wakeup");
-        let worker = spawn_tcp_connect_service_worker(
-            FakeConnector {
-                response: Vec::new(),
-                block_reads: 0,
-            },
-            wakeup.notifier().expect("notifier"),
-            VmnetServiceIoLimits::new(2, 2),
-        )
-        .expect("tcp connect worker");
-        let active = gateway
-            .active_tcp_sessions()
-            .into_iter()
-            .find(|active| active.session.state == tcp::State::Established)
-            .expect("active tcp session");
-        let destination = TcpDestination {
-            ip: Ipv4Addr::from(PUBLIC_IP.octets()),
-            port: 80,
-            domain: None,
-        };
-        let TcpProxyConnectPlan::Pending(pending) =
-            proxy.plan_connect(active.handle, destination.clone(), &policy)
-        else {
-            panic!("expected pending connect");
-        };
-        let token = match service.submit_to(
-            pending,
-            |pending, token| pending.service_command(token),
-            |command| worker.try_send_command(command.clone()),
-        ) {
-            Ok(token) => token,
-            Err(_) => panic!("submit pending connect to worker"),
-        };
-
-        let events = poller
-            .poll(Some(Duration::from_millis(500)))
-            .expect("poll service wakeup");
-        assert!(events
-            .iter()
-            .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
-        assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let mut core = VmnetCore::new(gateway);
-        let drain = drain_tcp_connect_worker_completions(
-            &mut core,
-            &mut proxy,
-            &mut service,
-            &worker,
-            Instant::from_millis(5),
-        );
-
-        assert!(!drain.disconnected);
-        assert!(drain.events.iter().any(|event| matches!(
-            event,
-            TcpProxyEvent::Connected {
-                destination: event_destination,
-                ..
-            } if *event_destination == destination
-        )));
-        assert_eq!(service.pending_len(), 0);
         assert_eq!(proxy.session_handles(), vec![active.handle]);
-        assert_eq!(token.get(), 1);
-        worker.shutdown().expect("worker shutdown");
+        worker.shutdown().await.expect("worker shutdown");
     }
 
     #[test]
@@ -2641,22 +4237,6 @@ mod tests {
         }
     }
 
-    #[derive(Debug)]
-    struct BlockingDnsUpstream {
-        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-    }
-
-    impl DnsUpstream for BlockingDnsUpstream {
-        fn exchange(&self, _query: &Message) -> Result<Message, DnsUpstreamError> {
-            self.release
-                .lock()
-                .expect("blocking dns mutex")
-                .recv()
-                .expect("release dns worker");
-            Err(DnsUpstreamError::Unavailable)
-        }
-    }
-
     #[derive(Debug, Clone)]
     struct FakeConnector {
         response: Vec<u8>,
@@ -2859,46 +4439,6 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
-        }
-    }
-
-    fn ready(source: VmnetEventSource) -> ReadyEventBuilder {
-        ReadyEventBuilder(crate::vmnet_poller::VmnetReadyEvent {
-            source,
-            readable: false,
-            writable: false,
-            error: false,
-            read_closed: false,
-            write_closed: false,
-        })
-    }
-
-    struct ReadyEventBuilder(crate::vmnet_poller::VmnetReadyEvent);
-
-    impl ReadyEventBuilder {
-        fn readable(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
-            self.0.readable = true;
-            self.0
-        }
-
-        fn writable(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
-            self.0.writable = true;
-            self.0
-        }
-
-        fn error(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
-            self.0.error = true;
-            self.0
-        }
-
-        fn read_closed(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
-            self.0.read_closed = true;
-            self.0
-        }
-
-        fn write_closed(mut self) -> crate::vmnet_poller::VmnetReadyEvent {
-            self.0.write_closed = true;
-            self.0
         }
     }
 
