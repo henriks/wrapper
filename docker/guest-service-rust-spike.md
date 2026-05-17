@@ -95,18 +95,22 @@ The appliance builder currently installs Python guest assets directly in
 `docker/build-appliance.sh` and records them in `source_inputs` inside
 `docker/out/artifact-manifest.json`.
 
-Adding a Rust guest binary would require all of the following before switching
+Adding a Rust guest binary requires all of the following before switching
 defaults:
 
 1. A repo-owned guest-service crate/binary with locked dependencies that compile
    under `./vm-frontend/validate.sh required`'s offline cargo mode.
 2. A build step that produces a Linux guest binary compatible with the Alpine
    appliance environment.
-3. `docker/build-appliance.sh` changes to install the binary, while retaining the
-   Python fallback until live parity is proven.
+3. `docker/build-appliance.sh` support to install the binary, while retaining the
+   Python fallback until live parity is proven. The current opt-in install hook
+   is `AGENTVM_GUEST_SERVICE_BIN=/path/to/agentvm-guest-service sudo ./docker/build-appliance.sh`.
 4. Artifact manifest/source freshness updates for the new binary and any source
-   inputs that affect it.
-5. Guest init changes to choose Python default vs Rust opt-in explicitly.
+   inputs that affect it. The opt-in install hook records the installed binary in
+   `source_inputs` so stale binaries are rejected before live boot.
+5. Guest init changes to choose Python default vs Rust opt-in explicitly. This is
+   intentionally not implemented yet; installing the binary does not make it the
+   default service.
 6. Live validation of both Docker bridge and payload protocol before any default
    switch.
 

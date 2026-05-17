@@ -12,7 +12,9 @@ readonly MANIFEST_PATH="${OUT_DIR}/artifact-manifest.json"
 readonly GUEST_INIT_PATH="${ROOTFS_DIR}/usr/local/sbin/agentvm-init"
 readonly GUEST_BRIDGE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-socket-bridge"
 readonly GUEST_PAYLOAD_SERVER_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-payload-server"
+readonly GUEST_RUST_SERVICE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-guest-service"
 readonly MINIROOTFS_TARBALL="${BUILD_DIR}/alpine-minirootfs.tar.gz"
+readonly OPTIONAL_GUEST_SERVICE_BIN="${AGENTVM_GUEST_SERVICE_BIN:-}"
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
@@ -24,7 +26,7 @@ require_root() {
 require_commands() {
   local missing=()
   local cmd
-  for cmd in chroot curl tar truncate mkfs.ext4 sha256sum; do
+  for cmd in chroot curl tar truncate mkfs.ext4 sha256sum realpath; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
       missing+=("${cmd}")
     fi
@@ -32,6 +34,20 @@ require_commands() {
   if ((${#missing[@]} > 0)); then
     printf 'error: missing required commands: %s\n' "${missing[*]}" >&2
     exit 1
+  fi
+}
+
+require_optional_guest_service_binary() {
+  if [[ -z "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN does not name a file: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
+    return 1
+  fi
+  if [[ ! -x "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN must be executable: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
+    return 1
   fi
 }
 
@@ -100,6 +116,9 @@ install_guest_assets() {
   install -m 0755 "${SCRIPT_DIR}/guest-init.sh" "${GUEST_INIT_PATH}"
   install -m 0755 "${SCRIPT_DIR}/guest-socket-bridge.py" "${GUEST_BRIDGE_PATH}"
   install -m 0755 "${SCRIPT_DIR}/guest-payload-server.py" "${GUEST_PAYLOAD_SERVER_PATH}"
+  if [[ -n "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    install -m 0755 "${OPTIONAL_GUEST_SERVICE_BIN}" "${GUEST_RUST_SERVICE_PATH}"
+  fi
   cat > "${ROOTFS_DIR}/etc/agentvm.env" <<EOF
 DOCKER_TCP_PORT=${DOCKER_TCP_PORT}
 PAYLOAD_TCP_PORT=${PAYLOAD_TCP_PORT}
@@ -200,6 +219,18 @@ source_inputs_json() {
     fi
     printf '    { "path": "docker/%s", "sha256": "%s" }' "${file}" "${hash}"
   done
+  if [[ -n "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    local optional_path
+    optional_path=$(realpath --relative-to="${SCRIPT_DIR}/.." "${OPTIONAL_GUEST_SERVICE_BIN}")
+    case "${optional_path}" in
+      ../*|/*)
+        echo "error: AGENTVM_GUEST_SERVICE_BIN must be inside the repository: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
+        exit 1
+        ;;
+    esac
+    hash=$(sha256sum "${OPTIONAL_GUEST_SERVICE_BIN}" | awk '{print $1}')
+    printf ',\n    { "path": "%s", "sha256": "%s" }' "${optional_path}" "${hash}"
+  fi
   printf '\n'
 }
 
@@ -254,6 +285,7 @@ main() {
   require_root
   require_commands
   require_version_pins
+  require_optional_guest_service_binary
   clean_dirs
   bootstrap_rootfs
   write_apk_repositories
@@ -266,4 +298,6 @@ main() {
   printf 'Built appliance artifacts in %s\n' "${OUT_DIR}"
 }
 
-main "$@"
+if [[ "${AGENTVM_BUILD_APPLIANCE_SOURCE_ONLY:-0}" != "1" ]]; then
+  main "$@"
+fi

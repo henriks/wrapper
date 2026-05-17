@@ -1,8 +1,8 @@
 ---
 id: wra-yl7i
 status: open
-deps: []
-links: [wra-bjaa]
+deps: [wra-n0fe, wra-zqci, wra-cvmy]
+links: [wra-bjaa, wra-zqci, wra-jkeg, wra-xcvq, wra-n0fe]
 created: 2026-05-16T16:12:05Z
 type: feature
 priority: 1
@@ -51,3 +51,9 @@ Related work:
 - Link to async runtime epic wra-bjaa: the control plane should be designed so vmnet/service IO can move to Tokio without changing TUI semantics.
 - Related stability tickets include payload cancellation, graceful shutdown, and TUI post-restore summaries.
 
+
+## Notes
+
+**2026-05-17T10:20:56Z**
+
+Linked into refactoring option 1 epic wra-xcvq. Dependencies added on option-1 supervisor skeleton (wra-n0fe), async launch supervision (wra-zqci), and shared payload protocol (wra-cvmy), because the TUI control-socket frontend should build on those backend boundaries rather than direct launch/payload coupling.

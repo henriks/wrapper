@@ -84,6 +84,7 @@ fuzz_check() {
 guest_services() {
   announce "offline guest service tests"
   ./docker/tests/test_guest_init.sh
+  ./docker/tests/test_build_appliance.sh
   python3 -W error::ResourceWarning -m unittest discover -s docker/tests -p '*test*.py' -v
 }
 

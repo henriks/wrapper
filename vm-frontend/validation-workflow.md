@@ -55,8 +55,8 @@ vm-frontend/validate.sh guest-services
 `docs` asserts that `AGENTS.md`, this workflow, and `vm-frontend/validate.sh`
 stay aligned on the required gate. `fuzz-check` compiles/checks the fuzz targets
 without running libFuzzer. `guest-services` runs offline `unittest` coverage for
-`docker/guest-init.sh`, `docker/guest-payload-server.py`, and
-`docker/guest-socket-bridge.py`. The Rust `guest-service` crate is covered by the
+`docker/guest-init.sh`, `docker/build-appliance.sh`,
+`docker/guest-payload-server.py`, and `docker/guest-socket-bridge.py`. The Rust `guest-service` crate is covered by the
 `fast`, `fmt`, and `required` tiers; it is not installed into the appliance by
 these offline tests.
 
