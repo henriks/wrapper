@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
@@ -8,55 +7,19 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+pub use agentvm_payload_protocol::{DiagnosticRequest, PayloadEvent, PayloadRequest};
 
-const FRAME_HEADER_LEN: usize = 5;
-const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
+use agentvm_payload_protocol::{
+    decode_header, encode_frame, payload_event_from_frame, read_frame_async, resize_payload,
+    signal_payload, write_frame_async, AsyncFrameError, Frame, FrameError, FrameKind,
+    PayloadEventError, FRAME_HEADER_LEN,
+};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::task::JoinHandle as TokioJoinHandle;
 
 #[cfg(unix)]
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct PayloadRequest {
-    pub script: String,
-    pub cwd: String,
-    pub env: BTreeMap<String, String>,
-    pub rows: u16,
-    pub cols: u16,
-}
-
-impl PayloadRequest {
-    pub fn new(script: impl Into<String>) -> Self {
-        Self {
-            script: script.into(),
-            cwd: "/".to_string(),
-            env: BTreeMap::new(),
-            rows: 24,
-            cols: 80,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DiagnosticRequest {
-    pub script: String,
-    pub cwd: String,
-    pub env: BTreeMap<String, String>,
-    pub timeout_seconds: u64,
-    pub max_output_bytes: u64,
-}
-
-impl DiagnosticRequest {
-    pub fn new(script: impl Into<String>) -> Self {
-        Self {
-            script: script.into(),
-            cwd: "/".to_string(),
-            env: BTreeMap::new(),
-            timeout_seconds: 10,
-            max_output_bytes: 1024 * 1024,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum PayloadClientError {
@@ -154,6 +117,9 @@ impl PayloadCancelToken {
     }
 
     fn register_stream(&self, stream: TcpStream) {
+        if self.is_cancelled() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
         if let Ok(mut current) = self.stream.lock() {
             *current = Some(stream);
         }
@@ -271,6 +237,257 @@ impl PayloadSessionOutcome {
     }
 }
 
+#[derive(Debug)]
+pub enum AsyncPayloadCommand {
+    Input(Vec<u8>),
+    Signal(i32),
+    Resize { rows: u16, cols: u16 },
+}
+
+#[derive(Debug, Clone)]
+pub struct AsyncPayloadCommandSender {
+    tx: mpsc::Sender<AsyncPayloadCommand>,
+}
+
+impl AsyncPayloadCommandSender {
+    pub async fn send(&self, command: AsyncPayloadCommand) -> Result<(), PayloadClientError> {
+        self.tx
+            .send(command)
+            .await
+            .map_err(|_| PayloadClientError::Cancelled)
+    }
+
+    pub async fn send_input(&self, input: impl Into<Vec<u8>>) -> Result<(), PayloadClientError> {
+        self.send(AsyncPayloadCommand::Input(input.into())).await
+    }
+
+    pub async fn send_signal(&self, signal: i32) -> Result<(), PayloadClientError> {
+        self.send(AsyncPayloadCommand::Signal(signal)).await
+    }
+
+    pub async fn send_resize(&self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        self.send(AsyncPayloadCommand::Resize { rows, cols }).await
+    }
+
+    pub fn try_send(&self, command: AsyncPayloadCommand) -> Result<(), PayloadClientError> {
+        self.tx.try_send(command).map_err(command_send_error)
+    }
+
+    pub fn try_send_input(&self, input: impl Into<Vec<u8>>) -> Result<(), PayloadClientError> {
+        self.try_send(AsyncPayloadCommand::Input(input.into()))
+    }
+
+    pub fn try_send_signal(&self, signal: i32) -> Result<(), PayloadClientError> {
+        self.try_send(AsyncPayloadCommand::Signal(signal))
+    }
+
+    pub fn try_send_resize(&self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        self.try_send(AsyncPayloadCommand::Resize { rows, cols })
+    }
+
+    pub fn blocking_send(&self, command: AsyncPayloadCommand) -> Result<(), PayloadClientError> {
+        self.tx
+            .blocking_send(command)
+            .map_err(|_| PayloadClientError::Cancelled)
+    }
+
+    pub fn blocking_send_input(&self, input: impl Into<Vec<u8>>) -> Result<(), PayloadClientError> {
+        self.blocking_send(AsyncPayloadCommand::Input(input.into()))
+    }
+
+    pub fn blocking_send_signal(&self, signal: i32) -> Result<(), PayloadClientError> {
+        self.blocking_send(AsyncPayloadCommand::Signal(signal))
+    }
+
+    pub fn blocking_send_resize(&self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        self.blocking_send(AsyncPayloadCommand::Resize { rows, cols })
+    }
+}
+
+fn command_send_error(error: TrySendError<AsyncPayloadCommand>) -> PayloadClientError {
+    match error {
+        TrySendError::Full(_) => PayloadClientError::Io(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "payload command channel is full",
+        )),
+        TrySendError::Closed(_) => PayloadClientError::Cancelled,
+    }
+}
+
+pub struct AsyncPayloadSession {
+    command_tx: mpsc::Sender<AsyncPayloadCommand>,
+    event_rx: mpsc::Receiver<Result<PayloadEvent, PayloadClientError>>,
+    reader_task: TokioJoinHandle<()>,
+    writer_task: TokioJoinHandle<()>,
+}
+
+impl AsyncPayloadSession {
+    pub async fn from_stream<S>(
+        stream: S,
+        request: &PayloadRequest,
+    ) -> Result<Self, PayloadClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::from_stream_with_capacity(stream, request, 32, 32).await
+    }
+
+    pub async fn from_stream_with_capacity<S>(
+        stream: S,
+        request: &PayloadRequest,
+        command_capacity: usize,
+        event_capacity: usize,
+    ) -> Result<Self, PayloadClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let request_json = serde_json::to_vec(request)?;
+        write_frame_async(
+            &mut writer,
+            &Frame::new(FrameKind::RUN_PRIMARY, request_json).map_err(frame_protocol_error)?,
+        )
+        .await?;
+
+        let (command_tx, mut command_rx) = mpsc::channel(command_capacity.max(1));
+        let (event_tx, event_rx) = mpsc::channel(event_capacity.max(1));
+
+        let reader_task = tokio::spawn(async move {
+            loop {
+                let event = match read_frame_async(&mut reader).await {
+                    Ok(frame) => payload_event_from_frame(frame).map_err(PayloadClientError::from),
+                    Err(error) => Err(PayloadClientError::from(error)),
+                };
+                let terminal = !matches!(event, Ok(PayloadEvent::Output(_)));
+                if event_tx.send(event).await.is_err() || terminal {
+                    break;
+                }
+            }
+        });
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                let frame = match command {
+                    AsyncPayloadCommand::Input(input) => Frame::new(FrameKind::INPUT, input),
+                    AsyncPayloadCommand::Signal(signal) => Frame::new(
+                        FrameKind::SIGNAL,
+                        signal_payload(signal)
+                            .expect("serializing signal control payload cannot fail"),
+                    ),
+                    AsyncPayloadCommand::Resize { rows, cols } => Frame::new(
+                        FrameKind::RESIZE,
+                        resize_payload(rows, cols)
+                            .expect("serializing resize control payload cannot fail"),
+                    ),
+                };
+                let Ok(frame) = frame else {
+                    break;
+                };
+                if write_frame_async(&mut writer, &frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Ok(Self {
+            command_tx,
+            event_rx,
+            reader_task,
+            writer_task,
+        })
+    }
+
+    pub fn command_sender(&self) -> AsyncPayloadCommandSender {
+        AsyncPayloadCommandSender {
+            tx: self.command_tx.clone(),
+        }
+    }
+
+    pub async fn send_input(&self, input: impl Into<Vec<u8>>) -> Result<(), PayloadClientError> {
+        self.command_sender().send_input(input).await
+    }
+
+    pub async fn send_signal(&self, signal: i32) -> Result<(), PayloadClientError> {
+        self.command_sender().send_signal(signal).await
+    }
+
+    pub async fn send_resize(&self, rows: u16, cols: u16) -> Result<(), PayloadClientError> {
+        self.command_sender().send_resize(rows, cols).await
+    }
+
+    pub async fn recv_event(&mut self) -> Result<PayloadEvent, PayloadClientError> {
+        match self.event_rx.recv().await {
+            Some(event) => event,
+            None => Err(PayloadClientError::Cancelled),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.reader_task.abort();
+        self.writer_task.abort();
+    }
+}
+
+impl Drop for AsyncPayloadSession {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+pub async fn ping_payload_async_io<S>(stream: &mut S) -> Result<(), PayloadClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    write_frame_async(
+        stream,
+        &Frame::new(FrameKind::PING, Vec::new()).map_err(frame_protocol_error)?,
+    )
+    .await?;
+    let frame = read_frame_async(stream).await?;
+    if frame.kind == FrameKind::OK && frame.payload == b"ok" {
+        return Ok(());
+    }
+    Err(PayloadClientError::Protocol(format!(
+        "unexpected ping response: frame={:?} payload={}",
+        frame.kind.as_byte(),
+        String::from_utf8_lossy(&frame.payload)
+    )))
+}
+
+pub async fn run_diagnostic_async_io<S, W>(
+    stream: &mut S,
+    request: &DiagnosticRequest,
+    output: &mut W,
+    deadline: Duration,
+) -> Result<i32, PayloadClientError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    tokio::time::timeout(deadline, async {
+        let request_json = serde_json::to_vec(request)?;
+        write_frame_async(
+            stream,
+            &Frame::new(FrameKind::RUN_DIAGNOSTIC, request_json).map_err(frame_protocol_error)?,
+        )
+        .await?;
+        loop {
+            match payload_event_from_frame(read_frame_async(stream).await?)? {
+                PayloadEvent::Output(payload) => {
+                    output.write_all(&payload).await?;
+                    output.flush().await?;
+                }
+                PayloadEvent::Exit(exit_code) => return Ok(exit_code),
+                PayloadEvent::Failure(message) => {
+                    return Err(PayloadClientError::Protocol(message))
+                }
+            }
+        }
+    })
+    .await
+    .map_err(|_| PayloadClientError::DeadlineExceeded)?
+}
+
 impl PayloadControlPolicy {
     pub fn disabled() -> Self {
         PayloadControlOptions::disabled().policy()
@@ -319,13 +536,6 @@ impl PayloadControlPolicy {
         }
         signals
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PayloadEvent {
-    Output(Vec<u8>),
-    Exit(i32),
-    Failure(String),
 }
 
 pub struct PayloadSession<S> {
@@ -551,26 +761,25 @@ fn run_diagnostic_io(
 
 fn payload_event_from_stream(stream: &mut impl Read) -> Result<PayloadEvent, PayloadClientError> {
     let (frame_type, payload) = recv_frame(stream)?;
-    match frame_type {
-        b'O' => Ok(PayloadEvent::Output(payload)),
-        b'X' => exit_code_from_payload(&payload).map(PayloadEvent::Exit),
-        b'F' => Ok(PayloadEvent::Failure(
-            String::from_utf8_lossy(&payload).to_string(),
-        )),
-        other => Err(PayloadClientError::Protocol(format!(
-            "unexpected payload frame type {other:?}"
-        ))),
-    }
+    payload_event_from_frame(Frame {
+        kind: FrameKind::from_byte(frame_type),
+        payload,
+    })
+    .map_err(PayloadClientError::from)
 }
 
 fn send_signal_frame(writer: &mut impl Write, signal: i32) -> io::Result<()> {
-    let payload = serde_json::json!({ "signal": signal }).to_string();
-    send_frame(writer, b'S', payload.as_bytes())
+    let payload = signal_payload(signal).map_err(json_io_error)?;
+    send_frame(writer, b'S', &payload)
 }
 
 fn send_resize_frame(writer: &mut impl Write, rows: u16, cols: u16) -> io::Result<()> {
-    let payload = serde_json::json!({ "rows": rows, "cols": cols }).to_string();
-    send_frame(writer, b'W', payload.as_bytes())
+    let payload = resize_payload(rows, cols).map_err(json_io_error)?;
+    send_frame(writer, b'W', &payload)
+}
+
+fn json_io_error(error: serde_json::Error) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 struct SignalForwarder {
@@ -849,45 +1058,27 @@ pub fn terminal_size() -> (u16, u16) {
     (24, 80)
 }
 
-fn exit_code_from_payload(payload: &[u8]) -> Result<i32, PayloadClientError> {
-    #[derive(Deserialize)]
-    struct ExitFrame {
-        exit_code: i32,
-    }
-
-    Ok(serde_json::from_slice::<ExitFrame>(payload)?.exit_code)
-}
-
 fn send_frame(writer: &mut impl Write, frame_type: u8, payload: &[u8]) -> io::Result<()> {
-    if payload.len() > MAX_FRAME_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "payload frame too large: {} > {}",
-                payload.len(),
-                MAX_FRAME_PAYLOAD
-            ),
-        ));
-    }
-    let len = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload frame too large"))?;
-    writer.write_all(&[frame_type])?;
-    writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(payload)
+    let encoded =
+        encode_frame(FrameKind::from_byte(frame_type), payload).map_err(frame_io_error)?;
+    writer.write_all(&encoded)
 }
 
 fn recv_frame(reader: &mut impl Read) -> Result<(u8, Vec<u8>), PayloadClientError> {
     let mut header = [0; FRAME_HEADER_LEN];
     reader.read_exact(&mut header)?;
-    let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
-    if len > MAX_FRAME_PAYLOAD {
-        return Err(PayloadClientError::Protocol(format!(
-            "payload frame too large: {len} > {MAX_FRAME_PAYLOAD}"
-        )));
-    }
+    let (kind, len) = decode_header(&header).map_err(frame_protocol_error)?;
     let mut payload = vec![0; len];
     reader.read_exact(&mut payload)?;
-    Ok((header[0], payload))
+    Ok((kind.as_byte(), payload))
+}
+
+fn frame_io_error(error: FrameError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, error)
+}
+
+fn frame_protocol_error(error: FrameError) -> PayloadClientError {
+    PayloadClientError::Protocol(error.to_string())
 }
 
 impl From<io::Error> for PayloadClientError {
@@ -899,6 +1090,27 @@ impl From<io::Error> for PayloadClientError {
 impl From<serde_json::Error> for PayloadClientError {
     fn from(error: serde_json::Error) -> Self {
         Self::Json(error)
+    }
+}
+
+impl From<AsyncFrameError> for PayloadClientError {
+    fn from(error: AsyncFrameError) -> Self {
+        match error {
+            AsyncFrameError::Io(error) => Self::Io(error),
+            AsyncFrameError::Frame(error) => Self::Protocol(error.to_string()),
+        }
+    }
+}
+
+impl From<PayloadEventError> for PayloadClientError {
+    fn from(error: PayloadEventError) -> Self {
+        match error {
+            PayloadEventError::Json(error) => Self::Json(error),
+            PayloadEventError::UnexpectedFrameKind(kind) => Self::Protocol(format!(
+                "unexpected payload frame type {:?}",
+                kind.as_byte()
+            )),
+        }
     }
 }
 
@@ -933,6 +1145,7 @@ impl std::error::Error for PayloadClientError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentvm_payload_protocol::MAX_FRAME_PAYLOAD;
     use proptest::prelude::*;
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -1188,10 +1401,13 @@ mod tests {
         let (request_seen_tx, request_seen_rx) = mpsc::channel();
         let server_thread = thread::spawn(move || {
             let (mut server, _) = listener.accept().expect("accept");
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("server read timeout");
             let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
             request_seen_tx.send(()).expect("request seen");
             let mut probe = [0_u8; 1];
-            let _ = server.read(&mut probe);
+            assert_eq!(server.read(&mut probe).expect("client closed"), 0);
         });
 
         let request = PayloadRequest::new("sleep forever");
@@ -1201,7 +1417,9 @@ mod tests {
         let runner =
             PayloadSessionRunner::with_cancel_token(PayloadControlOptions::disabled(), cancel);
         let cancel_thread = thread::spawn(move || {
-            request_seen_rx.recv().expect("request seen");
+            request_seen_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("request seen");
             cancel_for_thread.cancel();
         });
         let mut output = Vec::new();
@@ -1545,6 +1763,222 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn async_payload_session_sends_commands_and_receives_events() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut session = AsyncPayloadSession::from_stream(client, &PayloadRequest::new("async"))
+            .await
+            .expect("async session");
+
+        let request = read_frame_async(&mut server).await.expect("request frame");
+        assert_eq!(request.kind, FrameKind::RUN_PRIMARY);
+        let request_json: serde_json::Value =
+            serde_json::from_slice(&request.payload).expect("request json");
+        assert_eq!(request_json["script"], "async");
+
+        let command_sender = session.command_sender();
+        command_sender
+            .send_input(b"hello".to_vec())
+            .await
+            .expect("input");
+        command_sender.send_resize(44, 120).await.expect("resize");
+        command_sender.send_signal(2).await.expect("signal");
+
+        let input = read_frame_async(&mut server).await.expect("input frame");
+        assert_eq!(input.kind, FrameKind::INPUT);
+        assert_eq!(input.payload, b"hello");
+        let resize = read_frame_async(&mut server).await.expect("resize frame");
+        assert_eq!(resize.kind, FrameKind::RESIZE);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&resize.payload).expect("resize json"),
+            serde_json::json!({ "rows": 44, "cols": 120 })
+        );
+        let signal = read_frame_async(&mut server).await.expect("signal frame");
+        assert_eq!(signal.kind, FrameKind::SIGNAL);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&signal.payload).expect("signal json"),
+            serde_json::json!({ "signal": 2 })
+        );
+
+        write_frame_async(
+            &mut server,
+            &Frame::new(FrameKind::OUTPUT, b"ready".to_vec()).expect("output frame"),
+        )
+        .await
+        .expect("write output");
+        write_frame_async(
+            &mut server,
+            &Frame::new(FrameKind::EXIT, br#"{"exit_code":5}"#.to_vec()).expect("exit frame"),
+        )
+        .await
+        .expect("write exit");
+
+        assert_eq!(
+            session.recv_event().await.expect("output event"),
+            PayloadEvent::Output(b"ready".to_vec())
+        );
+        assert_eq!(
+            session.recv_event().await.expect("exit event"),
+            PayloadEvent::Exit(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_payload_session_reports_partial_frame_io_error() {
+        use tokio::io::AsyncWriteExt;
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut session = AsyncPayloadSession::from_stream(client, &PayloadRequest::new("partial"))
+            .await
+            .expect("async session");
+        let _request = read_frame_async(&mut server).await.expect("request frame");
+
+        server
+            .write_all(&[FrameKind::OUTPUT.as_byte(), 0, 0, 0, 4, b'a', b'b'])
+            .await
+            .expect("partial output frame");
+        drop(server);
+
+        let error = session.recv_event().await.expect_err("partial frame error");
+        assert!(
+            matches!(&error, PayloadClientError::Io(io_error) if io_error.kind() == io::ErrorKind::UnexpectedEof),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_payload_session_cancel_stops_event_and_command_paths() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut session = AsyncPayloadSession::from_stream(client, &PayloadRequest::new("cancel"))
+            .await
+            .expect("async session");
+        let _request = read_frame_async(&mut server).await.expect("request frame");
+
+        session.cancel();
+        assert!(matches!(
+            session.recv_event().await,
+            Err(PayloadClientError::Cancelled)
+        ));
+        assert!(matches!(
+            session.send_input(b"ignored".to_vec()).await,
+            Err(PayloadClientError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_payload_command_sender_try_send_reports_backpressure_and_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let sender = AsyncPayloadCommandSender { tx };
+
+        sender
+            .try_send_input(b"queued".to_vec())
+            .expect("first command");
+        let error = sender.try_send_signal(2).expect_err("full command channel");
+        assert!(
+            matches!(&error, PayloadClientError::Io(io_error) if io_error.kind() == io::ErrorKind::WouldBlock),
+            "{error:?}"
+        );
+        drop(rx);
+        assert!(matches!(
+            sender.try_send_resize(24, 80),
+            Err(PayloadClientError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn async_ping_uses_protocol_frames() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let client_fut = ping_payload_async_io(&mut client);
+        let server_fut = async {
+            let request = read_frame_async(&mut server).await.expect("ping frame");
+            assert_eq!(request.kind, FrameKind::PING);
+            assert!(request.payload.is_empty());
+            write_frame_async(
+                &mut server,
+                &Frame::new(FrameKind::OK, b"ok".to_vec()).expect("ok frame"),
+            )
+            .await
+            .expect("write ping response");
+        };
+
+        let (client_result, ()) = tokio::join!(client_fut, server_fut);
+        client_result.expect("ping ok");
+    }
+
+    #[tokio::test]
+    async fn async_diagnostic_streams_output_and_enforces_deadline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (mut output_writer, mut output_reader) = tokio::io::duplex(4096);
+        let mut request = DiagnosticRequest::new("diag");
+        request.timeout_seconds = 1;
+        request.max_output_bytes = 64;
+
+        let client_fut = run_diagnostic_async_io(
+            &mut client,
+            &request,
+            &mut output_writer,
+            Duration::from_secs(1),
+        );
+        let server_fut = async {
+            let request = read_frame_async(&mut server)
+                .await
+                .expect("diagnostic frame");
+            assert_eq!(request.kind, FrameKind::RUN_DIAGNOSTIC);
+            let request_json: serde_json::Value =
+                serde_json::from_slice(&request.payload).expect("request json");
+            assert_eq!(request_json["script"], "diag");
+            write_frame_async(
+                &mut server,
+                &Frame::new(FrameKind::OUTPUT, b"hello".to_vec()).expect("output frame"),
+            )
+            .await
+            .expect("write output");
+            write_frame_async(
+                &mut server,
+                &Frame::new(FrameKind::EXIT, br#"{"exit_code":9}"#.to_vec()).expect("exit frame"),
+            )
+            .await
+            .expect("write exit");
+        };
+
+        let (client_result, ()) = tokio::join!(client_fut, server_fut);
+        assert_eq!(client_result.expect("diagnostic exit"), 9);
+        drop(output_writer);
+        let mut output = Vec::new();
+        output_reader
+            .read_to_end(&mut output)
+            .await
+            .expect("read output");
+        assert_eq!(output, b"hello");
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (mut output_writer, _output_reader) = tokio::io::duplex(4096);
+        let partial_request = DiagnosticRequest::new("partial");
+        let timeout_fut = run_diagnostic_async_io(
+            &mut client,
+            &partial_request,
+            &mut output_writer,
+            Duration::from_millis(25),
+        );
+        let partial_server_fut = async {
+            let _request = read_frame_async(&mut server)
+                .await
+                .expect("diagnostic frame");
+            server
+                .write_all(&[FrameKind::OUTPUT.as_byte(), 0, 0, 0, 4, b'a', b'b'])
+                .await
+                .expect("partial frame");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let (timeout_result, ()) = tokio::join!(timeout_fut, partial_server_fut);
+        assert!(matches!(
+            timeout_result,
+            Err(PayloadClientError::DeadlineExceeded)
+        ));
+    }
+
     #[test]
     fn signal_and_resize_frames_match_guest_protocol() {
         let mut bytes = Vec::new();
@@ -1602,7 +2036,12 @@ mod tests {
 
     #[test]
     fn exit_code_payload_is_required_json() {
-        let error = exit_code_from_payload(b"not-json").expect_err("invalid");
+        let error = payload_event_from_frame(Frame {
+            kind: FrameKind::EXIT,
+            payload: b"not-json".to_vec(),
+        })
+        .map_err(PayloadClientError::from)
+        .expect_err("invalid");
         assert!(matches!(error, PayloadClientError::Json(_)));
     }
 

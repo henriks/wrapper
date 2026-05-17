@@ -24,6 +24,8 @@ readonly ROOT_OVERLAY_STATE_DEVICE
 readonly GUEST_DOCKERD_LOG=/run/dockerd.log
 readonly GUEST_SOCKET_BRIDGE_LOG=/run/socket-bridge.log
 readonly GUEST_PAYLOAD_SERVER_LOG=/run/payload-server.log
+readonly GUEST_PAYLOAD_SERVER_PATH=/usr/local/libexec/agentvm-payload-server
+readonly GUEST_RUST_SERVICE_PATH=/usr/local/libexec/agentvm-guest-service
 readonly DOCKER_SOCK=/var/run/docker.sock
 
 log() {
@@ -292,6 +294,38 @@ wait_for_docker_ready() {
   done
 }
 
+payload_server_command() {
+  service="${1:-python}"
+  case "${service}" in
+    ""|python)
+      printf '%s\n' "python3 -u ${GUEST_PAYLOAD_SERVER_PATH}"
+      ;;
+    rust)
+      if [ ! -x "${GUEST_RUST_SERVICE_PATH}" ]; then
+        log "error: rust payload service requested but ${GUEST_RUST_SERVICE_PATH} is not executable"
+        return 1
+      fi
+      printf '%s\n' "${GUEST_RUST_SERVICE_PATH}"
+      ;;
+    *)
+      log "error: unsupported payload service '${service}'"
+      return 1
+      ;;
+  esac
+}
+
+start_payload_server() {
+  service="${1:-python}"
+  command_prefix=$(payload_server_command "${service}") || return 1
+  log "starting ${service:-python} payload server"
+  # shellcheck disable=SC2086
+  ${command_prefix} \
+    --tcp-host 0.0.0.0 \
+    --tcp-port "${PAYLOAD_TCP_PORT}" \
+    >"${GUEST_PAYLOAD_SERVER_LOG}" 2>&1 &
+  PAYLOAD_SERVER_PID=$!
+}
+
 wait_for_critical_exit() {
   while :; do
     for pid in "${DOCKERD_PID}" "${BRIDGE_PID}" "${PAYLOAD_SERVER_PID}"; do
@@ -328,6 +362,7 @@ PREFIX_LEN=$(get_cmdline_value agentvm_prefix_len || true)
 DNS_IP=$(get_cmdline_value agentvm_dns || true)
 GUEST_MAC=$(get_cmdline_value agentvm_guest_mac || true)
 HTTP_SMOKE_URL=$(get_cmdline_value agentvm_http_smoke_url || true)
+PAYLOAD_SERVICE=$(get_cmdline_value agentvm_payload_service || true)
 if [ -z "${PROJECT_PATH}" ]; then
   PROJECT_PATH=/workspace
 fi
@@ -366,6 +401,7 @@ HOST_SOCKET_BRIDGE_LOG=${HOST_RUN_DIR}/guest-socket-bridge.log
 HOST_PAYLOAD_SERVER_LOG=${HOST_RUN_DIR}/guest-payload-server.log
 readonly \
   PROJECT_PATH \
+  PAYLOAD_SERVICE \
   HOST_RUN_DIR \
   HOST_DOCKERD_LOG \
   HOST_SOCKET_BRIDGE_LOG \
@@ -437,12 +473,10 @@ python3 -u /usr/local/libexec/agentvm-socket-bridge \
   >"${GUEST_SOCKET_BRIDGE_LOG}" 2>&1 &
 BRIDGE_PID=$!
 
-log "starting payload server"
-python3 -u /usr/local/libexec/agentvm-payload-server \
-  --tcp-host 0.0.0.0 \
-  --tcp-port "${PAYLOAD_TCP_PORT}" \
-  >"${GUEST_PAYLOAD_SERVER_LOG}" 2>&1 &
-PAYLOAD_SERVER_PID=$!
+if ! start_payload_server "${PAYLOAD_SERVICE:-python}"; then
+  teardown
+  exit 1
+fi
 
 wait_for_critical_exit
 log "critical service exited"

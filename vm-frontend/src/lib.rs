@@ -18,6 +18,7 @@ pub mod launch;
 pub mod network_policy;
 pub mod payload_client;
 pub mod runtime_manifest;
+pub mod supervisor;
 pub mod tcp_gateway;
 pub mod tcp_proxy;
 pub mod tls_mitm;
@@ -170,6 +171,7 @@ impl FrontendConfig {
                 config: self.config_fs_server(),
             },
             vmnet: ManagedTask::VmnetGateway(self.vmnet_gateway_config()),
+            docker_proxy: None,
             qemu: ManagedTask::ChildProcess(ProcessSpec {
                 program: self.tools.qemu_system_x86_64.clone(),
                 args: self
@@ -363,6 +365,7 @@ pub struct SupervisorPlan {
     pub composed_fs: ManagedTask,
     pub config_fs: ManagedTask,
     pub vmnet: ManagedTask,
+    pub docker_proxy: Option<ManagedTask>,
     pub qemu: ManagedTask,
     pub state_path: PathBuf,
 }
@@ -371,6 +374,7 @@ pub struct SupervisorPlan {
 pub enum ManagedTask {
     EmbeddedComposedFs { config: ServeConfig },
     VmnetGateway(VmnetRuntimeConfig),
+    DockerProxy,
     ChildProcess(ProcessSpec),
 }
 

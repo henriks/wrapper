@@ -34,4 +34,28 @@ if AGENTVM_BUILD_APPLIANCE_SOURCE_ONLY=1 \
   fail "missing optional guest-service binary was accepted"
 fi
 
+if AGENTVM_BUILD_APPLIANCE_SOURCE_ONLY=1 \
+   AGENTVM_PAYLOAD_SERVICE=rust \
+   bash -c 'source docker/build-appliance.sh; require_optional_guest_service_binary' 2>/dev/null; then
+  fail "rust payload service without guest-service binary was accepted"
+fi
+
+cmdline=$(
+  AGENTVM_BUILD_APPLIANCE_SOURCE_ONLY=1 \
+  AGENTVM_PAYLOAD_SERVICE=rust \
+  AGENTVM_GUEST_SERVICE_BIN="${repo_optional}" \
+  bash -c 'source docker/build-appliance.sh; kernel_cmdline'
+)
+echo "${cmdline}" | grep -F 'agentvm_payload_service=rust' >/dev/null || \
+  fail "rust payload service was not added to kernel cmdline"
+
+cmdline=$(
+  AGENTVM_BUILD_APPLIANCE_SOURCE_ONLY=1 \
+  AGENTVM_GUEST_SERVICE_BIN="${repo_optional}" \
+  bash -c 'source docker/build-appliance.sh; kernel_cmdline'
+)
+if echo "${cmdline}" | grep -F 'agentvm_payload_service=' >/dev/null; then
+  fail "python default unexpectedly added payload service kernel arg"
+fi
+
 echo "test_build_appliance: ok"

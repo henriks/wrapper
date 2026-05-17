@@ -30,17 +30,18 @@ agentvm --config
 agentvm -- bash -l
 ```
 
-The Rust frontend still supports explicit low-level subcommands:
+The Rust frontend still supports explicit low-level subcommands for development
+and validation:
 
 ```text
 agentvm-frontend launch ...
 agentvm-frontend self-test ...
-agentvm-frontend wrap ...
 ```
 
-The executable name is not part of wrapper behavior. `codex-wrap` and
-`copilot-wrap` aliases are not supported entrypoints, and the selected tool must
-come from explicit flags or the interactive TUI startup flow.
+The executable name and legacy wrapper aliases are not part of wrapper behavior.
+`codex-wrap`, `copilot-wrap`, and `agentvm-frontend wrap` are not supported
+entrypoints; the selected tool must come from explicit flags or the interactive
+TUI startup flow.
 
 Arguments after `--` are the full guest payload command for that launch. They do
 not persist to `.sandbox/config.json`.

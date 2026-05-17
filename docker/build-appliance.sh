@@ -15,6 +15,7 @@ readonly GUEST_PAYLOAD_SERVER_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-payl
 readonly GUEST_RUST_SERVICE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-guest-service"
 readonly MINIROOTFS_TARBALL="${BUILD_DIR}/alpine-minirootfs.tar.gz"
 readonly OPTIONAL_GUEST_SERVICE_BIN="${AGENTVM_GUEST_SERVICE_BIN:-}"
+readonly PAYLOAD_SERVICE_IMPL="${AGENTVM_PAYLOAD_SERVICE:-python}"
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
@@ -38,6 +39,17 @@ require_commands() {
 }
 
 require_optional_guest_service_binary() {
+  case "${PAYLOAD_SERVICE_IMPL}" in
+    python|rust) ;;
+    *)
+      echo "error: AGENTVM_PAYLOAD_SERVICE must be 'python' or 'rust': ${PAYLOAD_SERVICE_IMPL}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${PAYLOAD_SERVICE_IMPL}" == "rust" && -z "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_PAYLOAD_SERVICE=rust requires AGENTVM_GUEST_SERVICE_BIN" >&2
+    return 1
+  fi
   if [[ -z "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
     return 0
   fi
@@ -234,6 +246,14 @@ source_inputs_json() {
   printf '\n'
 }
 
+kernel_cmdline() {
+  local cmdline="console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
+  if [[ "${PAYLOAD_SERVICE_IMPL}" != "python" ]]; then
+    cmdline+=" agentvm_payload_service=${PAYLOAD_SERVICE_IMPL}"
+  fi
+  printf '%s\n' "${cmdline}"
+}
+
 write_manifest() {
   cat > "${MANIFEST_PATH}" <<EOF
 {
@@ -251,7 +271,7 @@ $(source_inputs_json)  ],
     "root_disk_device": "/dev/vda",
     "state_disk_device": "/dev/vdb",
     "virtiofs_tag": "${VIRTIOFS_TAG}",
-    "kernel_cmdline": "console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
+    "kernel_cmdline": "$(kernel_cmdline)"
   },
   "guest": {
     "docker_socket": "/var/run/docker.sock",

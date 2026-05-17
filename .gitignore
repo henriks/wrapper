@@ -6,4 +6,5 @@ composed-fs/target/
 vm-frontend/target/
 vm-frontend/fuzz-*.log
 guest-service/target/
+target/
 

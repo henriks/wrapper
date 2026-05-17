@@ -1,4 +1,5 @@
 use std::fs::{self, File};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -12,16 +13,26 @@ use std::time::{Duration, Instant};
 use agentvm_composed_fs::serve_vhost_user_fs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
+use tokio::sync::watch;
+use tracing::{debug, error, info, info_span, warn};
 use wait_timeout::ChildExt;
 
-use crate::docker_proxy::{start_docker_unix_proxy, DockerUnixProxyConfig};
+use crate::docker_proxy::{
+    run_docker_unix_proxy_async, start_docker_unix_proxy, DockerUnixProxyConfig,
+    DockerUnixProxyLimits,
+};
 use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
 use crate::runtime_manifest::{
     write_runtime_manifests, write_runtime_manifests_with_config_mounts, ManifestSourceClass,
     RuntimeManifestSummary, RuntimeMount,
 };
+use crate::supervisor::{LaunchSupervisor, SupervisorTaskController, SupervisorTaskName};
 use crate::vmnet_runtime::serve_vmnet_gateway;
-use crate::{FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, VmShape};
+use crate::{
+    FrontendConfig, GuestNetwork, ManagedTask, ProcessSpec, RuntimePaths, ToolPaths, VmArtifacts,
+    VmShape,
+};
 
 const SOCKET_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const SOCKET_WAIT_STEP: Duration = Duration::from_millis(20);
@@ -149,8 +160,130 @@ pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
     policy: VmnetPolicy,
     qemu_timeout: Option<Duration>,
 ) -> Result<QemuExit, LaunchError> {
+    info!(
+        run_dir = %config.runtime.run_dir.display(),
+        qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
+        "running frontend until qemu exits"
+    );
     let running = start_frontend_with_policy(config, mounts, policy)?;
     running.wait(qemu_timeout)
+}
+
+pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
+    config: FrontendConfig,
+    mounts: Vec<RuntimeMount>,
+    policy: VmnetPolicy,
+    qemu_timeout: Option<Duration>,
+) -> Result<QemuExit, LaunchError> {
+    info!(
+        run_dir = %config.runtime.run_dir.display(),
+        qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
+        "running frontend asynchronously until qemu exits"
+    );
+    let state_disk = config.runtime.state_disk.clone();
+    tokio::task::spawn_blocking(move || ensure_state_disk(&state_disk))
+        .await
+        .map_err(join_launch_error)??;
+    validate_launch_inputs(&config)?;
+    write_launch_state(&config, "starting", None, None, Some(&policy))?;
+    prepare_frontend_launch_with_policy(&config, &mounts, &policy)?;
+    remove_stale_socket(&config.runtime.composed_fs_sock)?;
+    remove_stale_socket(&config.runtime.config_fs_sock)?;
+    remove_stale_socket(&config.runtime.vmnet_sock)?;
+    remove_stale_socket(&config.runtime.docker_sock)?;
+    remove_stale_socket(&config.runtime.vmnet_event_log)?;
+
+    let docker_tcp_port = docker_listener_tcp_port(&policy);
+    let mut supervisor_plan = config.supervisor_plan();
+    if docker_tcp_port.is_some() {
+        supervisor_plan.docker_proxy = Some(ManagedTask::DockerProxy);
+    }
+    let supervisor = LaunchSupervisor::new(supervisor_plan);
+    let mut services = Vec::new();
+
+    let composed_controller =
+        required_task_controller(&supervisor, SupervisorTaskName::ComposedFs)?;
+    let composed_config = config.composed_fs_server();
+    services.push(
+        spawn_supervised_blocking_service_until_ready(
+            &config.runtime.composed_fs_sock,
+            SOCKET_WAIT_TIMEOUT,
+            &composed_controller,
+            move || serve_vhost_user_fs(composed_config).map_err(|error| error.to_string()),
+        )
+        .await?,
+    );
+
+    let config_fs_controller = required_task_controller(&supervisor, SupervisorTaskName::ConfigFs)?;
+    let config_fs_config = config.config_fs_server();
+    services.push(
+        spawn_supervised_blocking_service_until_ready(
+            &config.runtime.config_fs_sock,
+            SOCKET_WAIT_TIMEOUT,
+            &config_fs_controller,
+            move || serve_vhost_user_fs(config_fs_config).map_err(|error| error.to_string()),
+        )
+        .await?,
+    );
+
+    let vmnet_controller = required_task_controller(&supervisor, SupervisorTaskName::VmnetGateway)?;
+    let mut vmnet_config = config.vmnet_gateway_config();
+    vmnet_config.policy = policy.clone();
+    services.push(
+        spawn_supervised_blocking_service_until_ready(
+            &config.runtime.vmnet_sock,
+            SOCKET_WAIT_TIMEOUT,
+            &vmnet_controller,
+            move || {
+                serve_vmnet_gateway(vmnet_config)
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:?}"))
+            },
+        )
+        .await?,
+    );
+
+    if let Some(docker_tcp_port) = docker_tcp_port {
+        let docker_controller =
+            required_task_controller(&supervisor, SupervisorTaskName::DockerProxy)?;
+        let docker_config = DockerUnixProxyConfig {
+            socket_path: config.runtime.docker_sock.clone(),
+            tcp_host: std::net::Ipv4Addr::LOCALHOST,
+            tcp_port: docker_tcp_port,
+        };
+        services.push(
+            spawn_supervised_async_service_until_ready(
+                &config.runtime.docker_sock,
+                SOCKET_WAIT_TIMEOUT,
+                &docker_controller,
+                move |shutdown| async move {
+                    run_docker_unix_proxy_async(
+                        docker_config,
+                        DockerUnixProxyLimits::default(),
+                        shutdown,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                },
+            )
+            .await?,
+        );
+    }
+
+    let process = match &supervisor.plan().qemu {
+        crate::ManagedTask::ChildProcess(process) => process.clone(),
+        _ => unreachable!("supervisor qemu task must be a child process"),
+    };
+    let qemu_controller = required_task_controller(&supervisor, SupervisorTaskName::Qemu)?;
+    run_supervised_qemu_process_with_services_async(
+        &config,
+        &policy,
+        &process,
+        qemu_timeout,
+        &qemu_controller,
+        services,
+    )
+    .await
 }
 
 pub struct RunningFrontend {
@@ -167,12 +300,18 @@ impl RunningFrontend {
     }
 
     pub fn wait(mut self, qemu_timeout: Option<Duration>) -> Result<QemuExit, LaunchError> {
+        info!(
+            qemu_pid = self.child.id(),
+            qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
+            "waiting for qemu"
+        );
         let qemu_exit = wait_for_qemu(&mut self.child, qemu_timeout)?;
         self.finish(qemu_exit)
     }
 
     pub fn terminate(mut self) -> Result<QemuExit, LaunchError> {
         self.shutting_down.store(true, Ordering::SeqCst);
+        info!(qemu_pid = self.child.id(), "terminating frontend");
         if self.child.try_wait()?.is_none() {
             self.child.kill()?;
         }
@@ -191,6 +330,12 @@ impl RunningFrontend {
             "exited"
         };
         let qemu_status = qemu_exit.status.to_string();
+        info!(
+            qemu_status = %qemu_exit.status,
+            timed_out = qemu_exit.timed_out,
+            launch_state = state_status,
+            "frontend finished"
+        );
         write_launch_state(
             &self.config,
             state_status,
@@ -217,6 +362,10 @@ impl Drop for RunningFrontend {
             }
             Err(error) => Some(format!("cleanup status unavailable: {error}")),
         };
+        warn!(
+            qemu_status = status.as_deref(),
+            "dropping unfinished frontend; wrote terminated launch state"
+        );
         let _ = write_launch_state(
             &self.config,
             "terminated",
@@ -232,6 +381,14 @@ pub fn start_frontend_with_policy(
     mounts: Vec<RuntimeMount>,
     policy: VmnetPolicy,
 ) -> Result<RunningFrontend, LaunchError> {
+    let span = info_span!(
+        "frontend.launch",
+        run_dir = %config.runtime.run_dir.display(),
+        state_disk = %config.runtime.state_disk.display(),
+        vmnet_socket = %config.runtime.vmnet_sock.display(),
+    );
+    let _span_guard = span.enter();
+    info!(mount_count = mounts.len(), "starting frontend services");
     ensure_state_disk(&config.runtime.state_disk)?;
     validate_launch_inputs(&config)?;
     write_launch_state(&config, "starting", None, None, Some(&policy))?;
@@ -253,11 +410,16 @@ pub fn start_frontend_with_policy(
                 if composed_shutting_down.load(Ordering::SeqCst) {
                     return;
                 }
-                eprintln!("agentvm composed fs failed: {error}");
+                error!(service = "composed-fs", %error, "service failed");
             }
         })
         .map_err(LaunchError::Io)?;
     wait_for_path(&config.runtime.composed_fs_sock, SOCKET_WAIT_TIMEOUT)?;
+    info!(
+        service = "composed-fs",
+        socket = %config.runtime.composed_fs_sock.display(),
+        "service ready"
+    );
 
     let config_fs_config = config.config_fs_server();
     let config_fs_shutting_down = shutting_down.clone();
@@ -268,11 +430,16 @@ pub fn start_frontend_with_policy(
                 if config_fs_shutting_down.load(Ordering::SeqCst) {
                     return;
                 }
-                eprintln!("agentvm config fs failed: {error}");
+                error!(service = "config-fs", %error, "service failed");
             }
         })
         .map_err(LaunchError::Io)?;
     wait_for_path(&config.runtime.config_fs_sock, SOCKET_WAIT_TIMEOUT)?;
+    info!(
+        service = "config-fs",
+        socket = %config.runtime.config_fs_sock.display(),
+        "service ready"
+    );
 
     let mut vmnet_config = config.vmnet_gateway_config();
     vmnet_config.policy = policy.clone();
@@ -284,11 +451,16 @@ pub fn start_frontend_with_policy(
                 if vmnet_shutting_down.load(Ordering::SeqCst) {
                     return;
                 }
-                eprintln!("agentvm vmnet gateway failed: {error:?}");
+                error!(service = "vmnet-gateway", ?error, "service failed");
             }
         })
         .map_err(LaunchError::Io)?;
     wait_for_path(&config.runtime.vmnet_sock, SOCKET_WAIT_TIMEOUT)?;
+    info!(
+        service = "vmnet-gateway",
+        socket = %config.runtime.vmnet_sock.display(),
+        "service ready"
+    );
 
     if let Some(docker_tcp_port) = docker_listener_tcp_port(&policy) {
         start_docker_unix_proxy(DockerUnixProxyConfig {
@@ -297,6 +469,12 @@ pub fn start_frontend_with_policy(
             tcp_port: docker_tcp_port,
         })?;
         wait_for_path(&config.runtime.docker_sock, SOCKET_WAIT_TIMEOUT)?;
+        info!(
+            service = "docker-unix-proxy",
+            socket = %config.runtime.docker_sock.display(),
+            tcp_port = docker_tcp_port,
+            "service ready"
+        );
     }
 
     let process = match config.supervisor_plan().qemu {
@@ -304,11 +482,18 @@ pub fn start_frontend_with_policy(
         _ => unreachable!("supervisor qemu task must be a child process"),
     };
     let qemu_log = File::create(&process.stdout_log)?;
+    debug!(
+        program = %process.program.display(),
+        arg_count = process.args.len(),
+        stdout_log = %process.stdout_log.display(),
+        "spawning qemu"
+    );
     let child = Command::new(&process.program)
         .args(&process.args)
         .stdout(Stdio::from(qemu_log.try_clone()?))
         .stderr(Stdio::from(qemu_log))
         .spawn()?;
+    info!(qemu_pid = child.id(), "qemu started");
     write_launch_state(&config, "running", Some(child.id()), None, Some(&policy))?;
     Ok(RunningFrontend {
         config,
@@ -340,11 +525,18 @@ fn wait_for_qemu(
     };
 
     match child.wait_timeout(timeout).map_err(LaunchError::Io)? {
-        Some(status) => Ok(QemuExit {
-            status,
-            timed_out: false,
-        }),
+        Some(status) => {
+            info!(%status, "qemu exited");
+            Ok(QemuExit {
+                status,
+                timed_out: false,
+            })
+        }
         None => {
+            warn!(
+                timeout_seconds = timeout.as_secs(),
+                "qemu timed out; killing process"
+            );
             child.kill().map_err(LaunchError::Io)?;
             child
                 .wait()
@@ -355,6 +547,404 @@ fn wait_for_qemu(
                 .map_err(LaunchError::Io)
         }
     }
+}
+
+pub async fn run_qemu_process_async(
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+) -> Result<QemuExit, LaunchError> {
+    let mut child = spawn_qemu_process_async(process).await?;
+    wait_for_qemu_async(&mut child, qemu_timeout).await
+}
+
+pub async fn run_supervised_qemu_process_async(
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+) -> Result<QemuExit, LaunchError> {
+    if controller.name() != SupervisorTaskName::Qemu {
+        return Err(qemu_controller_mismatch(controller));
+    }
+    controller
+        .mark_starting()
+        .map_err(supervisor_launch_error)?;
+    let mut child = match spawn_qemu_process_async(process).await {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = controller.mark_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    controller.mark_ready().map_err(supervisor_launch_error)?;
+    finish_supervised_qemu_wait(&mut child, qemu_timeout, controller).await
+}
+
+pub async fn run_supervised_qemu_process_with_state_async(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+) -> Result<QemuExit, LaunchError> {
+    let mut child =
+        spawn_supervised_qemu_process_with_state_async(config, policy, process, controller).await?;
+    let exit = finish_supervised_qemu_wait(&mut child, qemu_timeout, controller).await?;
+    write_qemu_exit_state(config, policy, &exit)?;
+    Ok(exit)
+}
+
+pub async fn run_supervised_qemu_process_with_service_async(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+    service: SupervisedBlockingService,
+) -> Result<QemuExit, LaunchError> {
+    run_supervised_qemu_process_with_services_async(
+        config,
+        policy,
+        process,
+        qemu_timeout,
+        controller,
+        vec![service],
+    )
+    .await
+}
+
+pub async fn run_supervised_qemu_process_with_services_async(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    process: &ProcessSpec,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+    services: Vec<SupervisedBlockingService>,
+) -> Result<QemuExit, LaunchError> {
+    let mut child =
+        spawn_supervised_qemu_process_with_state_async(config, policy, process, controller).await?;
+    let exit = wait_for_qemu_or_service_failure(
+        config,
+        policy,
+        &mut child,
+        qemu_timeout,
+        controller,
+        services,
+    )
+    .await?;
+    write_qemu_exit_state(config, policy, &exit)?;
+    Ok(exit)
+}
+
+async fn spawn_supervised_qemu_process_with_state_async(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    process: &ProcessSpec,
+    controller: &SupervisorTaskController,
+) -> Result<TokioChild, LaunchError> {
+    if controller.name() != SupervisorTaskName::Qemu {
+        return Err(qemu_controller_mismatch(controller));
+    }
+    controller
+        .mark_starting()
+        .map_err(supervisor_launch_error)?;
+    let child = match spawn_qemu_process_async(process).await {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = controller.mark_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    write_launch_state(config, "running", child.id(), None, Some(policy))?;
+    controller.mark_ready().map_err(supervisor_launch_error)?;
+    Ok(child)
+}
+
+async fn finish_supervised_qemu_wait(
+    child: &mut TokioChild,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+) -> Result<QemuExit, LaunchError> {
+    match wait_for_qemu_async(child, qemu_timeout).await {
+        Ok(exit) => {
+            publish_supervised_qemu_exit(controller, &exit)?;
+            Ok(exit)
+        }
+        Err(error) => {
+            let _ = controller.mark_failed(error.to_string());
+            Err(error)
+        }
+    }
+}
+
+async fn wait_for_qemu_or_service_failure(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    child: &mut TokioChild,
+    qemu_timeout: Option<Duration>,
+    controller: &SupervisorTaskController,
+    services: Vec<SupervisedBlockingService>,
+) -> Result<QemuExit, LaunchError> {
+    if services.is_empty() {
+        return finish_supervised_qemu_wait(child, qemu_timeout, controller).await;
+    }
+
+    let service_controllers = service_controllers(&services);
+    let service_completion = wait_for_first_service_completion(services);
+    tokio::pin!(service_completion);
+    if let Some(timeout) = qemu_timeout {
+        tokio::select! {
+            status = child.wait() => {
+                let exit = QemuExit { status: status.map_err(LaunchError::Io)?, timed_out: false };
+                publish_supervised_qemu_exit(controller, &exit)?;
+                cancel_unfinished_services(&service_controllers, None, "qemu exited");
+                Ok(exit)
+            }
+            _ = tokio::time::sleep(timeout) => {
+                let exit = kill_timed_out_qemu(child).await?;
+                publish_supervised_qemu_exit(controller, &exit)?;
+                cancel_unfinished_services(&service_controllers, None, "qemu timed out");
+                Ok(exit)
+            }
+            service_result = &mut service_completion => {
+                let (service_name, service_result) = service_result?;
+                cancel_unfinished_services(&service_controllers, Some(service_name), "peer service failed");
+                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await
+            }
+        }
+    } else {
+        tokio::select! {
+            status = child.wait() => {
+                let exit = QemuExit { status: status.map_err(LaunchError::Io)?, timed_out: false };
+                publish_supervised_qemu_exit(controller, &exit)?;
+                cancel_unfinished_services(&service_controllers, None, "qemu exited");
+                Ok(exit)
+            }
+            service_result = &mut service_completion => {
+                let (service_name, service_result) = service_result?;
+                cancel_unfinished_services(&service_controllers, Some(service_name), "peer service failed");
+                terminate_qemu_after_service_failure(config, policy, child, controller, service_name, service_result).await
+            }
+        }
+    }
+}
+
+fn service_controllers(
+    services: &[SupervisedBlockingService],
+) -> Vec<(
+    SupervisorTaskName,
+    SupervisorTaskController,
+    Option<watch::Sender<bool>>,
+)> {
+    services
+        .iter()
+        .map(|service| {
+            (
+                service.name(),
+                service.controller.clone(),
+                service.shutdown_tx.clone(),
+            )
+        })
+        .collect()
+}
+
+fn cancel_unfinished_services(
+    services: &[(
+        SupervisorTaskName,
+        SupervisorTaskController,
+        Option<watch::Sender<bool>>,
+    )],
+    skip: Option<SupervisorTaskName>,
+    reason: &str,
+) {
+    for (name, controller, shutdown_tx) in services {
+        if Some(*name) == skip {
+            continue;
+        }
+        if let Some(shutdown_tx) = shutdown_tx {
+            let _ = shutdown_tx.send(true);
+        }
+        let _ = controller.mark_cancelled(reason);
+    }
+}
+
+async fn wait_for_first_service_completion(
+    services: Vec<SupervisedBlockingService>,
+) -> Result<(SupervisorTaskName, Result<(), LaunchError>), LaunchError> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for service in services {
+        let name = service.name();
+        tasks.spawn(async move { (name, service.wait().await) });
+    }
+    tasks
+        .join_next()
+        .await
+        .ok_or_else(|| {
+            LaunchError::Artifact(
+                "all supervised service monitors exited without result".to_string(),
+            )
+        })?
+        .map_err(|error| LaunchError::Artifact(format!("service monitor join failed: {error}")))
+}
+
+async fn kill_timed_out_qemu(child: &mut TokioChild) -> Result<QemuExit, LaunchError> {
+    child.start_kill().map_err(LaunchError::Io)?;
+    child
+        .wait()
+        .await
+        .map(|status| QemuExit {
+            status,
+            timed_out: true,
+        })
+        .map_err(LaunchError::Io)
+}
+
+async fn terminate_qemu_after_service_failure(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    child: &mut TokioChild,
+    controller: &SupervisorTaskController,
+    service_name: SupervisorTaskName,
+    service_result: Result<(), LaunchError>,
+) -> Result<QemuExit, LaunchError> {
+    let cause = match service_result {
+        Ok(()) => format!("{service_name} exited while qemu was running"),
+        Err(error) => error.to_string(),
+    };
+    let _ = controller.mark_failed(format!("service failure: {cause}"));
+    let status = if let Some(status) = child.try_wait().map_err(LaunchError::Io)? {
+        status
+    } else {
+        child.start_kill().map_err(LaunchError::Io)?;
+        child.wait().await.map_err(LaunchError::Io)?
+    };
+    let qemu_status = format!("terminated after service failure ({cause}); qemu status: {status}");
+    write_launch_state(
+        config,
+        "service_failed",
+        None,
+        Some(&qemu_status),
+        Some(policy),
+    )?;
+    Err(LaunchError::Artifact(cause))
+}
+
+fn publish_supervised_qemu_exit(
+    controller: &SupervisorTaskController,
+    exit: &QemuExit,
+) -> Result<(), LaunchError> {
+    if exit.timed_out {
+        controller
+            .mark_failed("qemu timed out")
+            .map_err(supervisor_launch_error)
+    } else {
+        controller.mark_finished().map_err(supervisor_launch_error)
+    }
+}
+
+fn write_qemu_exit_state(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    exit: &QemuExit,
+) -> Result<(), LaunchError> {
+    let state_status = if exit.timed_out {
+        "timed_out"
+    } else {
+        "exited"
+    };
+    let qemu_status = exit.status.to_string();
+    write_launch_state(config, state_status, None, Some(&qemu_status), Some(policy))
+}
+
+fn qemu_controller_mismatch(controller: &SupervisorTaskController) -> LaunchError {
+    LaunchError::Artifact(format!(
+        "qemu process supervisor received {} task controller",
+        controller.name()
+    ))
+}
+
+pub async fn spawn_qemu_process_async(process: &ProcessSpec) -> Result<TokioChild, LaunchError> {
+    if let Some(parent) = process.stdout_log.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let qemu_log = File::create(&process.stdout_log)?;
+    debug!(
+        program = %process.program.display(),
+        arg_count = process.args.len(),
+        stdout_log = %process.stdout_log.display(),
+        "spawning qemu asynchronously"
+    );
+    TokioCommand::new(&process.program)
+        .args(&process.args)
+        .stdout(Stdio::from(qemu_log.try_clone()?))
+        .stderr(Stdio::from(qemu_log))
+        .spawn()
+        .map_err(LaunchError::Io)
+}
+
+pub async fn wait_for_qemu_async(
+    child: &mut TokioChild,
+    qemu_timeout: Option<Duration>,
+) -> Result<QemuExit, LaunchError> {
+    let Some(timeout) = qemu_timeout else {
+        return child
+            .wait()
+            .await
+            .map(|status| QemuExit {
+                status,
+                timed_out: false,
+            })
+            .map_err(LaunchError::Io);
+    };
+
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            info!(%status, "qemu exited");
+            Ok(QemuExit {
+                status,
+                timed_out: false,
+            })
+        }
+        Ok(Err(error)) => Err(LaunchError::Io(error)),
+        Err(_) => {
+            if let Some(status) = child.try_wait().map_err(LaunchError::Io)? {
+                info!(%status, "qemu exited after async timeout boundary");
+                return Ok(QemuExit {
+                    status,
+                    timed_out: false,
+                });
+            }
+            warn!(
+                timeout_seconds = timeout.as_secs(),
+                "qemu timed out asynchronously; killing process"
+            );
+            child.start_kill().map_err(LaunchError::Io)?;
+            child
+                .wait()
+                .await
+                .map(|status| QemuExit {
+                    status,
+                    timed_out: true,
+                })
+                .map_err(LaunchError::Io)
+        }
+    }
+}
+
+fn supervisor_launch_error(error: impl std::fmt::Display) -> LaunchError {
+    LaunchError::Artifact(format!("launch supervisor status update failed: {error}"))
+}
+
+fn join_launch_error(error: tokio::task::JoinError) -> LaunchError {
+    LaunchError::Artifact(format!("blocking launch task failed: {error}"))
+}
+
+fn required_task_controller(
+    supervisor: &LaunchSupervisor,
+    name: SupervisorTaskName,
+) -> Result<SupervisorTaskController, LaunchError> {
+    supervisor
+        .task_controller(name)
+        .ok_or_else(|| LaunchError::Artifact(format!("missing launch supervisor task: {name}")))
 }
 
 fn validate_launch_inputs(config: &FrontendConfig) -> Result<(), LaunchError> {
@@ -470,10 +1060,156 @@ pub fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), LaunchError> 
         }
         thread::sleep(SOCKET_WAIT_STEP);
     }
-    Err(LaunchError::Artifact(format!(
-        "timed out waiting for {}",
-        path.display()
-    )))
+    Err(path_wait_timeout(path))
+}
+
+pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> Result<(), LaunchError> {
+    wait_for_path_async_with_step(path, timeout, SOCKET_WAIT_STEP).await
+}
+
+async fn wait_for_path_async_with_step(
+    path: &Path,
+    timeout: Duration,
+    step: Duration,
+) -> Result<(), LaunchError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(path_wait_timeout(path));
+        }
+        tokio::time::sleep(std::cmp::min(step, deadline.saturating_duration_since(now))).await;
+    }
+}
+
+pub async fn wait_for_service_ready_async(
+    path: &Path,
+    timeout: Duration,
+    controller: &SupervisorTaskController,
+) -> Result<(), LaunchError> {
+    match wait_for_path_async(path, timeout).await {
+        Ok(()) => {
+            controller.mark_ready().map_err(supervisor_launch_error)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = controller.mark_failed(error.to_string());
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SupervisedBlockingService {
+    controller: SupervisorTaskController,
+    handle: tokio::task::JoinHandle<Result<(), String>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+}
+
+impl SupervisedBlockingService {
+    pub fn name(&self) -> SupervisorTaskName {
+        self.controller.name()
+    }
+
+    pub async fn wait(self) -> Result<(), LaunchError> {
+        match self.handle.await {
+            Ok(Ok(())) => {
+                self.controller
+                    .mark_finished()
+                    .map_err(supervisor_launch_error)?;
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                let _ = self.controller.mark_failed(error.clone());
+                Err(LaunchError::Artifact(error))
+            }
+            Err(error) => {
+                let failure = format!("service task join failed: {error}");
+                let _ = self.controller.mark_failed(failure.clone());
+                Err(LaunchError::Artifact(failure))
+            }
+        }
+    }
+}
+
+pub async fn spawn_supervised_blocking_service_until_ready<F>(
+    ready_path: &Path,
+    timeout: Duration,
+    controller: &SupervisorTaskController,
+    service: F,
+) -> Result<SupervisedBlockingService, LaunchError>
+where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
+    let handle = tokio::task::spawn_blocking(service);
+    wait_for_supervised_service_ready(ready_path, timeout, controller, handle, None).await
+}
+
+pub async fn spawn_supervised_async_service_until_ready<F, Fut>(
+    ready_path: &Path,
+    timeout: Duration,
+    controller: &SupervisorTaskController,
+    service: F,
+) -> Result<SupervisedBlockingService, LaunchError>
+where
+    F: FnOnce(watch::Receiver<bool>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let handle = tokio::spawn(service(shutdown_rx));
+    wait_for_supervised_service_ready(ready_path, timeout, controller, handle, Some(shutdown_tx))
+        .await
+}
+
+async fn wait_for_supervised_service_ready(
+    ready_path: &Path,
+    timeout: Duration,
+    controller: &SupervisorTaskController,
+    mut handle: tokio::task::JoinHandle<Result<(), String>>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+) -> Result<SupervisedBlockingService, LaunchError> {
+    controller
+        .mark_starting()
+        .map_err(supervisor_launch_error)?;
+    let ready = wait_for_path_async(ready_path, timeout);
+    tokio::pin!(ready);
+
+    tokio::select! {
+        ready_result = &mut ready => match ready_result {
+            Ok(()) => {
+                controller.mark_ready().map_err(supervisor_launch_error)?;
+                Ok(SupervisedBlockingService {
+                    controller: controller.clone(),
+                    handle,
+                    shutdown_tx,
+                })
+            }
+            Err(error) => {
+                if let Some(shutdown_tx) = &shutdown_tx {
+                    let _ = shutdown_tx.send(true);
+                }
+                handle.abort();
+                let _ = controller.mark_failed(error.to_string());
+                Err(error)
+            }
+        },
+        service_result = &mut handle => {
+            let failure = match service_result {
+                Ok(Ok(())) => "service exited before readiness".to_string(),
+                Ok(Err(error)) => error,
+                Err(error) => format!("service task join failed: {error}"),
+            };
+            let _ = controller.mark_failed(failure.clone());
+            Err(LaunchError::Artifact(failure))
+        }
+    }
+}
+
+fn path_wait_timeout(path: &Path) -> LaunchError {
+    LaunchError::Artifact(format!("timed out waiting for {}", path.display()))
 }
 
 fn docker_listener_tcp_port(policy: &VmnetPolicy) -> Option<u16> {
@@ -769,6 +1505,164 @@ mod tests {
         assert!(!state.contains("\"status\": \"terminated\""), "{state}");
     }
 
+    #[tokio::test]
+    async fn async_qemu_process_exits_with_status() {
+        let root = unique_temp_dir();
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "exit 7".to_string()],
+            stdout_log: root.join("qemu.log"),
+        };
+
+        let exit = run_qemu_process_async(&process, None)
+            .await
+            .expect("async qemu exit");
+
+        assert_eq!(exit.status.code(), Some(7));
+        assert!(!exit.timed_out);
+        assert!(process.stdout_log.exists());
+    }
+
+    #[tokio::test]
+    async fn async_qemu_timeout_kills_child() {
+        let root = unique_temp_dir();
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: root.join("qemu.log"),
+        };
+
+        let exit = run_qemu_process_async(&process, Some(Duration::from_millis(20)))
+            .await
+            .expect("async qemu timeout");
+
+        assert!(exit.timed_out);
+        assert!(!exit.status.success());
+    }
+
+    #[tokio::test]
+    async fn supervised_async_qemu_marks_finished_on_exit() {
+        let config = minimal_frontend_config("supervised-qemu-exit");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-supervised.log"),
+        };
+
+        let exit = run_supervised_qemu_process_async(&process, None, &controller)
+            .await
+            .expect("supervised qemu exit");
+
+        assert!(exit.status.success());
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Finished)
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_async_qemu_marks_failed_on_timeout() {
+        let config = minimal_frontend_config("supervised-qemu-timeout");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-supervised.log"),
+        };
+
+        let exit = run_supervised_qemu_process_async(
+            &process,
+            Some(Duration::from_millis(20)),
+            &controller,
+        )
+        .await
+        .expect("supervised qemu timeout");
+
+        assert!(exit.timed_out);
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "qemu timed out".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_async_qemu_with_state_records_exit() {
+        let config = minimal_frontend_config("supervised-qemu-state-exit");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-supervised-state.log"),
+        };
+
+        let exit = run_supervised_qemu_process_with_state_async(
+            &config,
+            &policy,
+            &process,
+            None,
+            &controller,
+        )
+        .await
+        .expect("supervised qemu state exit");
+
+        assert!(exit.status.success());
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"exited\""), "{state}");
+        assert!(state.contains("\"qemu_status\":"), "{state}");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Finished)
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_async_qemu_with_state_records_timeout() {
+        let config = minimal_frontend_config("supervised-qemu-state-timeout");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-supervised-state.log"),
+        };
+
+        let exit = run_supervised_qemu_process_with_state_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_millis(20)),
+            &controller,
+        )
+        .await
+        .expect("supervised qemu state timeout");
+
+        assert!(exit.timed_out);
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"timed_out\""), "{state}");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "qemu timed out".to_string()
+            })
+        );
+    }
+
     #[test]
     fn repeated_runner_after_drop_cleanup_can_update_state() {
         let config = minimal_frontend_config("repeat-after-drop");
@@ -807,6 +1701,450 @@ mod tests {
         let state = fs::read_to_string(config.runtime.state_json).expect("state json");
         assert!(state.contains("\"status\": \"exited\""), "{state}");
         assert!(!state.contains("\"status\": \"terminated\""), "{state}");
+    }
+
+    #[tokio::test]
+    async fn async_service_readiness_marks_ready_when_path_exists() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("ready.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("service-ready");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::ComposedFs)
+            .expect("composed-fs controller");
+        controller.mark_starting().expect("starting");
+
+        wait_for_service_ready_async(&ready_path, Duration::from_secs(1), &controller)
+            .await
+            .expect("ready");
+
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ComposedFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn async_service_readiness_marks_failed_on_timeout() {
+        let root = unique_temp_dir();
+        let missing_path = root.join("missing.sock");
+        let config = minimal_frontend_config("service-timeout");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::ConfigFs)
+            .expect("config-fs controller");
+        controller.mark_starting().expect("starting");
+
+        let error =
+            wait_for_service_ready_async(&missing_path, Duration::from_millis(20), &controller)
+                .await
+                .expect_err("timeout");
+
+        assert!(error.to_string().contains("timed out waiting"));
+        let Some(crate::supervisor::SupervisorTaskStatus::Failed { cause }) =
+            supervisor.task_status(SupervisorTaskName::ConfigFs)
+        else {
+            panic!("expected failed config-fs status");
+        };
+        assert!(cause.contains("timed out waiting"));
+    }
+
+    #[tokio::test]
+    async fn supervised_blocking_service_marks_ready_and_returns_handle() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("blocking-ready.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("blocking-service-ready");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::ComposedFs)
+            .expect("composed-fs controller");
+
+        let handle = spawn_supervised_blocking_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &controller,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            },
+        )
+        .await
+        .expect("service ready");
+
+        assert_eq!(handle.name(), SupervisorTaskName::ComposedFs);
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ComposedFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Ready)
+        );
+        handle.wait().await.expect("service ok");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ComposedFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Finished)
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_blocking_service_marks_failed_after_readiness() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("blocking-ready-then-fail.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("blocking-service-late-failure");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::VmnetGateway)
+            .expect("vmnet controller");
+
+        let handle = spawn_supervised_blocking_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &controller,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                Err("vmnet failed after ready".to_string())
+            },
+        )
+        .await
+        .expect("service ready before failure");
+
+        let error = handle.wait().await.expect_err("late service failure");
+        assert_eq!(error.to_string(), "vmnet failed after ready");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::VmnetGateway),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "vmnet failed after ready".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_qemu_with_service_records_service_failure() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("service-ready-before-failure.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("qemu-service-failure");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let service_controller = supervisor
+            .task_controller(SupervisorTaskName::VmnetGateway)
+            .expect("vmnet controller");
+        let qemu_controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let service = spawn_supervised_blocking_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &service_controller,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                Err("vmnet failed while qemu running".to_string())
+            },
+        )
+        .await
+        .expect("service ready");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-service-failure.log"),
+        };
+
+        let error = run_supervised_qemu_process_with_service_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_secs(10)),
+            &qemu_controller,
+            service,
+        )
+        .await
+        .expect_err("service failure stops qemu");
+
+        assert_eq!(error.to_string(), "vmnet failed while qemu running");
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"service_failed\""), "{state}");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "service failure: vmnet failed while qemu running".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_qemu_with_services_records_first_service_failure() {
+        let root = unique_temp_dir();
+        let config_ready_path = root.join("config-ready.sock");
+        let vmnet_ready_path = root.join("vmnet-ready.sock");
+        fs::write(&config_ready_path, b"ready").expect("config ready marker");
+        fs::write(&vmnet_ready_path, b"ready").expect("vmnet ready marker");
+        let config = minimal_frontend_config("qemu-services-failure");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let config_controller = supervisor
+            .task_controller(SupervisorTaskName::ConfigFs)
+            .expect("config controller");
+        let vmnet_controller = supervisor
+            .task_controller(SupervisorTaskName::VmnetGateway)
+            .expect("vmnet controller");
+        let qemu_controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let config_service = spawn_supervised_blocking_service_until_ready(
+            &config_ready_path,
+            Duration::from_secs(1),
+            &config_controller,
+            || {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            },
+        )
+        .await
+        .expect("config ready");
+        let vmnet_service = spawn_supervised_blocking_service_until_ready(
+            &vmnet_ready_path,
+            Duration::from_secs(1),
+            &vmnet_controller,
+            || {
+                std::thread::sleep(Duration::from_millis(20));
+                Err("vmnet failed first".to_string())
+            },
+        )
+        .await
+        .expect("vmnet ready");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-services-failure.log"),
+        };
+
+        let error = run_supervised_qemu_process_with_services_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_secs(10)),
+            &qemu_controller,
+            vec![config_service, vmnet_service],
+        )
+        .await
+        .expect_err("first service failure stops qemu");
+
+        assert_eq!(error.to_string(), "vmnet failed first");
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"service_failed\""), "{state}");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::VmnetGateway),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "vmnet failed first".to_string()
+            })
+        );
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ConfigFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Cancelled {
+                reason: "peer service failed".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_qemu_exit_cancels_unfinished_services() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("service-ready-for-qemu-exit.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("qemu-exit-cancels-services");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let service_controller = supervisor
+            .task_controller(SupervisorTaskName::ConfigFs)
+            .expect("config controller");
+        let qemu_controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let service = spawn_supervised_blocking_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &service_controller,
+            || {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            },
+        )
+        .await
+        .expect("service ready");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            stdout_log: config
+                .runtime
+                .run_dir
+                .join("qemu-exit-cancels-services.log"),
+        };
+
+        let exit = run_supervised_qemu_process_with_services_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_secs(10)),
+            &qemu_controller,
+            vec![service],
+        )
+        .await
+        .expect("qemu exits");
+
+        assert!(exit.status.success());
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ConfigFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Cancelled {
+                reason: "qemu exited".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_qemu_exit_signals_async_service_shutdown() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("async-service-ready-for-qemu-exit.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("qemu-exit-cancels-async-service");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let mut plan = config.supervisor_plan();
+        plan.docker_proxy = Some(crate::ManagedTask::DockerProxy);
+        let supervisor = crate::supervisor::LaunchSupervisor::new(plan);
+        let service_controller = supervisor
+            .task_controller(SupervisorTaskName::DockerProxy)
+            .expect("docker proxy controller");
+        let qemu_controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let (shutdown_seen_tx, shutdown_seen_rx) = tokio::sync::oneshot::channel();
+        let service = spawn_supervised_async_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &service_controller,
+            move |mut shutdown| async move {
+                let _ = shutdown.changed().await;
+                let _ = shutdown_seen_tx.send(*shutdown.borrow());
+                Ok(())
+            },
+        )
+        .await
+        .expect("async service ready");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "exit 0".to_string()],
+            stdout_log: config
+                .runtime
+                .run_dir
+                .join("qemu-exit-cancels-async-service.log"),
+        };
+
+        let exit = run_supervised_qemu_process_with_services_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_secs(10)),
+            &qemu_controller,
+            vec![service],
+        )
+        .await
+        .expect("qemu exits");
+
+        assert!(exit.status.success());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), shutdown_seen_rx)
+                .await
+                .expect("shutdown signal")
+                .expect("shutdown value"),
+            true
+        );
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::DockerProxy),
+            Some(crate::supervisor::SupervisorTaskStatus::Cancelled {
+                reason: "qemu exited".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_qemu_timeout_cancels_unfinished_services() {
+        let root = unique_temp_dir();
+        let ready_path = root.join("service-ready-for-qemu-timeout.sock");
+        fs::write(&ready_path, b"ready").expect("ready marker");
+        let config = minimal_frontend_config("qemu-timeout-cancels-services");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let service_controller = supervisor
+            .task_controller(SupervisorTaskName::ConfigFs)
+            .expect("config controller");
+        let qemu_controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let service = spawn_supervised_blocking_service_until_ready(
+            &ready_path,
+            Duration::from_secs(1),
+            &service_controller,
+            || {
+                std::thread::sleep(Duration::from_secs(1));
+                Ok(())
+            },
+        )
+        .await
+        .expect("service ready");
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config
+                .runtime
+                .run_dir
+                .join("qemu-timeout-cancels-services.log"),
+        };
+
+        let exit = run_supervised_qemu_process_with_services_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_millis(20)),
+            &qemu_controller,
+            vec![service],
+        )
+        .await
+        .expect("qemu times out");
+
+        assert!(exit.timed_out);
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ConfigFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Cancelled {
+                reason: "qemu timed out".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_blocking_service_marks_failed_when_service_exits_before_ready() {
+        let root = unique_temp_dir();
+        let missing_path = root.join("missing-ready.sock");
+        let config = minimal_frontend_config("blocking-service-failed");
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::ConfigFs)
+            .expect("config-fs controller");
+
+        let error = spawn_supervised_blocking_service_until_ready(
+            &missing_path,
+            Duration::from_secs(1),
+            &controller,
+            || Err("config-fs failed".to_string()),
+        )
+        .await
+        .expect_err("service failure");
+
+        assert_eq!(error.to_string(), "config-fs failed");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::ConfigFs),
+            Some(crate::supervisor::SupervisorTaskStatus::Failed {
+                cause: "config-fs failed".to_string()
+            })
+        );
     }
 
     #[test]

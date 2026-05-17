@@ -8,8 +8,9 @@ vm-frontend/validate.sh required
 ```
 
 The required gate performs the validation documentation drift check, `cargo fmt
---check` for the Rust crates and fuzz package, composed-fs, guest-service, and
-vm-frontend offline tests, offline guest service tests, fuzz target compilation with `cargo
+--check` for the Rust crates and fuzz package, composed-fs, guest-service,
+payload-protocol, and vm-frontend offline tests, offline guest service tests,
+fuzz target compilation with `cargo
 check --manifest-path vm-frontend/fuzz/Cargo.toml --offline`, the quick
 `live-smoke` host live validation scenario, and the `live-setup-tools` Codex/Pi
 bootstrap/persistence scenario. `full` is an alias for the same gate.
@@ -30,6 +31,7 @@ Equivalent commands:
 ```sh
 cargo test --manifest-path composed-fs/Cargo.toml --offline
 cargo test --manifest-path guest-service/Cargo.toml --offline
+cargo test --manifest-path payload-protocol/Cargo.toml --offline
 cargo test --manifest-path vm-frontend/Cargo.toml --offline
 ```
 
@@ -56,9 +58,9 @@ vm-frontend/validate.sh guest-services
 stay aligned on the required gate. `fuzz-check` compiles/checks the fuzz targets
 without running libFuzzer. `guest-services` runs offline `unittest` coverage for
 `docker/guest-init.sh`, `docker/build-appliance.sh`,
-`docker/guest-payload-server.py`, and `docker/guest-socket-bridge.py`. The Rust `guest-service` crate is covered by the
-`fast`, `fmt`, and `required` tiers; it is not installed into the appliance by
-these offline tests.
+`docker/guest-payload-server.py`, and `docker/guest-socket-bridge.py`. The Rust `guest-service` and `payload-protocol` crates are covered by the
+`fast`, `fmt`, and `required` tiers; `guest-service` is not installed into the
+appliance by these offline tests.
 
 ## Stress And Property
 
@@ -113,6 +115,7 @@ Current targets:
 cargo fuzz run vmnet_stream_frame_io
 cargo fuzz run dns_proxy_payload
 cargo fuzz run vmnet_gateway_frame
+cargo fuzz run payload_protocol_frame
 cargo fuzz run composed_manifest_shape
 ```
 
@@ -159,7 +162,7 @@ vm-frontend/validate.sh live-full
 Equivalent command:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
   self-test \
   --project "$PWD" \
   --run-dir "$PWD/.sandbox/docker-vm/self-test" \

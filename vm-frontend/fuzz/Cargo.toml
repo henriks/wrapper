@@ -7,9 +7,12 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+[workspace]
+
 [dependencies]
 agentvm-composed-fs = { path = "../../composed-fs", features = ["fuzzing"] }
 agentvm-frontend = { path = ".." }
+agentvm-payload-protocol = { path = "../../payload-protocol" }
 hickory-proto = "0.26.1"
 libfuzzer-sys = "0.4"
 smoltcp = { version = "0.13.1", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp"] }
@@ -31,6 +34,13 @@ bench = false
 [[bin]]
 name = "vmnet_gateway_frame"
 path = "fuzz_targets/vmnet_gateway_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "payload_protocol_frame"
+path = "fuzz_targets/payload_protocol_frame.rs"
 test = false
 doc = false
 bench = false

@@ -1,6 +1,6 @@
 ---
 id: wra-f762
-status: open
+status: in_progress
 deps: [wra-73tn]
 links: []
 created: 2026-05-17T10:19:45Z
@@ -28,3 +28,7 @@ vmnet runs without mio RuntimePoller or std::sync::mpsc service workers, backpre
 **2026-05-17T10:28:44Z**
 
 Async-boundary refinement: replacing vmnet poller/service I/O with Tokio should not make the gateway core concurrent. Preserve one owner actor for smoltcp and frame ordering; use Tokio for edge readiness and bounded worker communication only.
+
+**2026-05-17T19:07:22Z**
+
+Starting in wra-xcvq-complete-epic iteration 1 while wra-662v Rust opt-in appliance validation is blocked on a privileged rebuild. First slice will be intentionally additive/mechanical: inspect vmnet_runtime/vmnet_poller/vmnet_service_io seams and add a small Tokio-facing actor boundary or test harness without moving VmnetGateway/VmnetCore state behind Arc<Mutex<_>> and without deleting the existing live-validated synchronous runtime yet.

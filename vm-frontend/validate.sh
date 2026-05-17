@@ -61,6 +61,8 @@ fast() {
   cargo test --manifest-path composed-fs/Cargo.toml --offline
   announce "offline tests: guest-service"
   cargo test --manifest-path guest-service/Cargo.toml --offline
+  announce "offline tests: payload-protocol"
+  cargo test --manifest-path payload-protocol/Cargo.toml --offline
   announce "offline tests: vm-frontend"
   cargo test --manifest-path vm-frontend/Cargo.toml --offline
 }
@@ -70,6 +72,8 @@ fmt_check() {
   cargo fmt --manifest-path composed-fs/Cargo.toml --check
   announce "rustfmt: guest-service"
   cargo fmt --manifest-path guest-service/Cargo.toml --check
+  announce "rustfmt: payload-protocol"
+  cargo fmt --manifest-path payload-protocol/Cargo.toml --check
   announce "rustfmt: vm-frontend"
   cargo fmt --manifest-path vm-frontend/Cargo.toml --check
   announce "rustfmt: vm-frontend fuzz targets"
@@ -150,7 +154,7 @@ run_self_test_scenario() {
   local qemu="${QEMU:-/usr/bin/qemu-system-x86_64}"
   local image="${IMAGE:-alpine:3.22}"
   announce "${name}: image=${image} qemu=${qemu}"
-  cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+  cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
     self-test \
     --project "${ROOT}" \
     --run-dir "${run_dir}" \

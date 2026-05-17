@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
 use smoltcp::time::Instant;
+use tracing::{debug, info, info_span, warn};
 
 use crate::dns_proxy::DnsUpstreamError;
 use crate::host_ingress::{
-    HostIngressAcceptedQueue, HostIngressBridge, HostIngressEvent, HostIngressListenerSet,
-    HostIngressReadiness, DEFAULT_HOST_INGRESS_ACCEPTS_PER_LISTENER_PUMP,
+    AcceptedHostConnection, HostIngressAcceptedQueue, HostIngressBridge, HostIngressEvent,
+    HostIngressListenerSet, HostIngressReadiness, DEFAULT_HOST_INGRESS_ACCEPTS_PER_LISTENER_PUMP,
     DEFAULT_HOST_INGRESS_ACCEPT_QUEUE_LIMIT,
 };
 use crate::network_policy::VmnetPolicy;
@@ -118,9 +119,55 @@ pub enum VmnetGatewayEvent {
     },
 }
 
+pub struct VmnetCore<'a> {
+    gateway: VmnetGateway<'a>,
+}
+
+impl<'a> VmnetCore<'a> {
+    pub fn new(gateway: VmnetGateway<'a>) -> Self {
+        Self { gateway }
+    }
+
+    pub fn handle_guest_frame(&mut self, frame: Vec<u8>, now: Instant) -> GuestFrameResult {
+        self.gateway.handle_guest_frame(frame, now)
+    }
+
+    fn handle_guest_frame_with_deferred_dns(
+        &mut self,
+        frame: Vec<u8>,
+        now: Instant,
+    ) -> VmnetDeferredDnsFrame {
+        self.gateway
+            .handle_guest_frame_with_deferred_dns(frame, now)
+    }
+
+    fn complete_pending_dns_query(
+        &mut self,
+        pending: VmnetPendingDnsQuery,
+        exchange: Result<hickory_proto::op::Message, DnsUpstreamError>,
+    ) -> GuestFrameResult {
+        dns_frame_result_to_guest(self.gateway.complete_pending_dns_query(pending, exchange))
+    }
+
+    pub fn poll_tcp(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        self.gateway.poll_tcp(now)
+    }
+
+    pub fn tcp_poll_delay(&mut self, now: Instant) -> Option<Duration> {
+        self.gateway.tcp_poll_delay(now)
+    }
+
+    // Narrow escape hatch for synchronous driver adapters that still need to
+    // call existing proxy/host-ingress APIs. Keep this private to this module:
+    // new runtime code should prefer explicit VmnetCore methods.
+    fn gateway_mut(&mut self) -> &mut VmnetGateway<'a> {
+        &mut self.gateway
+    }
+}
+
 pub fn run_qemu_stream_until_eof<T, C, F>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
     mut now: F,
 ) -> Result<VmnetRuntimeStats, VmnetRuntimeError>
@@ -134,13 +181,13 @@ where
     while let Some(frame) = frame_io.read_frame()? {
         stats.guest_frames_read += 1;
 
-        let result = gateway.handle_guest_frame(frame, now());
+        let result = core.handle_guest_frame(frame, now());
         if let Some(event) = gateway_event_from_outcome(&result.outcome) {
             stats.gateway_events.push(event);
         }
         write_guest_frames(frame_io, &result.guest_frames, &mut stats, None)?;
 
-        let pump = pump_proxy_once(frame_io, gateway, proxy, now(), None)?;
+        let pump = pump_proxy_once(frame_io, core, proxy, now(), None)?;
         stats.guest_frames_written += pump.guest_frames_written;
         stats.proxy_events.extend(pump.events);
     }
@@ -149,7 +196,7 @@ where
 
 pub fn run_qemu_stream_tick<T, C>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
     now: Instant,
     mut pcap: Option<&mut PcapWriter>,
@@ -165,7 +212,7 @@ where
             tick.guest_frame_read = true;
             capture_frame(pcap.as_deref_mut(), &frame)?;
             tick.captured_frames += usize::from(pcap.is_some());
-            let result = gateway.handle_guest_frame(frame, now);
+            let result = core.handle_guest_frame(frame, now);
             if let Some(event) = gateway_event_from_outcome(&result.outcome) {
                 tick.gateway_events.push(event);
             }
@@ -183,7 +230,7 @@ where
         FrameRead::Eof => tick.eof = true,
     }
 
-    let pump = pump_proxy_once(frame_io, gateway, proxy, now, pcap.as_deref_mut())?;
+    let pump = pump_proxy_once(frame_io, core, proxy, now, pcap.as_deref_mut())?;
     tick.guest_frames_written += pump.guest_frames_written;
     tick.captured_frames += pump.guest_frames_written;
     tick.proxy_events = pump.events;
@@ -193,15 +240,27 @@ where
 pub fn serve_vmnet_gateway(
     config: VmnetRuntimeConfig,
 ) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
+    let span = info_span!(
+        "vmnet.runtime",
+        socket = %config.socket_path.display(),
+        event_log = ?config.event_log_path,
+        upstream_mapping_count = config.upstream_mappings.len(),
+        host_listener_count = config.policy.host_listeners.len(),
+        default_egress_action = ?config.policy.egress.default_action,
+    );
+    let _span_guard = span.enter();
+    info!("binding vmnet gateway socket");
     let endpoint = VmnetStreamEndpoint::bind(&config.socket_path)?;
     let mut frame_io = endpoint.accept_one_nonblocking()?;
+    info!("accepted qemu vmnet stream");
     let started = StdInstant::now();
-    let mut gateway = VmnetGateway::new_with_dns_upstream(
+    let gateway = VmnetGateway::new_with_dns_upstream(
         &config.policy,
         &config.network,
         smoltcp_now(started),
         default_dns_upstream(),
     )?;
+    let mut core = VmnetCore::new(gateway);
     let connector = MappedTcpConnector {
         base: StdTcpConnector {
             timeout: config.upstream_connect_timeout,
@@ -230,6 +289,10 @@ pub fn serve_vmnet_gateway(
             config.service_io_limits,
         )?;
     let host_listeners = HostIngressListenerSet::bind(&config.policy.host_listeners)?;
+    info!(
+        host_listener_count = config.policy.host_listeners.len(),
+        "vmnet host listeners bound"
+    );
     let mut stats = VmnetRuntimeStats::default();
     let mut event_log = open_event_log(config.event_log_path.as_deref())?;
     let mut pcap = open_pcap_capture(&config)?;
@@ -253,7 +316,7 @@ pub fn serve_vmnet_gateway(
     )?;
 
     loop {
-        let poll_timeout = gateway.tcp_poll_delay(smoltcp_now(started));
+        let poll_timeout = core.tcp_poll_delay(smoltcp_now(started));
         let ready_events = poller.poll(poll_timeout)?;
         let now = smoltcp_now(started);
         let mut gateway_events = Vec::new();
@@ -262,7 +325,7 @@ pub fn serve_vmnet_gateway(
         let dispatch = RuntimeReadyDispatch::from_events(&ready_events);
 
         if ready_events.is_empty() {
-            let guest_frames = gateway.poll_tcp(now);
+            let guest_frames = core.poll_tcp(now);
             let mut frame_stats = VmnetRuntimeStats::default();
             let captured = write_guest_frames(
                 &mut frame_io,
@@ -276,6 +339,11 @@ pub fn serve_vmnet_gateway(
         }
 
         if dispatch.qemu_read_closed {
+            info!(
+                guest_frames_read = stats.guest_frames_read,
+                guest_frames_written = stats.guest_frames_written,
+                "qemu vmnet stream closed"
+            );
             return Ok(stats);
         }
         if dispatch.qemu_readable {
@@ -286,7 +354,7 @@ pub fn serve_vmnet_gateway(
                         poll_all_host_ingress = true;
                         capture_frame(pcap.as_mut(), &frame)?;
                         match handle_guest_frame_with_dns_worker(
-                            &mut gateway,
+                            &mut core,
                             &mut dns_service,
                             &dns_worker,
                             frame,
@@ -310,13 +378,20 @@ pub fn serve_vmnet_gateway(
                         }
                     }
                     FrameRead::WouldBlock => break,
-                    FrameRead::Eof => return Ok(stats),
+                    FrameRead::Eof => {
+                        info!(
+                            guest_frames_read = stats.guest_frames_read,
+                            guest_frames_written = stats.guest_frames_written,
+                            "qemu vmnet stream reached EOF"
+                        );
+                        return Ok(stats);
+                    }
                 }
             }
         }
 
         let mut tcp_connect_events = submit_tcp_connects_to_worker(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut tcp_connect_service,
             &tcp_connect_worker,
@@ -325,7 +400,7 @@ pub fn serve_vmnet_gateway(
 
         if dispatch.service_io {
             let _ = service_wakeup.drain()?;
-            let drain = drain_dns_worker_completions(&mut gateway, &mut dns_service, &dns_worker);
+            let drain = drain_dns_worker_completions(&mut core, &mut dns_service, &dns_worker);
             for result in drain.guest_results {
                 if let Some(event) = gateway_event_from_outcome(&result.outcome) {
                     gateway_events.push(event);
@@ -340,7 +415,7 @@ pub fn serve_vmnet_gateway(
                 stats.guest_frames_written += frame_stats.guest_frames_written;
             }
             let drain = drain_tcp_connect_worker_completions(
-                &mut gateway,
+                &mut core,
                 &mut proxy,
                 &mut tcp_connect_service,
                 &tcp_connect_worker,
@@ -374,38 +449,22 @@ pub fn serve_vmnet_gateway(
         }
 
         for accepted in host_accept_queue.drain_ready() {
-            match host_ingress.open_session(
-                &mut gateway,
-                accepted.guest_port,
-                accepted.connection,
-                now,
-            ) {
-                Ok(open) => {
-                    let mut frame_stats = VmnetRuntimeStats::default();
-                    write_guest_frames(
-                        &mut frame_io,
-                        &open.guest_frames,
-                        &mut frame_stats,
-                        pcap.as_mut(),
-                    )?;
-                    stats.guest_frames_written += frame_stats.guest_frames_written;
-                    host_events.push(HostIngressEvent::Opened {
-                        handle: open.handle,
-                        guest_port: open.guest_port,
-                        purpose: accepted.purpose,
-                    });
-                }
-                Err(error) => host_events.push(HostIngressEvent::OpenFailed {
-                    guest_port: accepted.guest_port,
-                    purpose: accepted.purpose,
-                    error: format!("{error:?}"),
-                }),
-            }
+            let (guest_frames, event) =
+                open_host_ingress_session(&mut core, &mut host_ingress, accepted, now);
+            let mut frame_stats = VmnetRuntimeStats::default();
+            write_guest_frames(
+                &mut frame_io,
+                &guest_frames,
+                &mut frame_stats,
+                pcap.as_mut(),
+            )?;
+            stats.guest_frames_written += frame_stats.guest_frames_written;
+            host_events.push(event);
         }
 
         let mut proxy_pump = pump_proxy_ready(
             &mut frame_io,
-            &mut gateway,
+            &mut core,
             &mut proxy,
             now,
             TcpProxyReadiness::selected(dispatch.proxy_readable, dispatch.proxy_writable),
@@ -424,7 +483,7 @@ pub fn serve_vmnet_gateway(
 
         let host_pump = pump_host_ingress_ready(
             &mut frame_io,
-            &mut gateway,
+            &mut core,
             &mut host_ingress,
             now,
             if poll_all_host_ingress {
@@ -510,22 +569,22 @@ enum VmnetDnsServiceFrame {
 
 #[allow(dead_code)]
 fn handle_guest_frame_with_dns_service<C>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
     frame: Vec<u8>,
     now: Instant,
 ) -> VmnetDnsServiceFrame {
-    match gateway.handle_guest_frame_with_deferred_dns(frame, now) {
+    match core.handle_guest_frame_with_deferred_dns(frame, now) {
         VmnetDeferredDnsFrame::Immediate(result) => VmnetDnsServiceFrame::Immediate(result),
         VmnetDeferredDnsFrame::Forward(pending) => {
             match service.submit(pending, |pending, token| pending.service_command(token)) {
                 Ok(token) => VmnetDnsServiceFrame::Queued { token },
                 Err(full) => {
-                    let result = gateway.complete_pending_dns_query(
+                    let result = core.complete_pending_dns_query(
                         full.pending,
                         Err(DnsUpstreamError::Unavailable),
                     );
-                    VmnetDnsServiceFrame::QueueFull(dns_frame_result_to_guest(result))
+                    VmnetDnsServiceFrame::QueueFull(result)
                 }
             }
         }
@@ -534,13 +593,13 @@ fn handle_guest_frame_with_dns_service<C>(
 
 #[allow(dead_code)]
 fn handle_guest_frame_with_dns_worker<C>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
     worker: &VmnetDnsWorkerHandle<C>,
     frame: Vec<u8>,
     now: Instant,
 ) -> VmnetDnsServiceFrame {
-    match gateway.handle_guest_frame_with_deferred_dns(frame, now) {
+    match core.handle_guest_frame_with_deferred_dns(frame, now) {
         VmnetDeferredDnsFrame::Immediate(result) => VmnetDnsServiceFrame::Immediate(result),
         VmnetDeferredDnsFrame::Forward(pending) => match service.submit_to(
             pending,
@@ -549,9 +608,9 @@ fn handle_guest_frame_with_dns_worker<C>(
         ) {
             Ok(token) => VmnetDnsServiceFrame::Queued { token },
             Err(error) => {
-                let result = gateway
+                let result = core
                     .complete_pending_dns_query(error.pending, Err(DnsUpstreamError::Unavailable));
-                VmnetDnsServiceFrame::QueueFull(dns_frame_result_to_guest(result))
+                VmnetDnsServiceFrame::QueueFull(result)
             }
         },
     }
@@ -559,15 +618,15 @@ fn handle_guest_frame_with_dns_worker<C>(
 
 #[allow(dead_code)]
 fn apply_dns_service_completion<C>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
     completion: VmnetServiceCompletion<C>,
 ) -> Option<GuestFrameResult> {
     let pending = service.remove_pending_for_completion(&completion)?;
     match completion {
-        VmnetServiceCompletion::DnsLookup(completion) => Some(dns_frame_result_to_guest(
-            gateway.complete_pending_dns_query(pending, completion.result),
-        )),
+        VmnetServiceCompletion::DnsLookup(completion) => {
+            Some(core.complete_pending_dns_query(pending, completion.result))
+        }
         VmnetServiceCompletion::TcpConnect(_)
         | VmnetServiceCompletion::ByteIo(_)
         | VmnetServiceCompletion::Cancelled(_) => None,
@@ -583,7 +642,7 @@ struct VmnetDnsServiceDrain {
 
 #[allow(dead_code)]
 fn drain_dns_worker_completions<C>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
     worker: &VmnetDnsWorkerHandle<C>,
 ) -> VmnetDnsServiceDrain {
@@ -591,7 +650,7 @@ fn drain_dns_worker_completions<C>(
     loop {
         match worker.try_recv_completion() {
             Ok(completion) => {
-                if let Some(result) = apply_dns_service_completion(gateway, service, completion) {
+                if let Some(result) = apply_dns_service_completion(core, service, completion) {
                     drain.guest_results.push(result);
                 }
             }
@@ -600,7 +659,7 @@ fn drain_dns_worker_completions<C>(
                 drain.disconnected = true;
                 drain
                     .guest_results
-                    .extend(fail_pending_dns_service_queries(gateway, service));
+                    .extend(fail_pending_dns_service_queries(core, service));
                 return drain;
             }
         }
@@ -609,23 +668,21 @@ fn drain_dns_worker_completions<C>(
 
 #[allow(dead_code)]
 fn fail_pending_dns_service_queries<C>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
 ) -> Vec<GuestFrameResult> {
     service
         .drain_pending()
         .into_iter()
         .map(|(_token, pending)| {
-            dns_frame_result_to_guest(
-                gateway.complete_pending_dns_query(pending, Err(DnsUpstreamError::Unavailable)),
-            )
+            core.complete_pending_dns_query(pending, Err(DnsUpstreamError::Unavailable))
         })
         .collect()
 }
 
 #[allow(dead_code)]
 fn submit_tcp_connects_to_worker<T>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
     worker: &VmnetTcpConnectWorkerHandle<T::Connection>,
@@ -635,7 +692,7 @@ where
     T: TcpUpstreamConnector,
 {
     let mut events = Vec::new();
-    for plan in proxy.plan_connects_for_service(gateway) {
+    for plan in proxy.plan_connects_for_service(core.gateway_mut()) {
         match plan {
             TcpProxyConnectPlan::Event(event) => events.push(event),
             TcpProxyConnectPlan::Pending(pending) => {
@@ -648,7 +705,7 @@ where
                     Ok(_) => proxy.mark_connect_pending(handle),
                     Err(error) => {
                         let _ = proxy.complete_connect(
-                            gateway,
+                            core.gateway_mut(),
                             error.pending,
                             Err(TcpConnectError::UpstreamUnavailable),
                             now,
@@ -664,7 +721,7 @@ where
 
 #[allow(dead_code)]
 fn apply_tcp_connect_service_completion<T>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
     completion: VmnetServiceCompletion<T::Connection>,
@@ -680,7 +737,13 @@ where
         return Vec::new();
     };
     let mut events = Vec::new();
-    let _ = proxy.complete_connect(gateway, pending, completion.result, now, &mut events);
+    let _ = proxy.complete_connect(
+        core.gateway_mut(),
+        pending,
+        completion.result,
+        now,
+        &mut events,
+    );
     events
 }
 
@@ -693,7 +756,7 @@ struct VmnetTcpConnectServiceDrain {
 
 #[allow(dead_code)]
 fn drain_tcp_connect_worker_completions<T>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
     worker: &VmnetTcpConnectWorkerHandle<T::Connection>,
@@ -707,7 +770,7 @@ where
         match worker.try_recv_completion() {
             Ok(completion) => {
                 drain.events.extend(apply_tcp_connect_service_completion(
-                    gateway, proxy, service, completion, now,
+                    core, proxy, service, completion, now,
                 ));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => return drain,
@@ -715,7 +778,7 @@ where
                 drain.disconnected = true;
                 drain
                     .events
-                    .extend(fail_pending_tcp_connects(gateway, proxy, service, now));
+                    .extend(fail_pending_tcp_connects(core, proxy, service, now));
                 return drain;
             }
         }
@@ -724,7 +787,7 @@ where
 
 #[allow(dead_code)]
 fn fail_pending_tcp_connects<T>(
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
     service: &mut VmnetServiceOwner<TcpProxyPendingConnect, T::Connection>,
     now: Instant,
@@ -735,7 +798,7 @@ where
     let mut events = Vec::new();
     for (_token, pending) in service.drain_pending() {
         let _ = proxy.complete_connect(
-            gateway,
+            core.gateway_mut(),
             pending,
             Err(TcpConnectError::UpstreamUnavailable),
             now,
@@ -804,6 +867,37 @@ fn sync_host_ingress_registrations(
     Ok(())
 }
 
+fn open_host_ingress_session<C>(
+    core: &mut VmnetCore<'_>,
+    bridge: &mut HostIngressBridge<C>,
+    accepted: AcceptedHostConnection<C>,
+    now: Instant,
+) -> (Vec<Vec<u8>>, HostIngressEvent) {
+    match bridge.open_session(
+        core.gateway_mut(),
+        accepted.guest_port,
+        accepted.connection,
+        now,
+    ) {
+        Ok(open) => (
+            open.guest_frames,
+            HostIngressEvent::Opened {
+                handle: open.handle,
+                guest_port: open.guest_port,
+                purpose: accepted.purpose,
+            },
+        ),
+        Err(error) => (
+            Vec::new(),
+            HostIngressEvent::OpenFailed {
+                guest_port: accepted.guest_port,
+                purpose: accepted.purpose,
+                error: format!("{error:?}"),
+            },
+        ),
+    }
+}
+
 fn sync_proxy_registrations(
     poller: &mut RuntimePoller,
     proxy: &TcpProxyBridge<MappedTcpConnector>,
@@ -826,7 +920,7 @@ fn sync_proxy_registrations(
 
 pub fn pump_proxy_once<T, C>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
     now: Instant,
     pcap: Option<&mut PcapWriter>,
@@ -836,19 +930,12 @@ where
     C: TcpUpstreamConnector,
     C::Connection: Read + Write,
 {
-    pump_proxy_ready(
-        frame_io,
-        gateway,
-        proxy,
-        now,
-        TcpProxyReadiness::all(),
-        pcap,
-    )
+    pump_proxy_ready(frame_io, core, proxy, now, TcpProxyReadiness::all(), pcap)
 }
 
 pub fn pump_proxy_ready<T, C>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
     now: Instant,
     readiness: TcpProxyReadiness,
@@ -860,7 +947,7 @@ where
     C::Connection: Read + Write,
 {
     let mut pump = VmnetProxyPump::default();
-    for event in proxy.process_gateway_with_readiness(gateway, now, readiness) {
+    for event in proxy.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
         let mut stats = VmnetRuntimeStats::default();
         write_proxy_event_guest_frames(
             frame_io,
@@ -902,7 +989,7 @@ where
 
 pub fn pump_host_ingress_once<T>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     bridge: &mut HostIngressBridge<std::net::TcpStream>,
     listeners: &HostIngressListenerSet,
     now: Instant,
@@ -914,29 +1001,17 @@ where
     let mut pump = VmnetHostIngressPump::default();
     for accepted in listeners.accept_pending() {
         let accepted = accepted?;
-        match bridge.open_session(gateway, accepted.guest_port, accepted.connection, now) {
-            Ok(open) => {
-                for frame in &open.guest_frames {
-                    capture_frame(pcap.as_deref_mut(), frame)?;
-                    frame_io.write_frame(frame)?;
-                    pump.guest_frames_written += 1;
-                }
-                pump.events.push(HostIngressEvent::Opened {
-                    handle: open.handle,
-                    guest_port: open.guest_port,
-                    purpose: accepted.purpose,
-                });
-            }
-            Err(error) => pump.events.push(HostIngressEvent::OpenFailed {
-                guest_port: accepted.guest_port,
-                purpose: accepted.purpose,
-                error: format!("{error:?}"),
-            }),
+        let (guest_frames, event) = open_host_ingress_session(core, bridge, accepted, now);
+        for frame in &guest_frames {
+            capture_frame(pcap.as_deref_mut(), frame)?;
+            frame_io.write_frame(frame)?;
+            pump.guest_frames_written += 1;
         }
+        pump.events.push(event);
     }
     let ready = pump_host_ingress_ready(
         frame_io,
-        gateway,
+        core,
         bridge,
         now,
         HostIngressReadiness::all(),
@@ -949,7 +1024,7 @@ where
 
 pub fn pump_host_ingress_ready<T>(
     frame_io: &mut QemuFrameIo<T>,
-    gateway: &mut VmnetGateway<'_>,
+    core: &mut VmnetCore<'_>,
     bridge: &mut HostIngressBridge<std::net::TcpStream>,
     now: Instant,
     readiness: HostIngressReadiness,
@@ -959,7 +1034,7 @@ where
     T: Read + Write,
 {
     let mut pump = VmnetHostIngressPump::default();
-    for event in bridge.process_gateway_with_readiness(gateway, now, readiness) {
+    for event in bridge.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
         if let HostIngressEvent::HostPayload { guest_frames, .. }
         | HostIngressEvent::HostClosed { guest_frames, .. }
         | HostIngressEvent::BufferLimitExceeded { guest_frames, .. } = &event
@@ -1002,23 +1077,59 @@ fn capture_frame(pcap: Option<&mut PcapWriter>, frame: &[u8]) -> Result<(), Vmne
 }
 
 fn write_proxy_events(log: &mut Option<File>, events: &[TcpProxyEvent]) -> io::Result<()> {
-    let Some(log) = log else {
-        return Ok(());
-    };
     for event in events {
-        writeln!(log, "{}", format_proxy_event(event))?;
+        trace_proxy_event(event);
+        if let Some(log) = log.as_mut() {
+            writeln!(log, "{}", format_proxy_event(event))?;
+        }
     }
-    log.flush()
+    if let Some(log) = log.as_mut() {
+        log.flush()?;
+    }
+    Ok(())
 }
 
 fn write_gateway_events(log: &mut Option<File>, events: &[VmnetGatewayEvent]) -> io::Result<()> {
-    let Some(log) = log else {
-        return Ok(());
-    };
     for event in events {
-        writeln!(log, "{}", format_gateway_event(event))?;
+        trace_gateway_event(event);
+        if let Some(log) = log.as_mut() {
+            writeln!(log, "{}", format_gateway_event(event))?;
+        }
     }
-    log.flush()
+    if let Some(log) = log.as_mut() {
+        log.flush()?;
+    }
+    Ok(())
+}
+
+fn trace_gateway_event(event: &VmnetGatewayEvent) {
+    let event_kind = gateway_event_kind(event);
+    let event_detail = format_gateway_event(event);
+    if gateway_event_is_failure(event) {
+        warn!(event_kind, event = %event_detail, "vmnet gateway event");
+    } else {
+        debug!(event_kind, event = %event_detail, "vmnet gateway event");
+    }
+}
+
+fn gateway_event_kind(event: &VmnetGatewayEvent) -> &'static str {
+    match event {
+        VmnetGatewayEvent::DnsQuery { .. } => "dns_query",
+        VmnetGatewayEvent::UdpDenied(_) => "udp_denied",
+        VmnetGatewayEvent::UnsupportedProtocol(_) => "unsupported_protocol",
+        VmnetGatewayEvent::TcpDenied { .. } => "tcp_denied_preaccept",
+        VmnetGatewayEvent::TcpSetupFailed { .. } => "tcp_setup_failed_preaccept",
+    }
+}
+
+fn gateway_event_is_failure(event: &VmnetGatewayEvent) -> bool {
+    matches!(
+        event,
+        VmnetGatewayEvent::UdpDenied(_)
+            | VmnetGatewayEvent::UnsupportedProtocol(_)
+            | VmnetGatewayEvent::TcpDenied { .. }
+            | VmnetGatewayEvent::TcpSetupFailed { .. }
+    )
 }
 
 fn format_gateway_event(event: &VmnetGatewayEvent) -> String {
@@ -1091,13 +1202,62 @@ fn write_host_ingress_events(
     log: &mut Option<File>,
     events: &[HostIngressEvent],
 ) -> io::Result<()> {
-    let Some(log) = log else {
-        return Ok(());
-    };
     for event in events {
-        writeln!(log, "{}", format_host_ingress_event(event))?;
+        trace_host_ingress_event(event);
+        if let Some(log) = log.as_mut() {
+            writeln!(log, "{}", format_host_ingress_event(event))?;
+        }
     }
-    log.flush()
+    if let Some(log) = log.as_mut() {
+        log.flush()?;
+    }
+    Ok(())
+}
+
+fn trace_host_ingress_event(event: &HostIngressEvent) {
+    let event_kind = host_ingress_event_kind(event);
+    let event_detail = format_host_ingress_event(event);
+    if host_ingress_event_is_failure(event) {
+        warn!(event_kind, event = %event_detail, "vmnet host ingress event");
+    } else {
+        debug!(event_kind, event = %event_detail, "vmnet host ingress event");
+    }
+}
+
+fn host_ingress_event_kind(event: &HostIngressEvent) -> &'static str {
+    match event {
+        HostIngressEvent::Opened { .. } => "host_ingress_opened",
+        HostIngressEvent::OpenFailed { .. } => "host_ingress_open_failed",
+        HostIngressEvent::AcceptQueueFull { .. } => "host_ingress_accept_queue_full",
+        HostIngressEvent::AcceptLimitReached { .. } => "host_ingress_accept_limit_reached",
+        HostIngressEvent::HostPayload { .. } => "host_ingress_host_payload",
+        HostIngressEvent::GuestPayload { .. } => "host_ingress_guest_payload",
+        HostIngressEvent::HostClosed { .. } => "host_ingress_host_closed",
+        HostIngressEvent::GuestClosed { .. } => "host_ingress_guest_closed",
+        HostIngressEvent::GuestReadFailed { .. } => "host_ingress_guest_read_failed",
+        HostIngressEvent::GuestWriteFailed { .. } => "host_ingress_guest_write_failed",
+        HostIngressEvent::HostReadFailed { .. } => "host_ingress_host_read_failed",
+        HostIngressEvent::HostReadLimitReached { .. } => "host_ingress_host_read_limit_reached",
+        HostIngressEvent::HostWriteLimitReached { .. } => "host_ingress_host_write_limit_reached",
+        HostIngressEvent::HostWriteFailed { .. } => "host_ingress_host_write_failed",
+        HostIngressEvent::BufferLimitExceeded { .. } => "host_ingress_buffer_limit_exceeded",
+    }
+}
+
+fn host_ingress_event_is_failure(event: &HostIngressEvent) -> bool {
+    matches!(
+        event,
+        HostIngressEvent::OpenFailed { .. }
+            | HostIngressEvent::AcceptQueueFull { .. }
+            | HostIngressEvent::AcceptLimitReached { .. }
+            | HostIngressEvent::GuestReadFailed { .. }
+            | HostIngressEvent::GuestWriteFailed { .. }
+            | HostIngressEvent::HostReadFailed { .. }
+            | HostIngressEvent::HostReadLimitReached { .. }
+            | HostIngressEvent::HostWriteLimitReached { .. }
+            | HostIngressEvent::HostWriteFailed { .. }
+            | HostIngressEvent::BufferLimitExceeded { .. }
+    )
 }
 
 fn format_host_ingress_event(event: &HostIngressEvent) -> String {
@@ -1203,6 +1363,54 @@ fn format_host_ingress_event(event: &HostIngressEvent) -> String {
             guest_frames.len()
         ),
     }
+}
+
+fn trace_proxy_event(event: &TcpProxyEvent) {
+    let event_kind = proxy_event_kind(event);
+    let event_detail = format_proxy_event(event);
+    if proxy_event_is_failure(event) {
+        warn!(event_kind, event = %event_detail, "vmnet proxy event");
+    } else {
+        debug!(event_kind, event = %event_detail, "vmnet proxy event");
+    }
+}
+
+fn proxy_event_kind(event: &TcpProxyEvent) -> &'static str {
+    match event {
+        TcpProxyEvent::Connected { .. } => "tcp_connected",
+        TcpProxyEvent::Denied { .. } => "tcp_denied",
+        TcpProxyEvent::ConnectFailed { .. } => "tcp_connect_failed",
+        TcpProxyEvent::GuestPayload { .. } => "guest_payload",
+        TcpProxyEvent::HttpRequest { .. } => "http_request",
+        TcpProxyEvent::HttpRequestIncomplete { .. } => "http_request_incomplete",
+        TcpProxyEvent::HttpRequestMalformed { .. } => "http_request_malformed",
+        TcpProxyEvent::UpstreamPayload { .. } => "upstream_payload",
+        TcpProxyEvent::TlsHandshakePayload { .. } => "tls_handshake_payload",
+        TcpProxyEvent::TlsUpstreamPayload { .. } => "tls_upstream_payload",
+        TcpProxyEvent::TlsMitmUnavailable { .. } => "tls_mitm_unavailable",
+        TcpProxyEvent::TlsMitmFailed { .. } => "tls_mitm_failed",
+        TcpProxyEvent::BufferLimitExceeded { .. } => "proxy_buffer_limit_exceeded",
+        TcpProxyEvent::GuestReadFailed { .. } => "guest_read_failed",
+        TcpProxyEvent::GuestWriteFailed { .. } => "guest_write_failed",
+        TcpProxyEvent::UpstreamWriteFailed { .. } => "upstream_write_failed",
+        TcpProxyEvent::UpstreamReadFailed { .. } => "upstream_read_failed",
+    }
+}
+
+fn proxy_event_is_failure(event: &TcpProxyEvent) -> bool {
+    matches!(
+        event,
+        TcpProxyEvent::Denied { .. }
+            | TcpProxyEvent::ConnectFailed { .. }
+            | TcpProxyEvent::HttpRequestMalformed { .. }
+            | TcpProxyEvent::TlsMitmUnavailable { .. }
+            | TcpProxyEvent::TlsMitmFailed { .. }
+            | TcpProxyEvent::BufferLimitExceeded { .. }
+            | TcpProxyEvent::GuestReadFailed { .. }
+            | TcpProxyEvent::GuestWriteFailed { .. }
+            | TcpProxyEvent::UpstreamWriteFailed { .. }
+            | TcpProxyEvent::UpstreamReadFailed { .. }
+    )
 }
 
 fn format_proxy_event(event: &TcpProxyEvent) -> String {
@@ -1413,6 +1621,23 @@ mod tests {
     const PUBLIC_IP: Ipv4Address = Ipv4Address::new(93, 184, 216, 34);
 
     #[test]
+    fn vmnet_core_handles_guest_frames_without_runtime_io() {
+        let network = GuestNetwork::default();
+        let policy = VmnetPolicy::default_sandbox(network.clone());
+        let gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut core = VmnetCore::new(gateway);
+
+        let result = core.handle_guest_frame(
+            test_support::udp_frame(53000, 443, test_support::TEST_GUEST_IP, PUBLIC_IP, b"quic"),
+            Instant::from_millis(1),
+        );
+
+        assert!(matches!(result.outcome, GuestFrameOutcome::UdpDenied(_)));
+        assert!(result.guest_frames.is_empty());
+    }
+
+    #[test]
     fn runtime_ready_dispatch_classifies_simultaneous_sources() {
         let handle = smoltcp::iface::SocketHandle::default();
         let dispatch = RuntimeReadyDispatch::from_events(&[
@@ -1471,19 +1696,20 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        let mut gateway = VmnetGateway::new_with_dns_upstream(
+        let gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
             Instant::from_millis(0),
             Box::new(PanicDnsUpstream),
         )
         .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
                 .expect("service");
 
         let step = handle_guest_frame_with_dns_service(
-            &mut gateway,
+            &mut core,
             &mut service,
             test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
             Instant::from_millis(1),
@@ -1504,7 +1730,7 @@ mod tests {
             ))
             .expect("completion");
         let completion = service.owner_recv_completion().expect("owner completion");
-        let result = apply_dns_service_completion(&mut gateway, &mut service, completion)
+        let result = apply_dns_service_completion(&mut core, &mut service, completion)
             .expect("applied completion");
 
         let GuestFrameOutcome::DnsQuery { log } = result.outcome else {
@@ -1520,26 +1746,27 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        let mut gateway = VmnetGateway::new_with_dns_upstream(
+        let gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
             Instant::from_millis(0),
             Box::new(PanicDnsUpstream),
         )
         .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(1, 1))
                 .expect("service");
 
         let first = handle_guest_frame_with_dns_service(
-            &mut gateway,
+            &mut core,
             &mut service,
             test_support::dns_query_frame("one.example", test_support::TEST_DNS_IP, 53000),
             Instant::from_millis(1),
         );
         assert!(matches!(first, VmnetDnsServiceFrame::Queued { .. }));
         let second = handle_guest_frame_with_dns_service(
-            &mut gateway,
+            &mut core,
             &mut service,
             test_support::dns_query_frame("two.example", test_support::TEST_DNS_IP, 53001),
             Instant::from_millis(2),
@@ -1562,13 +1789,14 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        let mut gateway = VmnetGateway::new_with_dns_upstream(
+        let gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
             Instant::from_millis(0),
             Box::new(PanicDnsUpstream),
         )
         .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
                 .expect("service");
@@ -1588,7 +1816,7 @@ mod tests {
         )
         .expect("dns worker");
 
-        let deferred = gateway.handle_guest_frame_with_deferred_dns(
+        let deferred = core.handle_guest_frame_with_deferred_dns(
             test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
             Instant::from_millis(1),
         );
@@ -1611,7 +1839,7 @@ mod tests {
             .iter()
             .any(|event| { event.source == VmnetEventSource::ServiceIo && event.readable }));
         assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let drain = drain_dns_worker_completions(&mut gateway, &mut service, &worker);
+        let drain = drain_dns_worker_completions(&mut core, &mut service, &worker);
 
         assert!(!drain.disconnected);
         assert_eq!(drain.guest_results.len(), 1);
@@ -1633,13 +1861,14 @@ mod tests {
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
         policy.egress.allow_ips.push(PUBLIC_IP.to_string());
-        let mut gateway = VmnetGateway::new_with_dns_upstream(
+        let gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
             Instant::from_millis(0),
             Box::new(PanicDnsUpstream),
         )
         .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
                 .expect("service");
@@ -1663,7 +1892,7 @@ mod tests {
         .expect("dns worker");
 
         let dns = handle_guest_frame_with_dns_worker(
-            &mut gateway,
+            &mut core,
             &mut service,
             &worker,
             test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
@@ -1673,7 +1902,7 @@ mod tests {
         assert_eq!(service.pending_len(), 1);
 
         let tcp = handle_guest_frame_with_dns_worker(
-            &mut gateway,
+            &mut core,
             &mut service,
             &worker,
             test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, 80),
@@ -1697,7 +1926,7 @@ mod tests {
             .iter()
             .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
         assert!(wakeup.drain().expect("drain wakeup") > 0);
-        let drain = drain_dns_worker_completions(&mut gateway, &mut service, &worker);
+        let drain = drain_dns_worker_completions(&mut core, &mut service, &worker);
         assert_eq!(drain.guest_results.len(), 1);
         assert_eq!(service.pending_len(), 0);
         worker.shutdown().expect("worker shutdown");
@@ -1738,9 +1967,10 @@ mod tests {
             Ok(token) => token,
             Err(_) => panic!("submit pending connect"),
         };
+        let mut core = VmnetCore::new(gateway);
 
         let events = apply_tcp_connect_service_completion(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             VmnetServiceCompletion::TcpConnect(VmnetTcpConnectCompletion {
@@ -1800,9 +2030,10 @@ mod tests {
             Ok(token) => token,
             Err(_) => panic!("submit pending connect"),
         };
+        let mut core = VmnetCore::new(gateway);
 
         let events = apply_tcp_connect_service_completion(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             VmnetServiceCompletion::TcpConnect(VmnetTcpConnectCompletion {
@@ -1853,8 +2084,9 @@ mod tests {
         )
         .expect("tcp connect worker");
 
+        let mut core = VmnetCore::new(gateway);
         let events = submit_tcp_connects_to_worker(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             &worker,
@@ -1865,7 +2097,7 @@ mod tests {
         assert_eq!(service.pending_len(), 1);
         assert!(proxy.has_pending_connect(active.handle));
         assert!(proxy
-            .process_gateway(&mut gateway, Instant::from_millis(5))
+            .process_gateway(core.gateway_mut(), Instant::from_millis(5))
             .is_empty());
         worker.shutdown().expect("worker shutdown");
     }
@@ -1909,8 +2141,9 @@ mod tests {
         )
         .expect("tcp connect worker");
 
+        let mut core = VmnetCore::new(gateway);
         let events = submit_tcp_connects_to_worker(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             &worker,
@@ -1923,7 +2156,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(500))
             .expect("worker started blocked connect");
 
-        let unrelated = gateway.handle_guest_frame(
+        let unrelated = core.handle_guest_frame(
             tcp_frame(81, TcpControl::Syn, TcpSeqNumber(700), None, &[]),
             Instant::from_millis(5),
         );
@@ -1943,7 +2176,7 @@ mod tests {
             .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
         assert!(wakeup.drain().expect("drain wakeup") > 0);
         let drain = drain_tcp_connect_worker_completions(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             &worker,
@@ -2024,8 +2257,9 @@ mod tests {
             .iter()
             .any(|event| event.source == VmnetEventSource::ServiceIo && event.readable));
         assert!(wakeup.drain().expect("drain wakeup") > 0);
+        let mut core = VmnetCore::new(gateway);
         let drain = drain_tcp_connect_worker_completions(
-            &mut gateway,
+            &mut core,
             &mut proxy,
             &mut service,
             &worker,
@@ -2051,17 +2285,18 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        let mut gateway = VmnetGateway::new_with_dns_upstream(
+        let gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
             Instant::from_millis(0),
             Box::new(PanicDnsUpstream),
         )
         .expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut service =
             VmnetServiceOwner::<VmnetPendingDnsQuery, ()>::new(VmnetServiceIoLimits::new(2, 2))
                 .expect("service");
-        let deferred = gateway.handle_guest_frame_with_deferred_dns(
+        let deferred = core.handle_guest_frame_with_deferred_dns(
             test_support::dns_query_frame("example.com", test_support::TEST_DNS_IP, 53000),
             Instant::from_millis(1),
         );
@@ -2079,7 +2314,7 @@ mod tests {
             panic!("submit pending dns");
         }
 
-        let results = fail_pending_dns_service_queries(&mut gateway, &mut service);
+        let results = fail_pending_dns_service_queries(&mut core, &mut service);
 
         assert_eq!(results.len(), 1);
         let GuestFrameOutcome::DnsQuery { log } = &results[0].outcome else {
@@ -2133,12 +2368,9 @@ mod tests {
         }
         proxy.mark_connect_pending(active.handle);
 
-        let events = fail_pending_tcp_connects(
-            &mut gateway,
-            &mut proxy,
-            &mut service,
-            Instant::from_millis(5),
-        );
+        let mut core = VmnetCore::new(gateway);
+        let events =
+            fail_pending_tcp_connects(&mut core, &mut proxy, &mut service, Instant::from_millis(5));
 
         let failed = events
             .iter()
@@ -2158,8 +2390,9 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.allow_ips.push(PUBLIC_IP.to_string());
-        let mut gateway =
+        let gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut proxy = TcpProxyBridge::new(FakeConnector {
             response: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
             block_reads: 0,
@@ -2167,7 +2400,7 @@ mod tests {
         let mut io = QemuFrameIo::new(ScriptedIo::new(), DEFAULT_MAX_FRAME_LEN);
         let mut millis = 1;
 
-        let stats = run_qemu_stream_until_eof(&mut io, &mut gateway, &mut proxy, || {
+        let stats = run_qemu_stream_until_eof(&mut io, &mut core, &mut proxy, || {
             let now = Instant::from_millis(millis);
             millis += 1;
             now
@@ -2200,8 +2433,9 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.allow_ips.push(PUBLIC_IP.to_string());
-        let mut gateway =
+        let gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut core = VmnetCore::new(gateway);
         let mut proxy = TcpProxyBridge::new(FakeConnector {
             response: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec(),
             block_reads: 2,
@@ -2209,7 +2443,7 @@ mod tests {
         let mut io = QemuFrameIo::new(ScriptedIo::new(), DEFAULT_MAX_FRAME_LEN);
         let mut millis = 1;
 
-        let stats = run_qemu_stream_until_eof(&mut io, &mut gateway, &mut proxy, || {
+        let stats = run_qemu_stream_until_eof(&mut io, &mut core, &mut proxy, || {
             let now = Instant::from_millis(millis);
             millis += 1;
             now
@@ -2222,7 +2456,7 @@ mod tests {
 
         let pump = pump_proxy_once(
             &mut io,
-            &mut gateway,
+            &mut core,
             &mut proxy,
             Instant::from_millis(millis),
             None,

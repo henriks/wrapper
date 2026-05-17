@@ -67,7 +67,7 @@ Coverage-guided fuzz targets and seed corpora live in `vm-frontend/fuzz/`.
 Run the KVM-required VM-only self-test:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
   self-test \
   --project "$PWD" \
   --run-dir "$PWD/.sandbox/docker-vm/self-test" \

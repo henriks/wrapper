@@ -83,6 +83,18 @@ wait_for_critical_exit
 assert_eq "101
 102" "$(cat "${kill_count}")" "critical service wait order"
 
+assert_eq "python3 -u /usr/local/libexec/agentvm-payload-server" "$(payload_server_command python)" "python payload command"
+assert_eq "python3 -u /usr/local/libexec/agentvm-payload-server" "$(payload_server_command "")" "default payload command"
+if payload_server_command invalid >/tmp/agentvm-invalid-payload-service-log; then
+  fail "invalid payload service unexpectedly succeeded"
+fi
+if payload_server_command rust >/tmp/agentvm-rust-payload-service-log; then
+  fail "missing rust payload service unexpectedly succeeded"
+fi
+if ! grep -q 'rust payload service requested' /tmp/agentvm-rust-payload-service-log; then
+  fail "missing rust payload service failure was not logged"
+fi
+
 ping_count=/tmp/agentvm-docker-ping-count
 : >"${ping_count}"
 docker_socket_exists() { [ "$1" = /var/run/docker.sock ]; }
@@ -107,4 +119,4 @@ if ! grep -q 'dockerd exited before Docker socket became ready' /tmp/agentvm-doc
   fail "dockerd exit readiness failure was not logged"
 fi
 
-rm -f /tmp/agentvm-test-cmdline /tmp/agentvm-missing-value "${calls}" "${kill_count}" "${ping_count}" /tmp/agentvm-docker-ready-log /tmp/agentvm-docker-exit-log
+rm -f /tmp/agentvm-test-cmdline /tmp/agentvm-missing-value /tmp/agentvm-invalid-payload-service-log /tmp/agentvm-rust-payload-service-log "${calls}" "${kill_count}" "${ping_count}" /tmp/agentvm-docker-ready-log /tmp/agentvm-docker-exit-log
