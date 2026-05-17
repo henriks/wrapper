@@ -1899,8 +1899,9 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         })
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "self-test".to_string());
-    let skip_sqlite_concurrency =
-        self_test.skip_sqlite_concurrency || (self_test.docker_net_check && self_test.no_net);
+    let skip_sqlite_concurrency = self_test.skip_sqlite_concurrency
+        || self_test.docker_net_check
+        || self_test.publish_container_port.is_some();
     let sqlite_concurrency_host_db = config
         .project
         .join(format!(".agentvm-self-test-sqlite/{sqlite_db_name}.sqlite"));
@@ -1978,13 +1979,14 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
         )
         .map_err(|error| format!("self-test payload failed: {error}\n{artifacts}"))
     };
-    let host_sqlite_result = if let Some(host_sqlite) = host_sqlite.as_mut() {
+    let host_sqlite_wait_result = if let Some(host_sqlite) = host_sqlite.as_mut() {
         wait_host_sqlite_concurrency(host_sqlite)
-            .and_then(|_| run_host_sqlite_integrity_check(&sqlite_concurrency_host_db))
     } else {
         Ok(())
     };
     println!("self-test: phase=shutting-down-frontend");
+    flush_guest_filesystems(payload_addr)
+        .map_err(|error| format!("self-test guest sync failed: {error}\n{artifacts}"))?;
     running
         .terminate()
         .map_err(|error| format!("self-test shutdown failed: {error}\n{artifacts}"))?;
@@ -1994,8 +1996,12 @@ fn run_self_test(args: &[String]) -> Result<(), String> {
             "self-test payload exited with {exit_code}\n{artifacts}"
         ));
     }
-    host_sqlite_result
+    host_sqlite_wait_result
         .map_err(|error| format!("self-test host sqlite failed: {error}\n{artifacts}"))?;
+    if !skip_sqlite_concurrency {
+        run_host_sqlite_integrity_check(&sqlite_concurrency_host_db)
+            .map_err(|error| format!("self-test host sqlite failed: {error}\n{artifacts}"))?;
+    }
     if self_test.fs_check {
         verify_self_test_fs_check(&config.project)
             .map_err(|error| format!("self-test fs check failed: {error}\n{artifacts}"))?;
@@ -5399,6 +5405,69 @@ mod tests {
         assert!(script.contains("sqlite-home-smoke"));
         assert!(!script.contains("sqlite-concurrency-smoke"));
         assert!(script.contains("docker-deny-ok image=alpine:3.22 policy=deny"));
+    }
+
+    #[test]
+    fn self_test_payload_skips_sqlite_concurrency_for_docker_egress_check() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            true,
+        );
+
+        assert!(script.contains("sqlite-home-smoke"));
+        assert!(!script.contains("sqlite-concurrency-smoke"));
+        assert!(script.contains("docker-egress-ok image=alpine:3.22 policy=allow"));
+    }
+
+    #[test]
+    fn self_test_payload_skips_sqlite_concurrency_for_published_port_check() {
+        let root = frontend_test_root();
+        let config = FrontendConfig::from_artifact_manifest_file(
+            root.join("repo"),
+            root.join(".sandbox/docker-vm/self-test"),
+            "qemu-system-x86_64",
+            root.join("docker/out/artifact-manifest.json"),
+        )
+        .expect("config");
+
+        let script = self_test_payload_script(
+            &config,
+            "alpine:3.22",
+            false,
+            false,
+            false,
+            false,
+            Some(PortPair {
+                host: 12080,
+                guest: 18080,
+            }),
+            false,
+            false,
+            false,
+            true,
+        );
+
+        assert!(script.contains("sqlite-home-smoke"));
+        assert!(!script.contains("sqlite-concurrency-smoke"));
+        assert!(script.contains("docker-publish-ok image=alpine:3.22"));
     }
 
     #[test]

@@ -28,3 +28,9 @@ Return a structured TUI outcome and print a concise post-restore summary to stde
 Validation:
 - PTY/TUI test for a payload that exits nonzero, asserting restored terminal output contains a stable failure summary.
 
+
+## Notes
+
+**2026-05-16T21:46:46Z**
+
+Review after wra-35eb/wra-m7gg: still valid. Plain payload mode now has PayloadSessionOutcome and cancellable runner semantics, but TUI still runs run_payload_viewport -> Result<i32, PayloadClientError> and main.rs maps the error to a string after terminal restore without a structured post-restore failure outcome. This ticket should use the new outcome/policy vocabulary where useful, but it still owns stable stderr summaries for TUI nonzero/protocol/cancel failures.

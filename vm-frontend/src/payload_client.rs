@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Mutex,
@@ -65,6 +65,8 @@ pub enum PayloadClientError {
     Protocol(String),
     Address(String),
     Unsupported(String),
+    DeadlineExceeded,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +88,236 @@ impl PayloadControlOptions {
             forward_signals: false,
             forward_resize: false,
         }
+    }
+
+    pub fn policy(self) -> PayloadControlPolicy {
+        PayloadControlPolicy {
+            forward_signals: self.forward_signals,
+            forward_resize: self.forward_resize,
+            repeated_interrupt_aborts: self.forward_signals,
+            terminate_aborts: self.forward_signals,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadControlPolicy {
+    pub forward_signals: bool,
+    pub forward_resize: bool,
+    pub repeated_interrupt_aborts: bool,
+    pub terminate_aborts: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadControlAction {
+    ForwardSignal(i32),
+    ForwardResize,
+    LocalAbort,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PayloadControlLoopDecision {
+    Continue,
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct PayloadCancelToken {
+    done: Arc<AtomicBool>,
+    stream: Arc<Mutex<Option<TcpStream>>>,
+}
+
+impl PayloadCancelToken {
+    pub fn new() -> Self {
+        Self {
+            done: Arc::new(AtomicBool::new(false)),
+            stream: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.done.store(true, Ordering::SeqCst);
+        if let Ok(stream) = self.stream.lock() {
+            if let Some(stream) = stream.as_ref() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.done.load(Ordering::SeqCst)
+    }
+
+    fn shared_flag(&self) -> Arc<AtomicBool> {
+        self.done.clone()
+    }
+
+    fn register_stream(&self, stream: TcpStream) {
+        if let Ok(mut current) = self.stream.lock() {
+            *current = Some(stream);
+        }
+    }
+
+    fn unregister_stream(&self) {
+        if let Ok(mut current) = self.stream.lock() {
+            *current = None;
+        }
+    }
+}
+
+impl Default for PayloadCancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadSessionOutcome {
+    Exit(i32),
+    Failure(String),
+    Cancelled,
+}
+
+pub struct PayloadSessionRunner {
+    control: PayloadControlOptions,
+    cancel: PayloadCancelToken,
+}
+
+impl PayloadSessionRunner {
+    pub fn new(control: PayloadControlOptions) -> Self {
+        Self::with_cancel_token(control, PayloadCancelToken::new())
+    }
+
+    pub fn with_cancel_token(control: PayloadControlOptions, cancel: PayloadCancelToken) -> Self {
+        Self { control, cancel }
+    }
+
+    pub fn cancel_token(&self) -> PayloadCancelToken {
+        self.cancel.clone()
+    }
+
+    pub fn run_tcp_session(
+        &self,
+        session: &mut PayloadSession<TcpStream>,
+        input: Option<Box<dyn Read + Send>>,
+        output: &mut impl Write,
+    ) -> Result<PayloadSessionOutcome, PayloadClientError> {
+        let done = self.cancel.shared_flag();
+        let send_lock = Arc::new(Mutex::new(session.stream.try_clone()?));
+        self.cancel.register_stream(session.stream.try_clone()?);
+
+        if let Some(mut input) = input {
+            let done = done.clone();
+            let send_lock = send_lock.clone();
+            thread::Builder::new()
+                .name("agentvm-payload-stdin".to_string())
+                .spawn(move || {
+                    let mut buffer = [0; 64 * 1024];
+                    while !done.load(Ordering::SeqCst) {
+                        let Ok(count) = input.read(&mut buffer) else {
+                            return;
+                        };
+                        if count == 0 {
+                            return;
+                        }
+                        let Ok(mut writer) = send_lock.lock() else {
+                            return;
+                        };
+                        if send_frame(&mut *writer, b'I', &buffer[..count]).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(PayloadClientError::Io)?;
+        }
+        let signal_forwarder =
+            SignalForwarder::install(self.control, send_lock.clone(), done.clone())?;
+
+        let result = (|| -> Result<PayloadSessionOutcome, PayloadClientError> {
+            loop {
+                match session.recv_event() {
+                    Ok(PayloadEvent::Output(payload)) => {
+                        output.write_all(&payload)?;
+                        output.flush()?;
+                    }
+                    Ok(PayloadEvent::Exit(exit_code)) => {
+                        return Ok(PayloadSessionOutcome::Exit(exit_code));
+                    }
+                    Ok(PayloadEvent::Failure(message)) => {
+                        return Ok(PayloadSessionOutcome::Failure(message));
+                    }
+                    Err(_error) if self.cancel.is_cancelled() => {
+                        return Ok(PayloadSessionOutcome::Cancelled);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })();
+        self.cancel.cancel();
+        self.cancel.unregister_stream();
+        drop(signal_forwarder);
+        result
+    }
+}
+
+impl PayloadSessionOutcome {
+    pub fn into_exit_code(self) -> Result<i32, PayloadClientError> {
+        match self {
+            PayloadSessionOutcome::Exit(exit_code) => Ok(exit_code),
+            PayloadSessionOutcome::Failure(message) => Err(PayloadClientError::Protocol(message)),
+            PayloadSessionOutcome::Cancelled => Err(PayloadClientError::Cancelled),
+        }
+    }
+}
+
+impl PayloadControlPolicy {
+    pub fn disabled() -> Self {
+        PayloadControlOptions::disabled().policy()
+    }
+
+    pub fn interactive() -> Self {
+        PayloadControlOptions::interactive().policy()
+    }
+}
+
+#[cfg(unix)]
+impl PayloadControlPolicy {
+    pub fn host_signal_action(
+        self,
+        signal: i32,
+        forwarded_interrupts: usize,
+    ) -> PayloadControlAction {
+        match signal {
+            libc::SIGWINCH if self.forward_resize => PayloadControlAction::ForwardResize,
+            libc::SIGINT if self.forward_signals => {
+                if self.repeated_interrupt_aborts && forwarded_interrupts > 0 {
+                    PayloadControlAction::LocalAbort
+                } else {
+                    PayloadControlAction::ForwardSignal(signal)
+                }
+            }
+            libc::SIGTERM if self.terminate_aborts => PayloadControlAction::LocalAbort,
+            libc::SIGTERM | libc::SIGHUP if self.forward_signals => {
+                PayloadControlAction::ForwardSignal(signal)
+            }
+            _ => PayloadControlAction::Ignore,
+        }
+    }
+
+    pub fn tui_ctrl_c_action(self, forwarded_interrupts: usize) -> PayloadControlAction {
+        self.host_signal_action(libc::SIGINT, forwarded_interrupts)
+    }
+
+    fn installed_unix_signals(self) -> Vec<i32> {
+        let mut signals = Vec::new();
+        if self.forward_signals {
+            signals.extend([libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
+        }
+        if self.forward_resize {
+            signals.push(libc::SIGWINCH);
+        }
+        signals
     }
 }
 
@@ -203,11 +435,31 @@ pub fn run_diagnostic_tcp(
     request: &DiagnosticRequest,
     output: &mut impl Write,
 ) -> Result<i32, PayloadClientError> {
+    run_diagnostic_tcp_with_deadline(
+        addr,
+        request,
+        output,
+        Duration::from_secs(request.timeout_seconds.max(1)),
+    )
+}
+
+pub fn run_diagnostic_tcp_with_deadline(
+    addr: impl ToSocketAddrs,
+    request: &DiagnosticRequest,
+    output: &mut impl Write,
+    deadline: Duration,
+) -> Result<i32, PayloadClientError> {
     let mut stream = connect_payload(addr, Duration::from_secs(10))?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-    run_diagnostic_io(&mut stream, request, output)
+    stream.set_read_timeout(Some(deadline))?;
+    stream.set_write_timeout(Some(deadline))?;
+    run_diagnostic_io(&mut stream, request, output).map_err(|error| {
+        if error.is_timeout() {
+            PayloadClientError::DeadlineExceeded
+        } else {
+            error
+        }
+    })
 }
 
 pub fn run_payload_tcp_with_control(
@@ -254,52 +506,9 @@ fn run_payload_session(
     output: &mut impl Write,
     control: PayloadControlOptions,
 ) -> Result<i32, PayloadClientError> {
-    let done = Arc::new(AtomicBool::new(false));
-    let send_lock = Arc::new(Mutex::new(session.stream.try_clone()?));
-
-    if let Some(mut input) = input {
-        let done = done.clone();
-        let send_lock = send_lock.clone();
-        thread::Builder::new()
-            .name("agentvm-payload-stdin".to_string())
-            .spawn(move || {
-                let mut buffer = [0; 64 * 1024];
-                while !done.load(Ordering::SeqCst) {
-                    let Ok(count) = input.read(&mut buffer) else {
-                        return;
-                    };
-                    if count == 0 {
-                        return;
-                    }
-                    let Ok(mut writer) = send_lock.lock() else {
-                        return;
-                    };
-                    if send_frame(&mut *writer, b'I', &buffer[..count]).is_err() {
-                        return;
-                    }
-                }
-            })
-            .map_err(PayloadClientError::Io)?;
-    }
-    let signal_forwarder = SignalForwarder::install(control, send_lock.clone(), done.clone())?;
-
-    let result = (|| -> Result<i32, PayloadClientError> {
-        loop {
-            match session.recv_event()? {
-                PayloadEvent::Output(payload) => {
-                    output.write_all(&payload)?;
-                    output.flush()?;
-                }
-                PayloadEvent::Exit(exit_code) => return Ok(exit_code),
-                PayloadEvent::Failure(message) => {
-                    return Err(PayloadClientError::Protocol(message))
-                }
-            }
-        }
-    })();
-    done.store(true, Ordering::SeqCst);
-    drop(signal_forwarder);
-    result
+    PayloadSessionRunner::new(control)
+        .run_tcp_session(session, input, output)?
+        .into_exit_code()
 }
 
 #[cfg(test)]
@@ -414,24 +623,19 @@ impl UnixSignalForwarder {
         send_lock: Arc<Mutex<TcpStream>>,
         done: Arc<AtomicBool>,
     ) -> Result<Self, PayloadClientError> {
-        let mut fds = [0; 2];
-        // SAFETY: pipe initializes both fd slots on success.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(PayloadClientError::Io(io::Error::last_os_error()));
-        }
-        let read_fd = fds[0];
-        let write_fd = fds[1];
+        let (read_fd, write_fd) = create_signal_pipe().map_err(PayloadClientError::Io)?;
         SIGNAL_WRITE_FD.store(write_fd, Ordering::SeqCst);
 
         let mut old_actions = Vec::new();
-        for signal in control.signals() {
+        for signal in control.policy().installed_unix_signals() {
             let old = install_signal_handler(signal)?;
             old_actions.push((signal, old));
         }
 
+        let policy = control.policy();
         let thread = thread::Builder::new()
             .name("agentvm-payload-signals".to_string())
-            .spawn(move || signal_forward_loop(read_fd, send_lock, done))
+            .spawn(move || signal_forward_loop(read_fd, send_lock, done, policy))
             .map_err(PayloadClientError::Io)?;
 
         Ok(Self {
@@ -468,17 +672,46 @@ impl Drop for UnixSignalForwarder {
 }
 
 #[cfg(unix)]
-impl PayloadControlOptions {
-    fn signals(self) -> Vec<i32> {
-        let mut signals = Vec::new();
-        if self.forward_signals {
-            signals.extend([libc::SIGINT, libc::SIGTERM, libc::SIGHUP]);
-        }
-        if self.forward_resize {
-            signals.push(libc::SIGWINCH);
-        }
-        signals
+fn create_signal_pipe() -> io::Result<(i32, i32)> {
+    let mut fds = [0; 2];
+    // SAFETY: pipe initializes both fd slots on success.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
     }
+    for fd in fds {
+        if let Err(error) = set_signal_pipe_flags(fd) {
+            // SAFETY: fds were returned by pipe and are not otherwise owned yet.
+            unsafe {
+                let _ = libc::close(fds[0]);
+                let _ = libc::close(fds[1]);
+            }
+            return Err(error);
+        }
+    }
+    Ok((fds[0], fds[1]))
+}
+
+#[cfg(unix)]
+fn set_signal_pipe_flags(fd: i32) -> io::Result<()> {
+    // SAFETY: fcntl is called with a valid fd and flag command.
+    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl is called with a valid fd and updated status flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, status | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl is called with a valid fd and flag command.
+    let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if fd_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl is called with a valid fd and updated descriptor flags.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -515,30 +748,86 @@ extern "C" fn payload_signal_handler(signal: i32) {
 }
 
 #[cfg(unix)]
-fn signal_forward_loop(read_fd: i32, send_lock: Arc<Mutex<TcpStream>>, done: Arc<AtomicBool>) {
+fn signal_forward_loop(
+    read_fd: i32,
+    send_lock: Arc<Mutex<TcpStream>>,
+    done: Arc<AtomicBool>,
+    policy: PayloadControlPolicy,
+) {
     let mut buffer = [0_u8; std::mem::size_of::<i32>()];
+    let mut forwarded_interrupts = 0;
     while !done.load(Ordering::SeqCst) {
         // SAFETY: buffer points to valid writable memory for the requested size.
         let read = unsafe { libc::read(read_fd, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if read <= 0 {
+        if read < 0 {
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                _ => return,
+            }
+        }
+        if read == 0 {
             return;
         }
         if read as usize != buffer.len() {
             continue;
         }
         let signal = i32::from_ne_bytes(buffer);
+        let action = policy.host_signal_action(signal, forwarded_interrupts);
         let Ok(mut writer) = send_lock.lock() else {
             return;
         };
-        let result = if signal == libc::SIGWINCH {
-            let (rows, cols) = terminal_size();
-            send_resize_frame(&mut *writer, rows, cols)
-        } else {
-            send_signal_frame(&mut *writer, signal)
-        };
-        if result.is_err() {
-            return;
+        let decision = apply_payload_control_action(
+            action,
+            &mut *writer,
+            &done,
+            &mut forwarded_interrupts,
+            terminal_size,
+        );
+        match decision {
+            Ok(PayloadControlLoopDecision::Continue) => {}
+            Ok(PayloadControlLoopDecision::Stop) => {
+                let _ = writer.shutdown(Shutdown::Both);
+                return;
+            }
+            Err(_) => return,
         }
+    }
+}
+
+fn apply_payload_control_action<W, F>(
+    action: PayloadControlAction,
+    writer: &mut W,
+    done: &AtomicBool,
+    forwarded_interrupts: &mut usize,
+    terminal_size: F,
+) -> io::Result<PayloadControlLoopDecision>
+where
+    W: Write,
+    F: FnOnce() -> (u16, u16),
+{
+    match action {
+        PayloadControlAction::ForwardSignal(signal) => {
+            send_signal_frame(writer, signal)?;
+            #[cfg(unix)]
+            if signal == libc::SIGINT {
+                *forwarded_interrupts += 1;
+            }
+            Ok(PayloadControlLoopDecision::Continue)
+        }
+        PayloadControlAction::ForwardResize => {
+            let (rows, cols) = terminal_size();
+            send_resize_frame(writer, rows, cols)?;
+            Ok(PayloadControlLoopDecision::Continue)
+        }
+        PayloadControlAction::LocalAbort => {
+            done.store(true, Ordering::SeqCst);
+            Ok(PayloadControlLoopDecision::Stop)
+        }
+        PayloadControlAction::Ignore => Ok(PayloadControlLoopDecision::Continue),
     }
 }
 
@@ -613,6 +902,16 @@ impl From<serde_json::Error> for PayloadClientError {
     }
 }
 
+impl PayloadClientError {
+    fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            PayloadClientError::Io(error)
+                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+        )
+    }
+}
+
 impl std::fmt::Display for PayloadClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -621,6 +920,10 @@ impl std::fmt::Display for PayloadClientError {
             PayloadClientError::Protocol(error) => write!(f, "payload protocol failed: {error}"),
             PayloadClientError::Address(error) => write!(f, "{error}"),
             PayloadClientError::Unsupported(error) => write!(f, "{error}"),
+            PayloadClientError::DeadlineExceeded => {
+                write!(f, "payload diagnostic deadline exceeded")
+            }
+            PayloadClientError::Cancelled => write!(f, "payload session cancelled"),
         }
     }
 }
@@ -631,6 +934,11 @@ impl std::error::Error for PayloadClientError {}
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    #[cfg(unix)]
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     proptest! {
         #![proptest_config(ProptestConfig {
@@ -653,6 +961,370 @@ mod tests {
         fn proptest_arbitrary_payload_frame_bytes_stay_bounded(bytes in prop::collection::vec(any::<u8>(), 0..=128)) {
             let _ = recv_frame(&mut io::Cursor::new(bytes));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_control_policy_defines_signal_resize_and_abort_actions() {
+        let policy = PayloadControlOptions::interactive().policy();
+
+        assert_eq!(
+            policy.installed_unix_signals(),
+            vec![libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGWINCH]
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGINT, 0),
+            PayloadControlAction::ForwardSignal(libc::SIGINT)
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGINT, 1),
+            PayloadControlAction::LocalAbort
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGTERM, 0),
+            PayloadControlAction::LocalAbort
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGHUP, 0),
+            PayloadControlAction::ForwardSignal(libc::SIGHUP)
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGWINCH, 0),
+            PayloadControlAction::ForwardResize
+        );
+        assert_eq!(
+            policy.tui_ctrl_c_action(0),
+            PayloadControlAction::ForwardSignal(libc::SIGINT)
+        );
+        assert_eq!(
+            policy.tui_ctrl_c_action(1),
+            PayloadControlAction::LocalAbort
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disabled_control_policy_ignores_process_signals_and_tui_interrupts() {
+        let policy = PayloadControlOptions::disabled().policy();
+
+        assert!(policy.installed_unix_signals().is_empty());
+        assert_eq!(
+            policy.host_signal_action(libc::SIGINT, 0),
+            PayloadControlAction::Ignore
+        );
+        assert_eq!(
+            policy.host_signal_action(libc::SIGWINCH, 0),
+            PayloadControlAction::Ignore
+        );
+        assert_eq!(policy.tui_ctrl_c_action(0), PayloadControlAction::Ignore);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_pipe_is_nonblocking_and_close_on_exec() {
+        let (read_fd, write_fd) = create_signal_pipe().expect("signal pipe");
+        for fd in [read_fd, write_fd] {
+            // SAFETY: fd is open for the duration of this assertion.
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            assert!(status >= 0);
+            assert_ne!(status & libc::O_NONBLOCK, 0);
+            // SAFETY: fd is open for the duration of this assertion.
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert!(fd_flags >= 0);
+            assert_ne!(fd_flags & libc::FD_CLOEXEC, 0);
+        }
+        // SAFETY: fds are owned by this test and closed exactly once here.
+        unsafe {
+            let _ = libc::close(write_fd);
+            let _ = libc::close(read_fd);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_handler_ignores_full_nonblocking_pipe() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let (read_fd, write_fd) = create_signal_pipe().expect("signal pipe");
+        let previous = SIGNAL_WRITE_FD.swap(write_fd, Ordering::SeqCst);
+        let chunk = [0_u8; 4096];
+        loop {
+            // SAFETY: write_fd is nonblocking and chunk points to valid memory.
+            let written = unsafe { libc::write(write_fd, chunk.as_ptr().cast(), chunk.len()) };
+            if written < 0 {
+                let error = io::Error::last_os_error();
+                let raw = error.raw_os_error();
+                assert!(
+                    raw == Some(libc::EAGAIN) || raw == Some(libc::EWOULDBLOCK),
+                    "expected EAGAIN/EWOULDBLOCK, got {error}"
+                );
+                break;
+            }
+            assert!(written > 0);
+        }
+
+        payload_signal_handler(libc::SIGINT);
+
+        SIGNAL_WRITE_FD.store(previous, Ordering::SeqCst);
+        // SAFETY: fds are owned by this test and closed exactly once here.
+        unsafe {
+            let _ = libc::close(write_fd);
+            let _ = libc::close(read_fd);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_forward_loop_forwards_then_aborts_on_repeated_interrupt() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let (read_fd, write_fd) = create_signal_pipe().expect("signal pipe");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let client =
+            TcpStream::connect(listener.local_addr().expect("listener addr")).expect("client");
+        let (mut server, _) = listener.accept().expect("accept");
+        let done = Arc::new(AtomicBool::new(false));
+        let send_lock = Arc::new(Mutex::new(client));
+        let done_for_thread = done.clone();
+        let send_lock_for_thread = send_lock.clone();
+        let thread = thread::spawn(move || {
+            signal_forward_loop(
+                read_fd,
+                send_lock_for_thread,
+                done_for_thread,
+                PayloadControlPolicy::interactive(),
+            )
+        });
+
+        write_signal_number(write_fd, libc::SIGINT).expect("first sigint");
+        let (frame_type, payload) = recv_frame(&mut server).expect("forwarded signal frame");
+        assert_eq!(frame_type, b'S');
+        let signal: serde_json::Value = serde_json::from_slice(&payload).expect("signal json");
+        assert_eq!(signal["signal"], libc::SIGINT);
+
+        write_signal_number(write_fd, libc::SIGINT).expect("second sigint");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut eof = [0_u8; 1];
+        assert_eq!(server.read(&mut eof).expect("stream shutdown"), 0);
+        assert!(done.load(Ordering::SeqCst));
+
+        // SAFETY: fd is owned by this test and closed exactly once here.
+        unsafe {
+            let _ = libc::close(write_fd);
+        }
+        thread.join().expect("signal loop exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_forwarder_terminates_blocked_payload_receive_on_sigterm() {
+        let _guard = SIGNAL_TEST_LOCK.lock().expect("signal test lock");
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
+            request_seen_tx.send(()).expect("request seen");
+            let mut probe = [0_u8; 1];
+            let _ = server.read(&mut probe);
+        });
+        let signal_thread = thread::spawn(move || {
+            request_seen_rx.recv().expect("request seen");
+            wait_for_signal_forwarder_installed().expect("signal forwarder installed");
+            payload_signal_handler(libc::SIGTERM);
+        });
+
+        let request = PayloadRequest::new("sleep forever");
+        let mut output = Vec::new();
+        let result = run_payload_tcp_with_control(
+            addr,
+            &request,
+            None,
+            &mut output,
+            PayloadControlOptions::interactive(),
+        );
+
+        assert!(
+            matches!(result, Err(PayloadClientError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(output.is_empty());
+        signal_thread.join().expect("signal thread");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn payload_session_runner_returns_structured_failure_outcome() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server_thread = thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
+            send_frame(&mut server, b'O', b"before failure\n").expect("output");
+            send_frame(&mut server, b'F', b"guest failed").expect("failure");
+        });
+
+        let request = PayloadRequest::new("fail");
+        let mut session = PayloadSession::connect(addr, &request).expect("session");
+        let runner = PayloadSessionRunner::new(PayloadControlOptions::disabled());
+        let mut output = Vec::new();
+        let outcome = runner
+            .run_tcp_session(&mut session, None, &mut output)
+            .expect("runner outcome");
+
+        assert_eq!(
+            outcome,
+            PayloadSessionOutcome::Failure("guest failed".to_string())
+        );
+        assert_eq!(output, b"before failure\n");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn payload_session_runner_cancel_token_interrupts_blocked_receive() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (request_seen_tx, request_seen_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
+            request_seen_tx.send(()).expect("request seen");
+            let mut probe = [0_u8; 1];
+            let _ = server.read(&mut probe);
+        });
+
+        let request = PayloadRequest::new("sleep forever");
+        let mut session = PayloadSession::connect(addr, &request).expect("session");
+        let cancel = PayloadCancelToken::new();
+        let cancel_for_thread = cancel.clone();
+        let runner =
+            PayloadSessionRunner::with_cancel_token(PayloadControlOptions::disabled(), cancel);
+        let cancel_thread = thread::spawn(move || {
+            request_seen_rx.recv().expect("request seen");
+            cancel_for_thread.cancel();
+        });
+        let mut output = Vec::new();
+        let outcome = runner
+            .run_tcp_session(&mut session, None, &mut output)
+            .expect("runner outcome");
+
+        assert_eq!(outcome, PayloadSessionOutcome::Cancelled);
+        assert!(output.is_empty());
+        cancel_thread.join().expect("cancel thread");
+        server_thread.join().expect("server thread");
+    }
+
+    #[test]
+    fn payload_session_runner_reports_partial_frame_io_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server_thread = thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
+            server
+                .write_all(&[b'O', 0, 0, 0, 4, b'a', b'b'])
+                .expect("partial output frame");
+        });
+
+        let request = PayloadRequest::new("partial");
+        let mut session = PayloadSession::connect(addr, &request).expect("session");
+        let runner = PayloadSessionRunner::new(PayloadControlOptions::disabled());
+        let mut output = Vec::new();
+        let result = runner.run_tcp_session(&mut session, None, &mut output);
+
+        assert!(
+            matches!(result, Err(PayloadClientError::Io(_))),
+            "{result:?}"
+        );
+        assert!(output.is_empty());
+        server_thread.join().expect("server thread");
+    }
+
+    #[cfg(unix)]
+    fn wait_for_signal_forwarder_installed() -> io::Result<()> {
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            if SIGNAL_WRITE_FD.load(Ordering::SeqCst) >= 0 {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "signal forwarder was not installed",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn write_signal_number(fd: i32, signal: i32) -> io::Result<()> {
+        let bytes = signal.to_ne_bytes();
+        // SAFETY: fd is an open nonblocking pipe and bytes points to valid memory.
+        let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        if written < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        assert_eq!(written as usize, bytes.len());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_action_application_forwards_resizes_and_sets_local_abort() {
+        let done = AtomicBool::new(false);
+        let mut forwarded_interrupts = 0;
+        let mut bytes = Vec::new();
+
+        assert_eq!(
+            apply_payload_control_action(
+                PayloadControlAction::ForwardSignal(libc::SIGINT),
+                &mut bytes,
+                &done,
+                &mut forwarded_interrupts,
+                || (40, 120),
+            )
+            .expect("signal"),
+            PayloadControlLoopDecision::Continue
+        );
+        assert_eq!(forwarded_interrupts, 1);
+        let (frame_type, payload) =
+            recv_frame(&mut io::Cursor::new(bytes.clone())).expect("signal frame");
+        assert_eq!(frame_type, b'S');
+        let signal: serde_json::Value = serde_json::from_slice(&payload).expect("signal json");
+        assert_eq!(signal["signal"], libc::SIGINT);
+
+        bytes.clear();
+        assert_eq!(
+            apply_payload_control_action(
+                PayloadControlAction::ForwardResize,
+                &mut bytes,
+                &done,
+                &mut forwarded_interrupts,
+                || (40, 120),
+            )
+            .expect("resize"),
+            PayloadControlLoopDecision::Continue
+        );
+        let (frame_type, payload) = recv_frame(&mut io::Cursor::new(bytes)).expect("resize frame");
+        assert_eq!(frame_type, b'W');
+        let resize: serde_json::Value = serde_json::from_slice(&payload).expect("resize json");
+        assert_eq!(resize["rows"], 40);
+        assert_eq!(resize["cols"], 120);
+
+        let mut ignored = Vec::new();
+        assert_eq!(
+            apply_payload_control_action(
+                PayloadControlAction::LocalAbort,
+                &mut ignored,
+                &done,
+                &mut forwarded_interrupts,
+                || (24, 80),
+            )
+            .expect("abort"),
+            PayloadControlLoopDecision::Stop
+        );
+        assert!(done.load(Ordering::SeqCst));
+        assert!(ignored.is_empty());
     }
 
     #[test]
@@ -715,6 +1387,37 @@ mod tests {
         assert_eq!(request["script"], "echo diag");
         assert_eq!(request["timeout_seconds"], 2);
         assert_eq!(request["max_output_bytes"], 4096);
+    }
+
+    #[test]
+    fn run_diagnostic_tcp_with_deadline_fails_partial_frame_stall() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server_thread = thread::spawn(move || {
+            let (mut server, _) = listener.accept().expect("accept");
+            let (_frame_type, _payload) = recv_frame(&mut server).expect("request frame");
+            server
+                .write_all(&[b'O', 0, 0, 0, 4, b'a', b'b'])
+                .expect("partial output frame");
+            let mut probe = [0_u8; 1];
+            let _ = server.read(&mut probe);
+        });
+
+        let request = DiagnosticRequest::new("partial diagnostic");
+        let mut output = Vec::new();
+        let result = run_diagnostic_tcp_with_deadline(
+            addr,
+            &request,
+            &mut output,
+            Duration::from_millis(50),
+        );
+
+        assert!(
+            matches!(result, Err(PayloadClientError::DeadlineExceeded)),
+            "{result:?}"
+        );
+        assert!(output.is_empty());
+        server_thread.join().expect("server thread");
     }
 
     #[test]

@@ -29,3 +29,9 @@ Epic acceptance:
 - Live behavior changes are exercised with the appropriate live validation tier before closing implementation tickets.
 - The required gate remains accurate: ./vm-frontend/validate.sh required, or an explicit documented limitation if live validation cannot be run.
 
+
+## Notes
+
+**2026-05-16T21:47:19Z**
+
+Review refresh after the async/payload/vmnet refactors: closed wra-d6vo because wra-35eb/wra-m7gg now provide policy-driven signal handling, nonblocking signal pipe safety, cancellable plain payload sessions, and focused regressions with required validation recorded. Closed wra-olu4 and wra-i3t9 because wra-kiv5 now wires DNS and TCP connect through bounded service workers with owner-side completion handling, guest-visible failure closure, delayed/blocked regressions, and required validation. Kept wra-8fjd, wra-ylfx, wra-57z4, wra-e9sr, and wra-vl1o open with updated notes describing remaining scope after the refactors.

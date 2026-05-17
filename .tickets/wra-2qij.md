@@ -1,6 +1,6 @@
 ---
 id: wra-2qij
-status: open
+status: closed
 deps: [wra-m7gg]
 links: [wra-8fjd, wra-ylfx, wra-d6vo]
 created: 2026-05-16T16:13:56Z
@@ -41,3 +41,25 @@ Validation:
 - Shutdown test where sync hangs and force-kill still reaps QEMU and writes launch state.
 - Live validation should include live-setup-tools and required gate before closing.
 
+
+## Notes
+
+**2026-05-16T16:40:54Z**
+
+Cross-ticket insight from wra-m7gg: PayloadSessionRunner now has a real PayloadCancelToken that shuts down the registered payload stream and returns PayloadSessionOutcome::Cancelled. Diagnostic/shutdown deadline work can mirror this shape for run_diagnostic_tcp_with_deadline rather than relying on disabled socket timeouts.
+
+**2026-05-16T16:55:53Z**
+
+Started after wra-m7gg closure. Available foundation: PayloadCancelToken can interrupt blocked payload TcpStream reads, PayloadSessionRunner returns structured Exit/Failure/Cancelled, and cancellation/partial-frame tests exist. Next slice should apply the same deadline/cancellation shape to diagnostics via run_diagnostic_tcp_with_deadline without changing guest diagnostic frame format.
+
+**2026-05-16T16:57:48Z**
+
+Added run_diagnostic_tcp_with_deadline in vm-frontend/src/payload_client.rs. run_diagnostic_tcp now uses a client-side deadline derived from DiagnosticRequest.timeout_seconds instead of disabling socket read/write timeouts. Timeout-like IO errors are mapped to PayloadClientError::DeadlineExceeded. Added fake partial-frame stall regression run_diagnostic_tcp_with_deadline_fails_partial_frame_stall. Focused validation passed: cargo fmt; cargo test ... run_diagnostic_tcp_with_deadline --offline; cargo test ... run_diagnostic_sends --offline; cargo test ... payload_client --offline.
+
+**2026-05-16T16:59:13Z**
+
+Wired bounded sync into self-test shutdown: run_self_test now calls flush_guest_filesystems(payload_addr) before terminate() and treats sync/deadline failures as fatal with artifact context. This uses the new run_diagnostic_tcp timeout behavior. Focused validation passed: cargo fmt; cargo test ... flush_guest_filesystems --offline; cargo test ... guest_sync_diagnostic_request --offline; cargo test ... self_test --offline.
+
+**2026-05-16T17:01:47Z**
+
+Required validation passed after diagnostic deadline and self-test bounded-sync changes: ./vm-frontend/validate.sh required completed within 600s timeout, including live setup-tool scenarios. No appliance or guest asset changes were made. True graceful guest/QMP poweroff remains tracked in linked wra-ylfx.

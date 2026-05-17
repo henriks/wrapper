@@ -1,6 +1,6 @@
 ---
 id: wra-t2uv
-status: open
+status: closed
 deps: []
 links: [wra-57z4, wra-olu4, wra-i3t9, wra-bbgh]
 created: 2026-05-16T16:13:56Z
@@ -34,3 +34,17 @@ Validation:
 - Existing required gate remains ./vm-frontend/validate.sh required.
 - Live validation is required before closing implementation tickets that change runtime behavior.
 
+
+## Notes
+
+**2026-05-16T16:25:34Z**
+
+Started under Ralph loop wra-bjaa-async-service-io. Initial ready set confirms wra-t2uv and wra-35eb can proceed; vmnet async IO children remain blocked on this boundary.
+
+**2026-05-16T16:27:25Z**
+
+Added vm-frontend/src/vmnet_service_io.rs with bounded FIFO owner->service and service->owner queue primitives plus tests for ordering and full-channel rejection. No Tokio dependency added; smoltcp/QEMU ownership remains outside worker-facing primitives. Verified with cargo fmt and cargo test --manifest-path vm-frontend/Cargo.toml vmnet_service_io --offline.
+
+**2026-05-16T17:03:10Z**
+
+Extended VmnetRuntimeConfig with explicit service_io_limits (default VmnetServiceIoLimits) so the owner/service boundary has configured bounded capacities before DNS/connect/session workers are added. Frontend supervisor config and vmnet-gateway CLI construction now carry default limits without changing .sandbox/config.json or runtime behavior. Focused validation passed: cargo fmt; cargo test ... vmnet_service_io --offline; cargo test ... exposes_vmnet_runtime_config --offline; cargo test ... parses_vmnet_gateway_runtime_config --offline.

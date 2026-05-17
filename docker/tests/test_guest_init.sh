@@ -83,4 +83,28 @@ wait_for_critical_exit
 assert_eq "101
 102" "$(cat "${kill_count}")" "critical service wait order"
 
-rm -f /tmp/agentvm-test-cmdline /tmp/agentvm-missing-value "${calls}" "${kill_count}"
+ping_count=/tmp/agentvm-docker-ping-count
+: >"${ping_count}"
+docker_socket_exists() { [ "$1" = /var/run/docker.sock ]; }
+docker_socket_ping() {
+  count=$(cat "${ping_count}")
+  count=$((count + 1))
+  printf '%s\n' "${count}" >"${ping_count}"
+  [ "${count}" -ge 3 ]
+}
+wait_for_docker_ready /var/run/docker.sock 101 5 0 >/tmp/agentvm-docker-ready-log
+assert_eq 3 "$(cat "${ping_count}")" "docker readiness retries until ping succeeds"
+if ! grep -q 'Docker socket is ready' /tmp/agentvm-docker-ready-log; then
+  fail "docker readiness success was not logged"
+fi
+
+: >"${ping_count}"
+docker_socket_ping() { return 1; }
+if wait_for_docker_ready /var/run/docker.sock 102 5 0 >/tmp/agentvm-docker-exit-log; then
+  fail "docker readiness unexpectedly succeeded after dockerd exit"
+fi
+if ! grep -q 'dockerd exited before Docker socket became ready' /tmp/agentvm-docker-exit-log; then
+  fail "dockerd exit readiness failure was not logged"
+fi
+
+rm -f /tmp/agentvm-test-cmdline /tmp/agentvm-missing-value "${calls}" "${kill_count}" "${ping_count}" /tmp/agentvm-docker-ready-log /tmp/agentvm-docker-exit-log

@@ -39,3 +39,21 @@ Validation:
 - Add appliance manifest/source freshness coverage for the new binary.
 - Run required validation plus live-docker and live-payload before switching default.
 
+
+## Notes
+
+**2026-05-16T19:42:36Z**
+
+Epic wra-bjaa vmnet/payload host-side async-boundary children are now closed. This guest-service Rust/Tokio spike remains intentionally unstarted because it is blocked by wra-g0uv, wra-sum7, and wra-dky9 and is appliance-sensitive: starting it likely touches docker guest assets/packaging and may require an appliance rebuild. Do not begin until those prerequisite service-bound tickets define the Python semantics to preserve and the user confirms appliance-sensitive work is acceptable.
+
+**2026-05-16T21:43:09Z**
+
+wra-dky9 is closed after appliance rebuild, live-docker, and required validation. Remaining prerequisite before guest-service Rust/Tokio spike is wra-sum7 (payload server idle/slow-writer bounds), which is appliance-sensitive and should define payload service bounds before the spike.
+
+**2026-05-16T21:57:40Z**
+
+Prerequisite status after Ralph iteration 10: wra-g0uv and wra-dky9 are closed. wra-sum7 remains blocked by wra-38ai until docker/guest-payload-server.py is rebuilt into the appliance and live/required validation passes. Do not start the Rust/Tokio guest-service spike until wra-sum7 closes; the spike remains appliance-sensitive.
+
+**2026-05-17T06:00:20Z**
+
+wra-sum7 and wra-38ai are now closed after rebuilt-appliance required validation passed. wra-lcbk is ready. Pausing before starting because this spike is appliance-sensitive and may add a Rust/Tokio guest-service binary and packaging/appliance changes.

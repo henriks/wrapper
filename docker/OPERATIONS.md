@@ -74,7 +74,8 @@ Normal flow:
 7. It starts the Rust vmnet gateway and any requested host listeners.
 8. It starts QEMU with microvm, read-only lower rootfs, root overlay state
    disk, virtio-fs devices, and stream networking.
-9. It waits for the guest payload control path.
+9. It waits for guest service readiness: Docker `_ping` succeeds inside the
+   guest and the payload control path responds.
 10. It launches the requested payload in the guest.
 11. It forwards stdio, signals, terminal resize events, and guest exit status.
 12. It terminates QEMU and releases the project lock.

@@ -10,6 +10,7 @@ use smoltcp::time::Instant;
 use smoltcp::wire::IpAddress;
 
 use crate::guest_tcp::GuestTcpSession;
+use crate::network_policy::VmnetPolicy;
 use crate::tcp_gateway::{
     evaluate_tcp_destination, parse_http_request, HttpParseError, HttpRequestSummary, TcpAction,
     TcpConnectError, TcpDecision, TcpDestination, TcpUpstreamConnector,
@@ -19,6 +20,7 @@ use crate::tls_mitm::{
     TlsUpstreamSession,
 };
 use crate::vmnet_gateway::VmnetGateway;
+use crate::vmnet_service_io::{VmnetServiceCommand, VmnetServiceToken, VmnetTcpConnectCommand};
 
 pub struct TcpProxyBridge<C>
 where
@@ -26,8 +28,10 @@ where
 {
     connector: C,
     sessions: HashMap<SocketHandle, UpstreamSession<C::Connection>>,
+    pending_connects: HashSet<SocketHandle>,
     tls_server_config: Option<Arc<rustls::ServerConfig>>,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
+    buffer_limits: TcpProxyBufferLimits,
 }
 
 impl<C> TcpProxyBridge<C>
@@ -38,8 +42,10 @@ where
         Self {
             connector,
             sessions: HashMap::new(),
+            pending_connects: HashSet::new(),
             tls_server_config: None,
             tls_client_config: None,
+            buffer_limits: TcpProxyBufferLimits::default(),
         }
     }
 
@@ -62,9 +68,128 @@ where
         Ok(Self {
             connector,
             sessions: HashMap::new(),
+            pending_connects: HashSet::new(),
             tls_server_config: Some(Arc::new(authority.rustls_server_config()?)),
             tls_client_config: Some(tls_client_config),
+            buffer_limits: TcpProxyBufferLimits::default(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_buffer_limits(mut self, buffer_limits: TcpProxyBufferLimits) -> Self {
+        self.buffer_limits = buffer_limits;
+        self
+    }
+
+    pub(crate) fn plan_connect(
+        &self,
+        handle: SocketHandle,
+        destination: TcpDestination,
+        policy: &VmnetPolicy,
+    ) -> TcpProxyConnectPlan {
+        let decision = evaluate_tcp_destination(policy, &destination);
+        if decision.action == TcpAction::Deny {
+            return TcpProxyConnectPlan::Event(TcpProxyEvent::Denied {
+                handle,
+                destination,
+                decision,
+            });
+        }
+        let guest_tls = if decision.action == TcpAction::InterceptHttps {
+            let Some(config) = &self.tls_server_config else {
+                return TcpProxyConnectPlan::Event(TcpProxyEvent::TlsMitmUnavailable {
+                    handle,
+                    destination,
+                });
+            };
+            match GuestTlsSession::new(config.clone()) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    return TcpProxyConnectPlan::Event(TcpProxyEvent::TlsMitmFailed {
+                        handle,
+                        error,
+                        guest_frames: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        TcpProxyConnectPlan::Pending(TcpProxyPendingConnect {
+            handle,
+            destination,
+            decision,
+            guest_tls,
+        })
+    }
+
+    pub(crate) fn complete_connect(
+        &mut self,
+        gateway: &mut VmnetGateway<'_>,
+        pending: TcpProxyPendingConnect,
+        result: Result<C::Connection, TcpConnectError>,
+        now: Instant,
+        events: &mut Vec<TcpProxyEvent>,
+    ) -> Result<(), TcpConnectError> {
+        self.pending_connects.remove(&pending.handle);
+        match result {
+            Ok(connection) => {
+                events.push(TcpProxyEvent::Connected {
+                    handle: pending.handle,
+                    destination: pending.destination.clone(),
+                    decision: pending.decision.clone(),
+                });
+                self.sessions.insert(
+                    pending.handle,
+                    UpstreamSession {
+                        destination: pending.destination,
+                        decision: pending.decision,
+                        connection,
+                        http_buffer: Vec::new(),
+                        guest_tls: pending.guest_tls,
+                        upstream_tls: None,
+                        upstream_tls_ready: false,
+                        pending_upstream_bytes: Vec::new(),
+                        pending_upstream_plaintext: Vec::new(),
+                        pending_guest_bytes: Vec::new(),
+                        buffer_limits: self.buffer_limits,
+                    },
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let guest_frames = gateway.close_tcp_session(pending.handle, now);
+                events.push(TcpProxyEvent::ConnectFailed {
+                    handle: pending.handle,
+                    destination: pending.destination,
+                    error: error.clone(),
+                    guest_frames,
+                });
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn plan_connects_for_service(
+        &self,
+        gateway: &VmnetGateway<'_>,
+    ) -> Vec<TcpProxyConnectPlan> {
+        let mut plans = Vec::new();
+        for active in gateway.active_tcp_sessions() {
+            if active.session.state != tcp::State::Established {
+                continue;
+            }
+            if self.sessions.contains_key(&active.handle)
+                || self.pending_connects.contains(&active.handle)
+            {
+                continue;
+            }
+            let Some(destination) = destination_from_session(&active.session) else {
+                continue;
+            };
+            plans.push(self.plan_connect(active.handle, destination, gateway.policy()));
+        }
+        plans
     }
 
     pub fn process_gateway(
@@ -94,6 +219,8 @@ where
             .filter(|active| active.session.state == tcp::State::Established)
             .map(|active| active.handle)
             .collect::<HashSet<_>>();
+        self.pending_connects
+            .retain(|handle| active_handles.contains(handle));
         for active in active_sessions {
             if active.session.state != tcp::State::Established {
                 continue;
@@ -103,67 +230,23 @@ where
             };
 
             if !self.sessions.contains_key(&active.handle) {
-                let decision = evaluate_tcp_destination(gateway.policy(), &destination);
-                if decision.action == TcpAction::Deny {
-                    events.push(TcpProxyEvent::Denied {
-                        handle: active.handle,
-                        destination,
-                        decision,
-                    });
+                if self.pending_connects.contains(&active.handle) {
                     continue;
                 }
-                let guest_tls = if decision.action == TcpAction::InterceptHttps {
-                    let Some(config) = &self.tls_server_config else {
-                        events.push(TcpProxyEvent::TlsMitmUnavailable {
-                            handle: active.handle,
-                            destination,
-                        });
+                let pending = match self.plan_connect(active.handle, destination, gateway.policy())
+                {
+                    TcpProxyConnectPlan::Pending(pending) => pending,
+                    TcpProxyConnectPlan::Event(event) => {
+                        events.push(event);
                         continue;
-                    };
-                    match GuestTlsSession::new(config.clone()) {
-                        Ok(session) => Some(session),
-                        Err(error) => {
-                            events.push(TcpProxyEvent::TlsMitmFailed {
-                                handle: active.handle,
-                                error,
-                            });
-                            continue;
-                        }
                     }
-                } else {
-                    None
                 };
-                match self.connector.connect(&destination) {
-                    Ok(connection) => {
-                        events.push(TcpProxyEvent::Connected {
-                            handle: active.handle,
-                            destination: destination.clone(),
-                            decision: decision.clone(),
-                        });
-                        self.sessions.insert(
-                            active.handle,
-                            UpstreamSession {
-                                destination,
-                                decision,
-                                connection,
-                                http_buffer: Vec::new(),
-                                guest_tls,
-                                upstream_tls: None,
-                                upstream_tls_ready: false,
-                                pending_upstream_bytes: Vec::new(),
-                                pending_upstream_plaintext: Vec::new(),
-                                pending_guest_bytes: Vec::new(),
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        events.push(TcpProxyEvent::ConnectFailed {
-                            handle: active.handle,
-                            destination,
-                            error,
-                        });
-                        continue;
-                    }
+                let result = self.connector.connect(&pending.destination);
+                if self
+                    .complete_connect(gateway, pending, result, now, &mut events)
+                    .is_err()
+                {
+                    continue;
                 }
             }
 
@@ -218,21 +301,25 @@ where
                 continue;
             }
             if readiness.writable(active.handle) {
-                flush_pending_https_plaintext(session, active.handle, &mut events);
-                drain_upstream_tls_writes(session, active.handle, &mut events);
-                flush_pending_upstream_bytes(session, active.handle, &mut events);
+                flush_pending_https_plaintext(session, active.handle, gateway, now, &mut events);
+                drain_upstream_tls_writes(session, active.handle, gateway, now, &mut events);
+                flush_pending_upstream_bytes(session, active.handle, gateway, now, &mut events);
             }
             if readiness.readable(active.handle) {
-                let upstream_bytes =
-                    match read_available(&mut session.connection, &mut events, active.handle) {
-                        UpstreamRead::Data(bytes) => bytes,
-                        UpstreamRead::WouldBlock => continue,
-                        UpstreamRead::Closed | UpstreamRead::Failed => {
-                            let _guest_frames = gateway.close_tcp_session(active.handle, now);
-                            self.sessions.remove(&active.handle);
-                            continue;
-                        }
-                    };
+                let upstream_bytes = match read_available(
+                    &mut session.connection,
+                    &mut events,
+                    active.handle,
+                    session.buffer_limits.pending_guest_bytes,
+                ) {
+                    UpstreamRead::Data(bytes) => bytes,
+                    UpstreamRead::WouldBlock => continue,
+                    UpstreamRead::Closed | UpstreamRead::Failed => {
+                        let _guest_frames = gateway.close_tcp_session(active.handle, now);
+                        self.sessions.remove(&active.handle);
+                        continue;
+                    }
+                };
                 let guest_bytes = if session.decision.action == TcpAction::InterceptHttps {
                     let upstream_read = match session
                         .upstream_tls
@@ -244,40 +331,37 @@ where
                     {
                         Ok(read) => read,
                         Err(error) => {
-                            events.push(TcpProxyEvent::TlsMitmFailed {
-                                handle: active.handle,
-                                error,
-                            });
+                            events.push(tls_mitm_failed_event(active.handle, gateway, now, error));
                             continue;
                         }
                     };
                     if !upstream_read.tls_to_upstream.is_empty() {
                         if readiness.writable(active.handle) {
-                            match write_buffered_best_effort(
-                                &mut session.connection,
-                                &mut session.pending_upstream_bytes,
+                            let Some(bytes) = write_pending_upstream_bytes_best_effort(
+                                session,
+                                active.handle,
+                                gateway,
+                                now,
                                 &upstream_read.tls_to_upstream,
-                            ) {
-                                Ok(bytes) => {
-                                    if bytes > 0 {
-                                        events.push(TcpProxyEvent::TlsUpstreamPayload {
-                                            handle: active.handle,
-                                            bytes,
-                                        });
-                                    }
-                                }
-                                Err(error) => {
-                                    events.push(TcpProxyEvent::UpstreamWriteFailed {
-                                        handle: active.handle,
-                                        error,
-                                    });
-                                    continue;
-                                }
+                                &mut events,
+                            ) else {
+                                continue;
+                            };
+                            if bytes > 0 {
+                                events.push(TcpProxyEvent::TlsUpstreamPayload {
+                                    handle: active.handle,
+                                    bytes,
+                                });
                             }
-                        } else {
-                            session
-                                .pending_upstream_bytes
-                                .extend_from_slice(&upstream_read.tls_to_upstream);
+                        } else if !buffer_pending_upstream_bytes(
+                            session,
+                            active.handle,
+                            gateway,
+                            now,
+                            &upstream_read.tls_to_upstream,
+                            &mut events,
+                        ) {
+                            continue;
                         }
                     }
                     if !session.upstream_tls_ready {
@@ -287,8 +371,20 @@ where
                             .is_some_and(|upstream_tls| !upstream_tls.is_handshaking());
                     }
                     if readiness.writable(active.handle) {
-                        flush_pending_https_plaintext(session, active.handle, &mut events);
-                        drain_upstream_tls_writes(session, active.handle, &mut events);
+                        flush_pending_https_plaintext(
+                            session,
+                            active.handle,
+                            gateway,
+                            now,
+                            &mut events,
+                        );
+                        drain_upstream_tls_writes(
+                            session,
+                            active.handle,
+                            gateway,
+                            now,
+                            &mut events,
+                        );
                     }
                     if upstream_read.plaintext.is_empty() {
                         continue;
@@ -303,10 +399,7 @@ where
                     match guest_tls.write_guest_plaintext(&upstream_read.plaintext) {
                         Ok(bytes) => bytes,
                         Err(error) => {
-                            events.push(TcpProxyEvent::TlsMitmFailed {
-                                handle: active.handle,
-                                error,
-                            });
+                            events.push(tls_mitm_failed_event(active.handle, gateway, now, error));
                             continue;
                         }
                     }
@@ -355,7 +448,7 @@ where
             let read = match guest_tls.read_guest_tls(&guest_bytes) {
                 Ok(read) => read,
                 Err(error) => {
-                    events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+                    events.push(tls_mitm_failed_event(handle, gateway, now, error));
                     return;
                 }
             };
@@ -373,6 +466,8 @@ where
             if !ensure_https_upstream_tls(
                 session,
                 handle,
+                gateway,
+                now,
                 self.tls_client_config.clone(),
                 upstream_writable,
                 events,
@@ -402,30 +497,28 @@ where
 
         if session.decision.action == TcpAction::InterceptHttps {
             if !session.upstream_tls_ready {
-                session
-                    .pending_upstream_plaintext
-                    .extend_from_slice(&payload);
+                let _ = buffer_pending_upstream_plaintext(
+                    session, handle, gateway, now, &payload, events,
+                );
                 return;
             }
             if upstream_writable {
-                write_https_plaintext_upstream(session, handle, &payload, events);
+                write_https_plaintext_upstream(session, handle, gateway, now, &payload, events);
             } else {
-                session
-                    .pending_upstream_plaintext
-                    .extend_from_slice(&payload);
+                let _ = buffer_pending_upstream_plaintext(
+                    session, handle, gateway, now, &payload, events,
+                );
             }
         } else {
             if upstream_writable {
-                match write_buffered_best_effort(
-                    &mut session.connection,
-                    &mut session.pending_upstream_bytes,
-                    &payload,
+                if let Some(bytes) = write_pending_upstream_bytes_best_effort(
+                    session, handle, gateway, now, &payload, events,
                 ) {
-                    Ok(bytes) => events.push(TcpProxyEvent::GuestPayload { handle, bytes }),
-                    Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
+                    events.push(TcpProxyEvent::GuestPayload { handle, bytes });
                 }
             } else {
-                session.pending_upstream_bytes.extend_from_slice(&payload);
+                let _ =
+                    buffer_pending_upstream_bytes(session, handle, gateway, now, &payload, events);
             }
         }
     }
@@ -447,6 +540,15 @@ where
         self.sessions.keys().copied().collect()
     }
 
+    pub(crate) fn mark_connect_pending(&mut self, handle: SocketHandle) {
+        self.pending_connects.insert(handle);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_connect(&self, handle: SocketHandle) -> bool {
+        self.pending_connects.contains(&handle)
+    }
+
     pub fn session_interest(&self, handle: SocketHandle) -> Option<UpstreamSessionInterest> {
         let session = self.sessions.get(&handle)?;
         Some(UpstreamSessionInterest {
@@ -457,6 +559,28 @@ where
                     .upstream_tls
                     .as_ref()
                     .is_some_and(|upstream_tls| upstream_tls.wants_write()),
+        })
+    }
+}
+
+pub(crate) enum TcpProxyConnectPlan {
+    Pending(TcpProxyPendingConnect),
+    Event(TcpProxyEvent),
+}
+
+pub(crate) struct TcpProxyPendingConnect {
+    pub handle: SocketHandle,
+    pub destination: TcpDestination,
+    pub decision: TcpDecision,
+    guest_tls: Option<GuestTlsSession>,
+}
+
+impl TcpProxyPendingConnect {
+    #[allow(dead_code)]
+    pub(crate) fn service_command(&self, token: VmnetServiceToken) -> VmnetServiceCommand {
+        VmnetServiceCommand::TcpConnect(VmnetTcpConnectCommand {
+            token,
+            destination: self.destination.clone(),
         })
     }
 }
@@ -472,6 +596,67 @@ struct UpstreamSession<T> {
     pending_upstream_bytes: Vec<u8>,
     pending_upstream_plaintext: Vec<u8>,
     pending_guest_bytes: Vec<u8>,
+    buffer_limits: TcpProxyBufferLimits,
+}
+
+const DEFAULT_TCP_PROXY_BUFFER_LIMIT: usize = 1024 * 1024;
+const DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpProxyBufferLimits {
+    pub pending_upstream_bytes: usize,
+    pub pending_upstream_plaintext: usize,
+    pub pending_guest_bytes: usize,
+}
+
+impl TcpProxyBufferLimits {
+    pub const fn new(pending_upstream_plaintext: usize) -> Self {
+        Self {
+            pending_upstream_bytes: DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+            pending_upstream_plaintext,
+            pending_guest_bytes: DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT,
+        }
+    }
+
+    pub const fn with_upstream_bytes(
+        pending_upstream_bytes: usize,
+        pending_upstream_plaintext: usize,
+    ) -> Self {
+        Self {
+            pending_upstream_bytes,
+            pending_upstream_plaintext,
+            pending_guest_bytes: DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT,
+        }
+    }
+
+    pub const fn with_all(
+        pending_upstream_bytes: usize,
+        pending_upstream_plaintext: usize,
+        pending_guest_bytes: usize,
+    ) -> Self {
+        Self {
+            pending_upstream_bytes,
+            pending_upstream_plaintext,
+            pending_guest_bytes,
+        }
+    }
+}
+
+impl Default for TcpProxyBufferLimits {
+    fn default() -> Self {
+        Self::with_all(
+            DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+            DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+            DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpProxyBufferKind {
+    PendingUpstreamBytes,
+    PendingUpstreamPlaintext,
+    PendingGuestBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,6 +704,124 @@ enum GuestSendEvent {
     TlsHandshakePayload,
 }
 
+fn tls_mitm_failed_event(
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    error: TlsMitmError,
+) -> TcpProxyEvent {
+    TcpProxyEvent::TlsMitmFailed {
+        handle,
+        error,
+        guest_frames: gateway.close_tcp_session(handle, now),
+    }
+}
+
+fn push_buffer_limit_exceeded(
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    buffer: TcpProxyBufferKind,
+    limit: usize,
+    attempted: usize,
+    events: &mut Vec<TcpProxyEvent>,
+) {
+    events.push(TcpProxyEvent::BufferLimitExceeded {
+        handle,
+        buffer,
+        limit,
+        attempted,
+        guest_frames: gateway.close_tcp_session(handle, now),
+    });
+}
+
+fn buffer_pending_upstream_bytes<T>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    bytes: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) -> bool {
+    let limit = session.buffer_limits.pending_upstream_bytes;
+    let attempted = session.pending_upstream_bytes.len() + bytes.len();
+    if attempted > limit {
+        push_buffer_limit_exceeded(
+            handle,
+            gateway,
+            now,
+            TcpProxyBufferKind::PendingUpstreamBytes,
+            limit,
+            attempted,
+            events,
+        );
+        return false;
+    }
+    session.pending_upstream_bytes.extend_from_slice(bytes);
+    true
+}
+
+fn write_pending_upstream_bytes_best_effort<T: Write>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    bytes: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) -> Option<usize> {
+    let limit = session.buffer_limits.pending_upstream_bytes;
+    let attempted = session.pending_upstream_bytes.len() + bytes.len();
+    if attempted > limit {
+        push_buffer_limit_exceeded(
+            handle,
+            gateway,
+            now,
+            TcpProxyBufferKind::PendingUpstreamBytes,
+            limit,
+            attempted,
+            events,
+        );
+        return None;
+    }
+    match write_buffered_best_effort(
+        &mut session.connection,
+        &mut session.pending_upstream_bytes,
+        bytes,
+    ) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
+            None
+        }
+    }
+}
+
+fn buffer_pending_upstream_plaintext<T>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    bytes: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) -> bool {
+    let limit = session.buffer_limits.pending_upstream_plaintext;
+    let attempted = session.pending_upstream_plaintext.len() + bytes.len();
+    if attempted > limit {
+        push_buffer_limit_exceeded(
+            handle,
+            gateway,
+            now,
+            TcpProxyBufferKind::PendingUpstreamPlaintext,
+            limit,
+            attempted,
+            events,
+        );
+        return false;
+    }
+    session.pending_upstream_plaintext.extend_from_slice(bytes);
+    true
+}
+
 fn send_guest_buffered<T>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
@@ -528,8 +831,78 @@ fn send_guest_buffered<T>(
     event: GuestSendEvent,
     events: &mut Vec<TcpProxyEvent>,
 ) {
-    session.pending_guest_bytes.extend_from_slice(bytes);
     flush_pending_guest_bytes(session, handle, gateway, now, event, events);
+    if session.pending_guest_bytes.is_empty() {
+        match gateway.send_tcp_session_partial(handle, bytes, now) {
+            Ok((written, guest_frames)) => {
+                if written > 0 {
+                    push_guest_send_event(events, event, handle, written, guest_frames);
+                }
+                if written == bytes.len() {
+                    return;
+                }
+                queue_pending_guest_bytes(session, handle, gateway, now, &bytes[written..], events);
+            }
+            Err(error) => {
+                events.push(TcpProxyEvent::GuestWriteFailed { handle, error });
+                queue_pending_guest_bytes(session, handle, gateway, now, bytes, events);
+            }
+        }
+        return;
+    }
+
+    queue_pending_guest_bytes(session, handle, gateway, now, bytes, events);
+}
+
+fn queue_pending_guest_bytes<T>(
+    session: &mut UpstreamSession<T>,
+    handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
+    bytes: &[u8],
+    events: &mut Vec<TcpProxyEvent>,
+) -> bool {
+    let limit = session.buffer_limits.pending_guest_bytes;
+    let attempted = session.pending_guest_bytes.len() + bytes.len();
+    if attempted > limit {
+        push_buffer_limit_exceeded(
+            handle,
+            gateway,
+            now,
+            TcpProxyBufferKind::PendingGuestBytes,
+            limit,
+            attempted,
+            events,
+        );
+        return false;
+    }
+    session.pending_guest_bytes.extend_from_slice(bytes);
+    true
+}
+
+fn push_guest_send_event(
+    events: &mut Vec<TcpProxyEvent>,
+    event: GuestSendEvent,
+    handle: SocketHandle,
+    bytes: usize,
+    guest_frames: Vec<Vec<u8>>,
+) {
+    match event {
+        GuestSendEvent::UpstreamPayload => {
+            events.push(TcpProxyEvent::UpstreamPayload {
+                handle,
+                bytes,
+                guest_frames,
+            });
+        }
+        GuestSendEvent::TlsHandshakePayload => {
+            events.push(TcpProxyEvent::TlsHandshakePayload {
+                handle,
+                bytes,
+                guest_frames,
+            });
+        }
+    }
 }
 
 fn flush_pending_guest_bytes<T>(
@@ -547,22 +920,7 @@ fn flush_pending_guest_bytes<T>(
         Ok((bytes, guest_frames)) => {
             if bytes > 0 {
                 session.pending_guest_bytes.drain(..bytes);
-                match event {
-                    GuestSendEvent::UpstreamPayload => {
-                        events.push(TcpProxyEvent::UpstreamPayload {
-                            handle,
-                            bytes,
-                            guest_frames,
-                        });
-                    }
-                    GuestSendEvent::TlsHandshakePayload => {
-                        events.push(TcpProxyEvent::TlsHandshakePayload {
-                            handle,
-                            bytes,
-                            guest_frames,
-                        });
-                    }
-                }
+                push_guest_send_event(events, event, handle, bytes, guest_frames);
             }
         }
         Err(error) => events.push(TcpProxyEvent::GuestWriteFailed { handle, error }),
@@ -572,6 +930,8 @@ fn flush_pending_guest_bytes<T>(
 fn ensure_https_upstream_tls<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     tls_client_config: Option<Arc<rustls::ClientConfig>>,
     upstream_writable: bool,
     events: &mut Vec<TcpProxyEvent>,
@@ -589,12 +949,12 @@ fn ensure_https_upstream_tls<T: Write>(
     };
     let Some(server_name) = guest_tls.server_name().map(ToOwned::to_owned) else {
         if !guest_tls.is_handshaking() {
-            events.push(TcpProxyEvent::TlsMitmFailed {
+            events.push(tls_mitm_failed_event(
                 handle,
-                error: TlsMitmError::InvalidHost(
-                    "guest TLS connection did not provide SNI".to_string(),
-                ),
-            });
+                gateway,
+                now,
+                TlsMitmError::InvalidHost("guest TLS connection did not provide SNI".to_string()),
+            ));
         }
         return false;
     };
@@ -608,38 +968,41 @@ fn ensure_https_upstream_tls<T: Write>(
     let mut upstream_tls = match TlsUpstreamSession::new(config, &server_name) {
         Ok(upstream_tls) => upstream_tls,
         Err(error) => {
-            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            events.push(tls_mitm_failed_event(handle, gateway, now, error));
             return false;
         }
     };
     let client_hello = match upstream_tls.drain_tls_to_upstream() {
         Ok(client_hello) => client_hello,
         Err(error) => {
-            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            events.push(tls_mitm_failed_event(handle, gateway, now, error));
             return false;
         }
     };
     if !client_hello.is_empty() {
         if upstream_writable {
-            match write_buffered_best_effort(
-                &mut session.connection,
-                &mut session.pending_upstream_bytes,
+            let Some(bytes) = write_pending_upstream_bytes_best_effort(
+                session,
+                handle,
+                gateway,
+                now,
                 &client_hello,
-            ) {
-                Ok(bytes) => {
-                    if bytes > 0 {
-                        events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
-                    }
-                }
-                Err(error) => {
-                    events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error });
-                    return false;
-                }
+                events,
+            ) else {
+                return false;
+            };
+            if bytes > 0 {
+                events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
             }
-        } else {
-            session
-                .pending_upstream_bytes
-                .extend_from_slice(&client_hello);
+        } else if !buffer_pending_upstream_bytes(
+            session,
+            handle,
+            gateway,
+            now,
+            &client_hello,
+            events,
+        ) {
+            return false;
         }
     }
     session.upstream_tls = Some(upstream_tls);
@@ -649,6 +1012,8 @@ fn ensure_https_upstream_tls<T: Write>(
 fn flush_pending_https_plaintext<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     events: &mut Vec<TcpProxyEvent>,
 ) {
     if session.pending_upstream_plaintext.is_empty() {
@@ -658,49 +1023,46 @@ fn flush_pending_https_plaintext<T: Write>(
         return;
     }
     let pending = std::mem::take(&mut session.pending_upstream_plaintext);
-    write_https_plaintext_upstream(session, handle, &pending, events);
+    write_https_plaintext_upstream(session, handle, gateway, now, &pending, events);
 }
 
 fn write_https_plaintext_upstream<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     plaintext: &[u8],
     events: &mut Vec<TcpProxyEvent>,
 ) {
     let Some(upstream_tls) = session.upstream_tls.as_mut() else {
-        session
-            .pending_upstream_plaintext
-            .extend_from_slice(plaintext);
+        let _ = buffer_pending_upstream_plaintext(session, handle, gateway, now, plaintext, events);
         return;
     };
     let tls_bytes = match upstream_tls.write_upstream_plaintext(plaintext) {
         Ok(tls_bytes) => tls_bytes,
         Err(error) => {
-            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            events.push(tls_mitm_failed_event(handle, gateway, now, error));
             return;
         }
     };
-    match write_buffered_best_effort(
-        &mut session.connection,
-        &mut session.pending_upstream_bytes,
-        &tls_bytes,
-    ) {
-        Ok(bytes) => {
-            events.push(TcpProxyEvent::GuestPayload {
-                handle,
-                bytes: plaintext.len(),
-            });
-            if bytes > 0 {
-                events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
-            }
+    if let Some(bytes) =
+        write_pending_upstream_bytes_best_effort(session, handle, gateway, now, &tls_bytes, events)
+    {
+        events.push(TcpProxyEvent::GuestPayload {
+            handle,
+            bytes: plaintext.len(),
+        });
+        if bytes > 0 {
+            events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
         }
-        Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
     }
 }
 
 fn drain_upstream_tls_writes<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     events: &mut Vec<TcpProxyEvent>,
 ) {
     if session.decision.action != TcpAction::InterceptHttps {
@@ -712,29 +1074,27 @@ fn drain_upstream_tls_writes<T: Write>(
     let tls_bytes = match upstream_tls.drain_tls_to_upstream() {
         Ok(tls_bytes) => tls_bytes,
         Err(error) => {
-            events.push(TcpProxyEvent::TlsMitmFailed { handle, error });
+            events.push(tls_mitm_failed_event(handle, gateway, now, error));
             return;
         }
     };
     if tls_bytes.is_empty() {
         return;
     }
-    match write_buffered_best_effort(
-        &mut session.connection,
-        &mut session.pending_upstream_bytes,
-        &tls_bytes,
-    ) {
-        Ok(bytes) if bytes > 0 => {
+    if let Some(bytes) =
+        write_pending_upstream_bytes_best_effort(session, handle, gateway, now, &tls_bytes, events)
+    {
+        if bytes > 0 {
             events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
         }
-        Ok(_) => {}
-        Err(error) => events.push(TcpProxyEvent::UpstreamWriteFailed { handle, error }),
     }
 }
 
 fn flush_pending_upstream_bytes<T: Write>(
     session: &mut UpstreamSession<T>,
     handle: SocketHandle,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     events: &mut Vec<TcpProxyEvent>,
 ) {
     if session.pending_upstream_bytes.is_empty() {
@@ -760,7 +1120,7 @@ fn flush_pending_upstream_bytes<T: Write>(
             .is_some_and(|upstream_tls| !upstream_tls.is_handshaking())
     {
         session.upstream_tls_ready = true;
-        flush_pending_https_plaintext(session, handle, events);
+        flush_pending_https_plaintext(session, handle, gateway, now, events);
     }
 }
 
@@ -780,6 +1140,7 @@ pub enum TcpProxyEvent {
         handle: SocketHandle,
         destination: TcpDestination,
         error: TcpConnectError,
+        guest_frames: Vec<Vec<u8>>,
     },
     GuestPayload {
         handle: SocketHandle,
@@ -817,6 +1178,14 @@ pub enum TcpProxyEvent {
     TlsMitmFailed {
         handle: SocketHandle,
         error: TlsMitmError,
+        guest_frames: Vec<Vec<u8>>,
+    },
+    BufferLimitExceeded {
+        handle: SocketHandle,
+        buffer: TcpProxyBufferKind,
+        limit: usize,
+        attempted: usize,
+        guest_frames: Vec<Vec<u8>>,
     },
     GuestReadFailed {
         handle: SocketHandle,
@@ -902,10 +1271,13 @@ fn read_available(
     connection: &mut impl Read,
     events: &mut Vec<TcpProxyEvent>,
     handle: SocketHandle,
+    max_bytes: usize,
 ) -> UpstreamRead {
+    let max_bytes = max_bytes.max(1);
     let mut collected = Vec::new();
-    loop {
-        let mut buffer = vec![0; 64 * 1024];
+    while collected.len() < max_bytes {
+        let remaining = max_bytes - collected.len();
+        let mut buffer = vec![0; remaining.min(64 * 1024)];
         match connection.read(&mut buffer) {
             Ok(0) => {
                 return if collected.is_empty() {
@@ -938,6 +1310,7 @@ fn read_available(
             }
         }
     }
+    UpstreamRead::Data(collected)
 }
 
 #[cfg(test)]
@@ -948,6 +1321,7 @@ mod tests {
     use crate::tls_mitm::rustls_client_config_with_roots;
     use crate::vmnet_gateway::{GuestFrameOutcome, VmnetGateway};
     use crate::GuestNetwork;
+    use proptest::prelude::*;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
     use smoltcp::phy::ChecksumCapabilities;
@@ -1070,6 +1444,22 @@ mod tests {
             session.connection.response.is_empty(),
             "one readiness event should drain all immediately available upstream bytes"
         );
+    }
+
+    #[test]
+    fn upstream_read_is_capped_per_owner_pass() {
+        let mut connection = MemoryConnection {
+            response: vec![b'R'; 10],
+            written: Vec::new(),
+            write_would_block_count: 0,
+        };
+        let mut events = Vec::new();
+
+        let read = read_available(&mut connection, &mut events, SocketHandle::default(), 4);
+
+        assert_eq!(read, UpstreamRead::Data(vec![b'R'; 4]));
+        assert_eq!(connection.response.len(), 6);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1238,6 +1628,34 @@ mod tests {
     }
 
     #[test]
+    fn connect_can_be_planned_without_calling_connector() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let bridge = TcpProxyBridge::new(PanicConnector);
+        let destination = TcpDestination {
+            ip: Ipv4Addr::from(PUBLIC_IP.octets()),
+            port: 12345,
+            domain: None,
+        };
+
+        let plan = bridge.plan_connect(SocketHandle::default(), destination, &policy);
+
+        let TcpProxyConnectPlan::Pending(pending) = plan else {
+            panic!("allowed destination should produce pending connect");
+        };
+        assert_eq!(pending.destination.port, 12345);
+        assert_eq!(pending.decision.action, TcpAction::Connect);
+
+        let command = pending.service_command(VmnetServiceToken::new(100));
+        let VmnetServiceCommand::TcpConnect(command) = command else {
+            panic!("expected TCP connect service command");
+        };
+        assert_eq!(command.token, VmnetServiceToken::new(100));
+        assert_eq!(command.destination.port, 12345);
+    }
+
+    #[test]
     fn upstream_connect_failure_is_reported_without_creating_session() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
@@ -1249,13 +1667,25 @@ mod tests {
         establish_http_session(&mut gateway);
         let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TcpProxyEvent::ConnectFailed {
-                error: TcpConnectError::UpstreamUnavailable,
-                ..
-            }
-        )));
+        let failed = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    TcpProxyEvent::ConnectFailed {
+                        error: TcpConnectError::UpstreamUnavailable,
+                        ..
+                    }
+                )
+            })
+            .expect("connect failure event");
+        let TcpProxyEvent::ConnectFailed { guest_frames, .. } = failed else {
+            unreachable!();
+        };
+        assert!(
+            !guest_frames.is_empty(),
+            "failed upstream connect must be guest-visible"
+        );
         assert!(bridge.sessions.is_empty());
     }
 
@@ -1440,6 +1870,353 @@ mod tests {
         assert!(session.connection.requests[1].starts_with("GET /second "));
     }
 
+    proptest! {
+        #[test]
+        fn proptest_pending_upstream_buffer_limits_stay_bounded(
+            limit in 0_usize..=32,
+            existing in 0_usize..=32,
+            incoming in 0_usize..=32,
+            plaintext in any::<bool>(),
+        ) {
+            let network = GuestNetwork::default();
+            let mut policy = VmnetPolicy::default_sandbox(network.clone());
+            policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+            let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
+                .expect("gateway");
+            establish_tcp_session(&mut gateway, 80);
+            let handle = gateway
+                .active_tcp_sessions()
+                .into_iter()
+                .find(|active| active.session.state == tcp::State::Established)
+                .expect("active session")
+                .handle;
+            let mut session = test_upstream_session(TcpProxyBufferLimits::with_upstream_bytes(
+                limit,
+                limit,
+            ));
+            if plaintext {
+                session.pending_upstream_plaintext = vec![b'x'; existing];
+            } else {
+                session.pending_upstream_bytes = vec![b'x'; existing];
+            }
+            let mut events = Vec::new();
+
+            let accepted = if plaintext {
+                buffer_pending_upstream_plaintext(
+                    &mut session,
+                    handle,
+                    &mut gateway,
+                    Instant::from_millis(4),
+                    &vec![b'y'; incoming],
+                    &mut events,
+                )
+            } else {
+                buffer_pending_upstream_bytes(
+                    &mut session,
+                    handle,
+                    &mut gateway,
+                    Instant::from_millis(4),
+                    &vec![b'y'; incoming],
+                    &mut events,
+                )
+            };
+
+            let attempted = existing + incoming;
+            if attempted > limit {
+                prop_assert!(!accepted);
+                let has_limit_event = events.iter().any(|event| {
+                    matches!(event, TcpProxyEvent::BufferLimitExceeded { attempted: event_attempted, .. } if *event_attempted == attempted)
+                });
+                prop_assert!(has_limit_event);
+            } else {
+                prop_assert!(accepted);
+                prop_assert!(events.is_empty());
+                if plaintext {
+                    prop_assert_eq!(session.pending_upstream_plaintext.len(), attempted);
+                } else {
+                    prop_assert_eq!(session.pending_upstream_bytes.len(), attempted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_guest_bytes_limit_does_not_reject_direct_guest_send() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        establish_tcp_session(&mut gateway, 80);
+        let handle = gateway
+            .active_tcp_sessions()
+            .into_iter()
+            .find(|active| active.session.state == tcp::State::Established)
+            .expect("active session")
+            .handle;
+        let mut session = test_upstream_session(TcpProxyBufferLimits::with_all(
+            DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+            DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+            8,
+        ));
+        let mut events = Vec::new();
+
+        send_guest_buffered(
+            &mut session,
+            handle,
+            &mut gateway,
+            Instant::from_millis(5),
+            b"larger-than-limit-but-sendable",
+            GuestSendEvent::UpstreamPayload,
+            &mut events,
+        );
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TcpProxyEvent::UpstreamPayload { bytes, .. } if *bytes > 0
+        )));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TcpProxyEvent::BufferLimitExceeded { .. })));
+        assert!(session.pending_guest_bytes.is_empty());
+    }
+
+    #[test]
+    fn pending_guest_bytes_limit_fails_closed_before_buffering() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        establish_tcp_session(&mut gateway, 80);
+        let handle = gateway
+            .active_tcp_sessions()
+            .into_iter()
+            .find(|active| active.session.state == tcp::State::Established)
+            .expect("active session")
+            .handle;
+        let fill = vec![b'z'; 4096];
+        let mut filled = false;
+        for _ in 0..1024 {
+            let (written, _) = gateway
+                .send_tcp_session_partial(handle, &fill, Instant::from_millis(4))
+                .expect("fill guest send buffer");
+            if written == 0 {
+                filled = true;
+                break;
+            }
+        }
+        assert!(filled, "test requires a full guest-side TCP send buffer");
+        let mut session = UpstreamSession {
+            destination: TcpDestination {
+                ip: Ipv4Addr::from(PUBLIC_IP.octets()),
+                port: 80,
+                domain: None,
+            },
+            decision: TcpDecision {
+                action: TcpAction::Connect,
+                reason: "test".to_string(),
+            },
+            connection: MemoryConnection {
+                response: Vec::new(),
+                written: Vec::new(),
+                write_would_block_count: 0,
+            },
+            http_buffer: Vec::new(),
+            guest_tls: None,
+            upstream_tls: None,
+            upstream_tls_ready: false,
+            pending_upstream_bytes: Vec::new(),
+            pending_upstream_plaintext: Vec::new(),
+            pending_guest_bytes: vec![b'x'; 4],
+            buffer_limits: TcpProxyBufferLimits::with_all(
+                DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+                DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+                8,
+            ),
+        };
+        let mut events = Vec::new();
+
+        send_guest_buffered(
+            &mut session,
+            handle,
+            &mut gateway,
+            Instant::from_millis(5),
+            b"too-large",
+            GuestSendEvent::UpstreamPayload,
+            &mut events,
+        );
+
+        let limit_event = events
+            .iter()
+            .find(|event| matches!(event, TcpProxyEvent::BufferLimitExceeded { .. }))
+            .expect("buffer limit event");
+        let TcpProxyEvent::BufferLimitExceeded {
+            buffer,
+            limit,
+            attempted,
+            guest_frames,
+            ..
+        } = limit_event
+        else {
+            unreachable!();
+        };
+        assert_eq!(*buffer, TcpProxyBufferKind::PendingGuestBytes);
+        assert_eq!(*limit, 8);
+        assert!(*attempted > *limit);
+        assert!(!guest_frames.is_empty());
+        assert_eq!(session.pending_guest_bytes, vec![b'x'; 4]);
+    }
+
+    #[test]
+    fn https_pending_upstream_tls_limit_fails_closed_when_upstream_not_writable() {
+        let ca = TestCa::new("tcp-proxy-https-upstream-tls-limit");
+        let authority = Arc::new(ca.authority());
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.ca_cert()).expect("root");
+        let upstream_server_config = test_tls_server_config(&authority, "example.com");
+        let mut bridge = TcpProxyBridge::with_tls_mitm_and_client_config(
+            TlsServerConnector {
+                server_config: upstream_server_config,
+            },
+            authority.clone(),
+            Arc::new(rustls_client_config_with_roots(roots.clone()).expect("proxy client config")),
+        )
+        .expect("bridge")
+        .with_buffer_limits(TcpProxyBufferLimits::with_upstream_bytes(
+            8,
+            DEFAULT_TCP_PROXY_BUFFER_LIMIT,
+        ));
+        let (mut gateway, server_ack) = configured_https_gateway(&ca);
+        let mut guest_client = ClientConnection::new(
+            guest_client_config(roots),
+            ServerName::try_from("example.com")
+                .expect("server name")
+                .to_owned(),
+        )
+        .expect("guest client");
+        let guest_tls = drain_guest_client_tls(&mut guest_client);
+        assert!(!guest_tls.is_empty());
+        gateway.handle_guest_frame(
+            tcp_frame(
+                443,
+                TcpControl::Psh,
+                TcpSeqNumber(101),
+                Some(server_ack),
+                &guest_tls,
+            ),
+            Instant::from_millis(4),
+        );
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(5),
+            TcpProxyReadiness::selected(Vec::new(), Vec::new()),
+        );
+
+        let limit_event = events
+            .iter()
+            .find(|event| matches!(event, TcpProxyEvent::BufferLimitExceeded { .. }))
+            .expect("buffer limit event");
+        let TcpProxyEvent::BufferLimitExceeded {
+            buffer,
+            limit,
+            attempted,
+            guest_frames,
+            ..
+        } = limit_event
+        else {
+            unreachable!();
+        };
+        assert_eq!(*buffer, TcpProxyBufferKind::PendingUpstreamBytes);
+        assert_eq!(*limit, 8);
+        assert!(*attempted > *limit);
+        assert!(!guest_frames.is_empty());
+    }
+
+    #[test]
+    fn https_pending_plaintext_limit_fails_closed_when_upstream_not_writable() {
+        let ca = TestCa::new("tcp-proxy-https-plaintext-limit");
+        let authority = Arc::new(ca.authority());
+        let mut roots = RootCertStore::empty();
+        roots.add(authority.ca_cert()).expect("root");
+        let upstream_server_config = test_tls_server_config(&authority, "example.com");
+        let mut bridge = TcpProxyBridge::with_tls_mitm_and_client_config(
+            TlsServerConnector {
+                server_config: upstream_server_config,
+            },
+            authority.clone(),
+            Arc::new(rustls_client_config_with_roots(roots.clone()).expect("proxy client config")),
+        )
+        .expect("bridge")
+        .with_buffer_limits(TcpProxyBufferLimits::new(8));
+        let (mut gateway, server_ack) = configured_https_gateway(&ca);
+        let mut guest_client = ClientConnection::new(
+            guest_client_config(roots),
+            ServerName::try_from("example.com")
+                .expect("server name")
+                .to_owned(),
+        )
+        .expect("guest client");
+        let mut guest_seq = 101_i32;
+        let mut clock = 4_i64;
+
+        send_guest_tls_to_proxy(
+            &mut guest_client,
+            &mut gateway,
+            &mut bridge,
+            server_ack,
+            &mut guest_seq,
+            &mut clock,
+        );
+        assert!(!guest_client.is_handshaking());
+        let handle = bridge.session_handles().pop().expect("proxy session");
+
+        guest_client
+            .writer()
+            .write_all(b"GET /too-large HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .expect("request");
+        let request_tls = drain_guest_client_tls(&mut guest_client);
+        gateway.handle_guest_frame(
+            tcp_frame(
+                443,
+                TcpControl::Psh,
+                TcpSeqNumber(guest_seq),
+                Some(server_ack),
+                &request_tls,
+            ),
+            Instant::from_millis(clock),
+        );
+
+        let events = bridge.process_gateway_with_readiness(
+            &mut gateway,
+            Instant::from_millis(clock + 1),
+            TcpProxyReadiness::selected(Vec::new(), Vec::new()),
+        );
+
+        let limit_event = events
+            .iter()
+            .find(|event| matches!(event, TcpProxyEvent::BufferLimitExceeded { .. }))
+            .expect("buffer limit event");
+        let TcpProxyEvent::BufferLimitExceeded {
+            buffer,
+            limit,
+            attempted,
+            guest_frames,
+            ..
+        } = limit_event
+        else {
+            unreachable!();
+        };
+        assert_eq!(*buffer, TcpProxyBufferKind::PendingUpstreamPlaintext);
+        assert_eq!(*limit, 8);
+        assert!(*attempted > *limit);
+        assert!(!guest_frames.is_empty());
+
+        bridge.process_gateway(&mut gateway, Instant::from_millis(clock + 2));
+        assert_eq!(bridge.session_interest(handle), None);
+    }
+
     #[test]
     fn https_guest_without_sni_fails_before_upstream_connect() {
         let ca = TestCa::new("tcp-proxy-https-nosni");
@@ -1475,13 +2252,25 @@ mod tests {
             &mut clock,
         );
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TcpProxyEvent::TlsMitmFailed {
-                error: TlsMitmError::Tls(_),
-                ..
-            }
-        )));
+        let failed = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    TcpProxyEvent::TlsMitmFailed {
+                        error: TlsMitmError::Tls(_),
+                        ..
+                    }
+                )
+            })
+            .expect("TLS MITM failure");
+        let TcpProxyEvent::TlsMitmFailed { guest_frames, .. } = failed else {
+            unreachable!();
+        };
+        assert!(
+            !guest_frames.is_empty(),
+            "fatal guest TLS failure must close/reset the guest session"
+        );
         let session = bridge.sessions.values().next().expect("session");
         assert!(
             session.upstream_tls.is_none(),
@@ -1528,13 +2317,25 @@ mod tests {
             &mut clock,
         );
 
-        assert!(events.iter().any(|event| matches!(
-            event,
-            TcpProxyEvent::TlsMitmFailed {
-                error: TlsMitmError::Tls(_) | TlsMitmError::Io(_),
-                ..
-            }
-        )));
+        let failed = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event,
+                    TcpProxyEvent::TlsMitmFailed {
+                        error: TlsMitmError::Tls(_) | TlsMitmError::Io(_),
+                        ..
+                    }
+                )
+            })
+            .expect("TLS MITM failure");
+        let TcpProxyEvent::TlsMitmFailed { guest_frames, .. } = failed else {
+            unreachable!();
+        };
+        assert!(
+            !guest_frames.is_empty(),
+            "fatal upstream TLS failure must close/reset the guest session"
+        );
     }
 
     #[derive(Debug, Clone)]
@@ -1632,6 +2433,20 @@ mod tests {
     }
 
     #[derive(Debug, Clone)]
+    struct PanicConnector;
+
+    impl TcpUpstreamConnector for PanicConnector {
+        type Connection = MemoryConnection;
+
+        fn connect(
+            &self,
+            _destination: &TcpDestination,
+        ) -> Result<Self::Connection, TcpConnectError> {
+            panic!("connect planning must not call connector")
+        }
+    }
+
+    #[derive(Debug, Clone)]
     struct FailingConnector;
 
     impl TcpUpstreamConnector for FailingConnector {
@@ -1678,6 +2493,33 @@ mod tests {
         response: Vec<u8>,
         written: Vec<u8>,
         write_would_block_count: usize,
+    }
+
+    fn test_upstream_session(limits: TcpProxyBufferLimits) -> UpstreamSession<MemoryConnection> {
+        UpstreamSession {
+            destination: TcpDestination {
+                ip: Ipv4Addr::from(PUBLIC_IP.octets()),
+                port: 80,
+                domain: None,
+            },
+            decision: TcpDecision {
+                action: TcpAction::Connect,
+                reason: "test".to_string(),
+            },
+            connection: MemoryConnection {
+                response: Vec::new(),
+                written: Vec::new(),
+                write_would_block_count: 0,
+            },
+            http_buffer: Vec::new(),
+            guest_tls: None,
+            upstream_tls: None,
+            upstream_tls_ready: false,
+            pending_upstream_bytes: Vec::new(),
+            pending_upstream_plaintext: Vec::new(),
+            pending_guest_bytes: Vec::new(),
+            buffer_limits: limits,
+        }
     }
 
     impl Read for MemoryConnection {

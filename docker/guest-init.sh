@@ -24,6 +24,7 @@ readonly ROOT_OVERLAY_STATE_DEVICE
 readonly GUEST_DOCKERD_LOG=/run/dockerd.log
 readonly GUEST_SOCKET_BRIDGE_LOG=/run/socket-bridge.log
 readonly GUEST_PAYLOAD_SERVER_LOG=/run/payload-server.log
+readonly DOCKER_SOCK=/var/run/docker.sock
 
 log() {
   echo "agentvm-init: $*"
@@ -234,6 +235,63 @@ dump_log_if_present() {
   fi
 }
 
+docker_socket_exists() {
+  [ -S "$1" ]
+}
+
+docker_socket_ping() {
+  python3 - "$1" <<'PY'
+import socket
+import sys
+
+sock_path = sys.argv[1]
+try:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(1.0)
+    sock.connect(sock_path)
+    sock.sendall(b"GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n")
+    response = sock.recv(4096)
+finally:
+    try:
+        sock.close()
+    except NameError:
+        pass
+
+header, _, body = response.partition(b"\r\n\r\n")
+if b" 200 " in header and body.strip() == b"OK":
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+
+wait_for_docker_ready() {
+  docker_sock="$1"
+  dockerd_pid="$2"
+  max_attempts="${3:-600}"
+  sleep_interval="${4:-0.1}"
+  attempts=0
+
+  log "waiting for Docker socket readiness at ${docker_sock}"
+  while :; do
+    if docker_socket_exists "${docker_sock}" && docker_socket_ping "${docker_sock}"; then
+      log "Docker socket is ready"
+      return 0
+    fi
+
+    if ! kill -0 "${dockerd_pid}" 2>/dev/null; then
+      log "error: dockerd exited before Docker socket became ready"
+      return 1
+    fi
+
+    attempts=$((attempts + 1))
+    if [ "${attempts}" -ge "${max_attempts}" ]; then
+      log "error: timed out waiting for Docker socket readiness at ${docker_sock}"
+      return 1
+    fi
+    sleep "${sleep_interval}"
+  done
+}
+
 wait_for_critical_exit() {
   while :; do
     for pid in "${DOCKERD_PID}" "${BRIDGE_PID}" "${PAYLOAD_SERVER_PID}"; do
@@ -359,17 +417,23 @@ fi
 
 log "starting dockerd"
 dockerd \
-  --host=unix:///var/run/docker.sock \
+  --host=unix://${DOCKER_SOCK} \
   --data-root=/var/lib/docker \
   --exec-root=/run/docker \
   >"${GUEST_DOCKERD_LOG}" 2>&1 &
 DOCKERD_PID=$!
 
+if ! wait_for_docker_ready "${DOCKER_SOCK}" "${DOCKERD_PID}"; then
+  dump_log_if_present "${GUEST_DOCKERD_LOG}" dockerd.log
+  teardown
+  exit 1
+fi
+
 log "starting socket bridge"
 python3 -u /usr/local/libexec/agentvm-socket-bridge \
   --tcp-host 0.0.0.0 \
   --tcp-port "${DOCKER_TCP_PORT}" \
-  --docker-sock /var/run/docker.sock \
+  --docker-sock "${DOCKER_SOCK}" \
   >"${GUEST_SOCKET_BRIDGE_LOG}" 2>&1 &
 BRIDGE_PID=$!
 

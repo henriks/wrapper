@@ -8,7 +8,8 @@ use smoltcp::wire::{
 };
 
 use crate::dns_proxy::{
-    dns_allowed_to_destination, DnsLogEntry, DnsProxy, DnsUpstream, UdpDnsUpstream,
+    dns_allowed_to_destination, DnsForwardRequest, DnsLogEntry, DnsProxy, DnsProxyPlan,
+    DnsUpstream, DnsUpstreamError, UdpDnsUpstream,
 };
 use crate::guest_tcp::{
     evaluate_tcp_syn_frame, GuestTcpConnectError, GuestTcpCore, GuestTcpCoreError,
@@ -17,6 +18,7 @@ use crate::guest_tcp::{
 use crate::l2_gateway::{ipv4_checksum, L2Gateway, ParseAddressError};
 use crate::network_policy::VmnetPolicy;
 use crate::tcp_gateway::{TcpAction, TcpDecision, TcpDestination};
+use crate::vmnet_service_io::{VmnetDnsLookupCommand, VmnetServiceCommand, VmnetServiceToken};
 use crate::GuestNetwork;
 
 pub struct VmnetGateway<'a> {
@@ -57,20 +59,47 @@ impl<'a> VmnetGateway<'a> {
     }
 
     pub fn handle_guest_frame(&mut self, frame: Vec<u8>, now: Instant) -> GuestFrameResult {
+        match self.handle_guest_frame_with_deferred_dns(frame, now) {
+            VmnetDeferredDnsFrame::Immediate(result) => result,
+            VmnetDeferredDnsFrame::Forward(pending) => {
+                let exchange = self.dns_upstream.exchange(&pending.request.query);
+                let result = self.complete_pending_dns_query(pending, exchange);
+                GuestFrameResult {
+                    outcome: GuestFrameOutcome::DnsQuery { log: result.log },
+                    guest_frames: result.response.into_iter().collect(),
+                }
+            }
+        }
+    }
+
+    pub(crate) fn handle_guest_frame_with_deferred_dns(
+        &mut self,
+        frame: Vec<u8>,
+        now: Instant,
+    ) -> VmnetDeferredDnsFrame {
         if let Some(reply) = self.l2.handle_frame(&frame) {
-            return GuestFrameResult {
+            return VmnetDeferredDnsFrame::Immediate(GuestFrameResult {
                 outcome: GuestFrameOutcome::L2Response,
                 guest_frames: vec![reply],
+            });
+        }
+
+        if let Some(plan) = self.plan_dns_frame(&frame) {
+            return match plan {
+                VmnetDnsFramePlan::Immediate(result) => {
+                    VmnetDeferredDnsFrame::Immediate(GuestFrameResult {
+                        outcome: GuestFrameOutcome::DnsQuery { log: result.log },
+                        guest_frames: result.response.into_iter().collect(),
+                    })
+                }
+                VmnetDnsFramePlan::Forward(pending) => VmnetDeferredDnsFrame::Forward(pending),
             };
         }
 
-        if let Some(result) = self.handle_dns_frame(&frame) {
-            return GuestFrameResult {
-                outcome: GuestFrameOutcome::DnsQuery { log: result.log },
-                guest_frames: result.response.into_iter().collect(),
-            };
-        }
+        VmnetDeferredDnsFrame::Immediate(self.handle_non_dns_guest_frame(frame, now))
+    }
 
+    fn handle_non_dns_guest_frame(&mut self, frame: Vec<u8>, now: Instant) -> GuestFrameResult {
         if let Some(denial) = udp_denial_from_frame(self.policy, &frame) {
             return GuestFrameResult {
                 outcome: GuestFrameOutcome::UdpDenied(denial),
@@ -210,18 +239,32 @@ impl<'a> VmnetGateway<'a> {
         self.drain_tcp_frames()
     }
 
-    fn handle_dns_frame(&self, frame: &[u8]) -> Option<DnsFrameResult> {
+    pub(crate) fn plan_dns_frame(&self, frame: &[u8]) -> Option<VmnetDnsFramePlan> {
         let query = parse_dns_query_frame(self.policy, frame)?;
+        let context = query.response_context();
         let proxy = DnsProxy::new(self.policy, self.dns_upstream.as_ref());
-        let result = proxy.handle_udp_payload(query.payload);
-        let response = result
-            .response
-            .as_ref()
-            .map(|payload| dns_response_frame(&query, payload));
-        Some(DnsFrameResult {
-            response,
-            log: result.log,
-        })
+        match proxy.plan_udp_payload(query.payload) {
+            DnsProxyPlan::Immediate(result) => Some(VmnetDnsFramePlan::Immediate(
+                DnsFrameResult::from_proxy_result(context, result),
+            )),
+            DnsProxyPlan::Forward(request) => {
+                Some(VmnetDnsFramePlan::Forward(VmnetPendingDnsQuery {
+                    context,
+                    request,
+                }))
+            }
+        }
+    }
+
+    pub(crate) fn complete_pending_dns_query(
+        &self,
+        pending: VmnetPendingDnsQuery,
+        exchange: Result<hickory_proto::op::Message, DnsUpstreamError>,
+    ) -> DnsFrameResult {
+        let proxy = DnsProxy::new(self.policy, self.dns_upstream.as_ref());
+        let context = pending.context;
+        let result = proxy.complete_forward(pending.request, exchange);
+        DnsFrameResult::from_proxy_result(context, result)
     }
 
     fn drain_tcp_frames(&mut self) -> Vec<Vec<u8>> {
@@ -293,9 +336,60 @@ fn ethernet_mtu(policy: &VmnetPolicy) -> usize {
     usize::from(policy.mtu) + 14
 }
 
-struct DnsFrameResult {
-    response: Option<Vec<u8>>,
-    log: DnsLogEntry,
+pub(crate) enum VmnetDeferredDnsFrame {
+    Immediate(GuestFrameResult),
+    Forward(VmnetPendingDnsQuery),
+}
+
+pub(crate) enum VmnetDnsFramePlan {
+    Immediate(DnsFrameResult),
+    Forward(VmnetPendingDnsQuery),
+}
+
+pub(crate) struct VmnetPendingDnsQuery {
+    pub context: DnsResponseContext,
+    pub request: DnsForwardRequest,
+}
+
+impl VmnetPendingDnsQuery {
+    #[allow(dead_code)]
+    pub(crate) fn service_command(&self, token: VmnetServiceToken) -> VmnetServiceCommand {
+        VmnetServiceCommand::DnsLookup(VmnetDnsLookupCommand {
+            token,
+            request: self.request.clone(),
+        })
+    }
+}
+
+pub(crate) struct DnsFrameResult {
+    pub response: Option<Vec<u8>>,
+    pub log: DnsLogEntry,
+}
+
+impl DnsFrameResult {
+    fn from_proxy_result(
+        context: DnsResponseContext,
+        result: crate::dns_proxy::DnsProxyResult,
+    ) -> Self {
+        let response = result
+            .response
+            .as_ref()
+            .map(|payload| dns_response_frame(&context, payload));
+        Self {
+            response,
+            log: result.log,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DnsResponseContext {
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    src_port: u16,
+    dst_port: u16,
 }
 
 struct DnsQueryFrame<'a> {
@@ -306,6 +400,19 @@ struct DnsQueryFrame<'a> {
     src_port: u16,
     dst_port: u16,
     payload: &'a [u8],
+}
+
+impl DnsQueryFrame<'_> {
+    fn response_context(&self) -> DnsResponseContext {
+        DnsResponseContext {
+            src_mac: self.src_mac,
+            dst_mac: self.dst_mac,
+            src_ip: self.src_ip,
+            dst_ip: self.dst_ip,
+            src_port: self.src_port,
+            dst_port: self.dst_port,
+        }
+    }
 }
 
 fn parse_dns_query_frame<'a>(policy: &VmnetPolicy, frame: &'a [u8]) -> Option<DnsQueryFrame<'a>> {
@@ -324,7 +431,7 @@ fn parse_dns_query_frame<'a>(policy: &VmnetPolicy, frame: &'a [u8]) -> Option<Dn
     })
 }
 
-fn dns_response_frame(query: &DnsQueryFrame<'_>, payload: &[u8]) -> Vec<u8> {
+fn dns_response_frame(query: &DnsResponseContext, payload: &[u8]) -> Vec<u8> {
     let udp_len = 8 + payload.len();
     let ip_total_len = 20 + udp_len;
     let mut ipv4 = Vec::with_capacity(ip_total_len);
@@ -460,7 +567,7 @@ fn parse_udp_frame(frame: &[u8]) -> Option<UdpFrame<'_>> {
     })
 }
 
-fn default_dns_upstream() -> Box<dyn DnsUpstream> {
+pub(crate) fn default_dns_upstream() -> Box<dyn DnsUpstream + Send> {
     Box::new(UdpDnsUpstream {
         server: host_dns_server().unwrap_or_else(|| SocketAddr::from(([1, 1, 1, 1], 53))),
         timeout: Duration::from_secs(5),
@@ -602,6 +709,106 @@ mod tests {
         let response = Message::from_vec(payload).expect("dns response");
         assert_eq!(response.metadata.id, 0x1234);
         assert!(response.metadata.recursion_available);
+    }
+
+    #[test]
+    fn deferred_dns_query_does_not_block_unrelated_tcp_syn() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        let mut gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+
+        let dns = gateway.handle_guest_frame_with_deferred_dns(
+            dns_query_frame("example.com", DNS_IP, 53000),
+            Instant::from_millis(1),
+        );
+        let VmnetDeferredDnsFrame::Forward(pending) = dns else {
+            panic!("allowed DNS query should be deferred");
+        };
+        assert_eq!(pending.request.domain, "example.com");
+
+        let tcp = gateway
+            .handle_guest_frame_with_deferred_dns(tcp_syn_frame(80), Instant::from_millis(2));
+        let VmnetDeferredDnsFrame::Immediate(result) = tcp else {
+            panic!("TCP frames must stay owner-side while DNS is pending");
+        };
+        assert!(matches!(
+            result.outcome,
+            GuestFrameOutcome::TcpAccepted { .. }
+        ));
+    }
+
+    #[test]
+    fn pending_dns_query_builds_service_command_without_losing_owner_context() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+
+        let VmnetDnsFramePlan::Forward(pending) = gateway
+            .plan_dns_frame(&dns_query_frame("example.com", DNS_IP, 53000))
+            .expect("dns plan")
+        else {
+            panic!("allowed DNS query should be service IO");
+        };
+        let command = pending.service_command(VmnetServiceToken::new(99));
+
+        let VmnetServiceCommand::DnsLookup(command) = command else {
+            panic!("expected DNS service command");
+        };
+        assert_eq!(command.token, VmnetServiceToken::new(99));
+        assert_eq!(command.request.domain, "example.com");
+        assert_eq!(pending.context.src_port, 53000);
+    }
+
+    #[test]
+    fn dns_query_can_be_planned_and_completed_without_upstream_on_owner_path() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
+        let gateway = VmnetGateway::new_with_dns_upstream(
+            &policy,
+            &network,
+            Instant::from_millis(0),
+            Box::new(PanicDnsUpstream),
+        )
+        .expect("gateway");
+
+        let plan = gateway
+            .plan_dns_frame(&dns_query_frame("example.com", DNS_IP, 53000))
+            .expect("dns plan");
+        let VmnetDnsFramePlan::Forward(pending) = plan else {
+            panic!("allowed DNS query should be deferred to service IO");
+        };
+        assert_eq!(pending.request.domain, "example.com");
+
+        let result =
+            gateway.complete_pending_dns_query(pending, Err(DnsUpstreamError::Unavailable));
+
+        assert_eq!(result.log.domain.as_deref(), Some("example.com"));
+        assert_eq!(result.log.decision, DnsDecision::UpstreamFailure);
+        let frame = result.response.expect("servfail frame");
+        let (src_port, dst_port, payload) = parse_udp_reply(&frame);
+        assert_eq!(src_port, 53);
+        assert_eq!(dst_port, 53000);
+        let response = Message::from_vec(payload).expect("dns response");
+        assert_eq!(
+            response.metadata.response_code,
+            hickory_proto::op::ResponseCode::ServFail
+        );
     }
 
     #[test]
@@ -1161,6 +1368,15 @@ mod tests {
                     "unexpected session at generated step {step}"
                 );
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanicDnsUpstream;
+
+    impl DnsUpstream for PanicDnsUpstream {
+        fn exchange(&self, _query: &Message) -> Result<Message, DnsUpstreamError> {
+            panic!("planned DNS path must not call upstream synchronously")
         }
     }
 

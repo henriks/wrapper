@@ -30,3 +30,13 @@ Validation:
 - Update no-SNI and invalid-upstream TLS tests to assert session closure and guest frames.
 - Add a live HTTPS regression for a bad upstream endpoint proving the guest command exits promptly.
 
+
+## Notes
+
+**2026-05-16T18:32:03Z**
+
+wra-g13g has implemented part of this linked behavior in the TLS MITM owner path: active TcpProxyEvent::TlsMitmFailed events now carry guest close/reset frames from VmnetGateway::close_tcp_session, and no-SNI / invalid-upstream-TLS regressions assert guest-visible closure. Remaining wra-vl1o scope should verify any other fatal TLS edge cases and runtime/session cleanup semantics.
+
+**2026-05-16T21:46:56Z**
+
+Review after closing wra-i3t9 and wra-g13g: the main active TLS MITM fatal paths now emit guest close/reset frames (no-SNI guest TLS and invalid upstream TLS have regressions), and upstream connect failure closure is no longer a blocker. Keep this ticket open for the remaining edge sweep and the requested live bad-upstream HTTPS regression before declaring the TLS failure surface fully closed.

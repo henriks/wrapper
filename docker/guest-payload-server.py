@@ -26,6 +26,10 @@ DEFAULT_DIAGNOSTIC_TIMEOUT_SECONDS = 10.0
 MAX_DIAGNOSTIC_TIMEOUT_SECONDS = 60.0
 DEFAULT_DIAGNOSTIC_OUTPUT_BYTES = 1024 * 1024
 MAX_DIAGNOSTIC_OUTPUT_BYTES = 4 * 1024 * 1024
+DEFAULT_INITIAL_FRAME_TIMEOUT_SECONDS = 10.0
+DEFAULT_SESSION_IO_TIMEOUT_SECONDS = 30.0
+DEFAULT_MAX_CLIENTS = 16
+DEFAULT_MAX_DIAGNOSTIC_SESSIONS = 4
 
 
 def log(msg: str) -> None:
@@ -60,6 +64,23 @@ def send_frame(sock: socket.socket, frame_type: bytes, payload: bytes = b"",
         return
     with lock:
         sock.sendall(frame)
+
+
+def terminate_process_group(proc: subprocess.Popen[object], grace_seconds: float = 2.0) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=grace_seconds)
 
 
 def set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -134,6 +155,7 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
     os.close(slave_fd)
     send_lock = threading.Lock()
     finished = threading.Event()
+    client_failed = threading.Event()
 
     def output_loop() -> None:
         try:
@@ -148,10 +170,15 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
                     break
                 send_frame(conn, b"O", chunk, send_lock)
         except OSError as exc:
+            client_failed.set()
+            finished.set()
             log(f"output loop stopped: {exc}")
 
     def wait_loop() -> None:
         exit_code = proc.wait()
+        if client_failed.is_set():
+            finished.set()
+            return
         payload = json.dumps({"exit_code": exit_code}).encode("utf-8")
         try:
             send_frame(conn, b"X", payload, send_lock)
@@ -167,6 +194,9 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
 
     try:
         while not finished.is_set():
+            readable, _, _ = select.select([conn], [], [], 0.1)
+            if not readable:
+                continue
             frame_type, payload = recv_frame(conn)
             if frame_type == b"I":
                 if payload:
@@ -183,22 +213,10 @@ def run_payload(conn: socket.socket, request: dict[str, object]) -> None:
                 except ProcessLookupError:
                     pass
                 continue
-    except EOFError:
-        log("client disconnected during payload execution")
+    except (EOFError, TimeoutError, socket.timeout):
+        log("client disconnected or timed out during payload execution")
     finally:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=2.0)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                proc.wait(timeout=2.0)
+        terminate_process_group(proc)
         try:
             os.close(master_fd)
         except OSError:
@@ -265,48 +283,52 @@ def run_diagnostic(conn: socket.socket, request: dict[str, object], session_id: 
     truncated = False
     fd = proc.stdout.fileno()
     try:
-        while True:
-            now = time.monotonic()
-            if now >= deadline and proc.poll() is None:
-                timed_out = True
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            remaining = max(0.0, deadline - now) if proc.poll() is None else 0.0
-            readable, _, _ = select.select([fd], [], [], min(0.1, remaining))
-            if readable:
-                capacity = max_output_bytes - sent
-                if capacity <= 0:
-                    truncated = True
-                    if proc.poll() is None:
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    continue
-                chunk = os.read(fd, min(65536, capacity))
-                if chunk:
-                    sent += len(chunk)
-                    send_frame(conn, b"O", chunk)
-                    if sent >= max_output_bytes and proc.poll() is None:
+        try:
+            while True:
+                now = time.monotonic()
+                if now >= deadline and proc.poll() is None:
+                    timed_out = True
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                remaining = max(0.0, deadline - now) if proc.poll() is None else 0.0
+                readable, _, _ = select.select([fd], [], [], min(0.1, remaining))
+                if readable:
+                    capacity = max_output_bytes - sent
+                    if capacity <= 0:
                         truncated = True
-                        try:
-                            os.killpg(proc.pid, signal.SIGKILL)
-                        except ProcessLookupError:
-                            pass
-                    continue
-            if proc.poll() is not None:
-                while True:
-                    chunk = os.read(fd, min(65536, max(0, max_output_bytes - sent)))
-                    if not chunk:
-                        break
-                    sent += len(chunk)
-                    send_frame(conn, b"O", chunk)
-                    if sent >= max_output_bytes:
-                        truncated = True
-                        break
-                break
+                        if proc.poll() is None:
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        continue
+                    chunk = os.read(fd, min(65536, capacity))
+                    if chunk:
+                        sent += len(chunk)
+                        send_frame(conn, b"O", chunk)
+                        if sent >= max_output_bytes and proc.poll() is None:
+                            truncated = True
+                            try:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                            except ProcessLookupError:
+                                pass
+                        continue
+                if proc.poll() is not None:
+                    while True:
+                        chunk = os.read(fd, min(65536, max(0, max_output_bytes - sent)))
+                        if not chunk:
+                            break
+                        sent += len(chunk)
+                        send_frame(conn, b"O", chunk)
+                        if sent >= max_output_bytes:
+                            truncated = True
+                            break
+                    break
+        except OSError:
+            terminate_process_group(proc)
+            raise
     finally:
         try:
             proc.stdout.close()
@@ -330,18 +352,24 @@ def run_diagnostic(conn: socket.socket, request: dict[str, object], session_id: 
     log(f"diagnostic session {session_id} exited code={exit_code} timed_out={timed_out} truncated={truncated}")
 
 
-def handle_client(conn: socket.socket, session_lock: threading.Lock,
-                  diagnostic_sem: threading.BoundedSemaphore | None = None,
-                  session_ids: itertools.count | None = None) -> None:
+def handle_client(
+    conn: socket.socket,
+    session_lock: threading.Lock,
+    diagnostic_sem: threading.BoundedSemaphore | None = None,
+    session_ids: itertools.count | None = None,
+    initial_timeout: float = DEFAULT_INITIAL_FRAME_TIMEOUT_SECONDS,
+    io_timeout: float = DEFAULT_SESSION_IO_TIMEOUT_SECONDS,
+) -> None:
     if diagnostic_sem is None:
-        diagnostic_sem = threading.BoundedSemaphore(4)
+        diagnostic_sem = threading.BoundedSemaphore(DEFAULT_MAX_DIAGNOSTIC_SESSIONS)
     if session_ids is None:
         session_ids = itertools.count(1)
     with conn:
+        conn.settimeout(initial_timeout)
         try:
             frame_type, payload = recv_frame(conn)
-        except EOFError as exc:
-            log(f"payload client disconnected before initial frame: {exc}")
+        except (EOFError, TimeoutError, socket.timeout) as exc:
+            log(f"payload client disconnected or timed out before initial frame: {exc}")
             return
         except ValueError as exc:
             log(f"payload protocol failed: {exc}")
@@ -350,6 +378,7 @@ def handle_client(conn: socket.socket, session_lock: threading.Lock,
             except OSError:
                 pass
             return
+        conn.settimeout(io_timeout)
         if frame_type == b"P":
             send_frame(conn, b"K", b"ok")
             return
@@ -392,24 +421,52 @@ def handle_client(conn: socket.socket, session_lock: threading.Lock,
             session_lock.release()
 
 
-def serve_tcp(tcp_host: str, tcp_port: int) -> None:
+def start_client_thread(
+    conn: socket.socket,
+    session_lock: threading.Lock,
+    diagnostic_sem: threading.BoundedSemaphore,
+    session_ids: itertools.count,
+    client_sem: threading.BoundedSemaphore,
+    initial_timeout: float = DEFAULT_INITIAL_FRAME_TIMEOUT_SECONDS,
+    io_timeout: float = DEFAULT_SESSION_IO_TIMEOUT_SECONDS,
+) -> bool:
+    if not client_sem.acquire(blocking=False):
+        log("rejecting payload client: session limit reached")
+        conn.close()
+        return False
+
+    def run() -> None:
+        try:
+            handle_client(conn, session_lock, diagnostic_sem, session_ids, initial_timeout, io_timeout)
+        finally:
+            client_sem.release()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return True
+
+
+def serve_tcp(
+    tcp_host: str,
+    tcp_port: int,
+    max_clients: int = DEFAULT_MAX_CLIENTS,
+    max_diagnostics: int = DEFAULT_MAX_DIAGNOSTIC_SESSIONS,
+    initial_timeout: float = DEFAULT_INITIAL_FRAME_TIMEOUT_SECONDS,
+    io_timeout: float = DEFAULT_SESSION_IO_TIMEOUT_SECONDS,
+) -> None:
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((tcp_host, tcp_port))
-    listener.listen()
+    listener.listen(max_clients)
     session_lock = threading.Lock()
-    diagnostic_sem = threading.BoundedSemaphore(4)
+    diagnostic_sem = threading.BoundedSemaphore(max_diagnostics)
+    client_sem = threading.BoundedSemaphore(max_clients)
     session_ids = itertools.count(1)
-    log(f"listening on tcp {tcp_host}:{tcp_port}")
+    log(f"listening on tcp {tcp_host}:{tcp_port} max_clients={max_clients} max_diagnostics={max_diagnostics}")
 
     while True:
         conn, _ = listener.accept()
-        thread = threading.Thread(
-            target=handle_client,
-            args=(conn, session_lock, diagnostic_sem, session_ids),
-            daemon=True,
-        )
-        thread.start()
+        start_client_thread(conn, session_lock, diagnostic_sem, session_ids, client_sem, initial_timeout, io_timeout)
 
 
 def parse_args() -> argparse.Namespace:
@@ -418,12 +475,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tcp-port", type=int, required=True)
     parser.add_argument("--tcp-host", default="0.0.0.0")
+    parser.add_argument("--max-clients", type=int, default=DEFAULT_MAX_CLIENTS)
+    parser.add_argument("--max-diagnostics", type=int, default=DEFAULT_MAX_DIAGNOSTIC_SESSIONS)
+    parser.add_argument("--initial-timeout", type=float, default=DEFAULT_INITIAL_FRAME_TIMEOUT_SECONDS)
+    parser.add_argument("--io-timeout", type=float, default=DEFAULT_SESSION_IO_TIMEOUT_SECONDS)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    serve_tcp(args.tcp_host, args.tcp_port)
+    serve_tcp(
+        args.tcp_host,
+        args.tcp_port,
+        args.max_clients,
+        args.max_diagnostics,
+        args.initial_timeout,
+        args.io_timeout,
+    )
     return 0
 
 

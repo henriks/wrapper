@@ -30,3 +30,13 @@ Validation:
 - Extend live-persistence to write many files plus Docker/setup markers, shutdown, relaunch, and assert no fsck/kernel errors and all markers remain.
 - Run live-setup-tools and required validation before closing.
 
+
+## Notes
+
+**2026-05-16T16:59:13Z**
+
+Cross-ticket note from wra-2qij: self-test now performs bounded diagnostic sync before force terminate and fails if sync/deadline fails. Normal launch still warns on sync failure, and RunningFrontend::terminate still force-kills QEMU. True graceful guest/QMP poweroff remains for wra-ylfx rather than being hidden in the async-service-IO slice.
+
+**2026-05-16T21:46:50Z**
+
+Review after wra-35eb/wra-m7gg/wra-2qij: still valid. The payload side now has a local-abort path and bounded diagnostic sync is used for self-test, but normal launch still treats flush_guest_filesystems failure as a warning and RunningFrontend::terminate still force-kills QEMU. This ticket remains the owner for guest/QMP poweroff, bounded graceful wait, fatal persistence/setup sync semantics, and live persistence/setup validation.

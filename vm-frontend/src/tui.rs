@@ -4,7 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use agentvm_frontend::payload_client::{
-    PayloadClientError, PayloadEvent, PayloadRequest, PayloadSession, PayloadWriter,
+    PayloadClientError, PayloadControlAction, PayloadControlPolicy, PayloadEvent, PayloadRequest,
+    PayloadSession, PayloadWriter,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect, Size};
@@ -591,7 +592,7 @@ fn key_event_to_guest_input(key: KeyEvent) -> Option<GuestInput> {
         return Some(GuestInput::Reserved);
     }
     if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
-        return Some(GuestInput::Signal(libc::SIGINT));
+        return ctrl_c_to_guest_input(0);
     }
 
     let bytes = match key.code {
@@ -624,6 +625,14 @@ fn key_event_to_guest_input(key: KeyEvent) -> Option<GuestInput> {
         _ => return None,
     };
     Some(GuestInput::Bytes(bytes))
+}
+
+fn ctrl_c_to_guest_input(forwarded_interrupts: usize) -> Option<GuestInput> {
+    match PayloadControlPolicy::interactive().tui_ctrl_c_action(forwarded_interrupts) {
+        PayloadControlAction::ForwardSignal(signal) => Some(GuestInput::Signal(signal)),
+        PayloadControlAction::LocalAbort => Some(GuestInput::Reserved),
+        PayloadControlAction::ForwardResize | PayloadControlAction::Ignore => None,
+    }
 }
 
 fn ctrl_char_bytes(ch: char) -> Option<Vec<u8>> {
@@ -843,6 +852,7 @@ mod tests {
             key_event_to_guest_input(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(GuestInput::Signal(libc::SIGINT))
         );
+        assert_eq!(ctrl_c_to_guest_input(1), Some(GuestInput::Reserved));
         assert_eq!(
             key_event_to_guest_input(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL)),
             Some(GuestInput::Reserved)

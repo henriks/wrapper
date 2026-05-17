@@ -23,8 +23,18 @@ where
     }
 
     pub fn handle_udp_payload(&self, payload: &[u8]) -> DnsProxyResult {
+        match self.plan_udp_payload(payload) {
+            DnsProxyPlan::Immediate(result) => result,
+            DnsProxyPlan::Forward(request) => {
+                let exchange = self.upstream.exchange(&request.query);
+                self.complete_forward(request, exchange)
+            }
+        }
+    }
+
+    pub fn plan_udp_payload(&self, payload: &[u8]) -> DnsProxyPlan {
         if payload_has_answer_or_authority_records(payload) {
-            return DnsProxyResult {
+            return DnsProxyPlan::Immediate(DnsProxyResult {
                 response: None,
                 log: DnsLogEntry {
                     domain: None,
@@ -32,58 +42,69 @@ where
                     detail: "DNS query payload must not contain answer or authority records"
                         .to_string(),
                 },
-            };
+            });
         }
 
         let query = match parse_message(payload) {
             Ok(query) => query,
             Err(error) => {
-                return DnsProxyResult {
+                return DnsProxyPlan::Immediate(DnsProxyResult {
                     response: None,
                     log: DnsLogEntry {
                         domain: None,
                         decision: DnsDecision::Malformed,
                         detail: error,
                     },
-                };
+                });
             }
         };
 
         let Some(domain) = query_domain(&query) else {
-            return DnsProxyResult {
+            return DnsProxyPlan::Immediate(DnsProxyResult {
                 response: serialize_response(error_response(&query, ResponseCode::FormErr)),
                 log: DnsLogEntry {
                     domain: None,
                     decision: DnsDecision::Malformed,
                     detail: "expected exactly one DNS question".to_string(),
                 },
-            };
+            });
         };
 
         if !domain_allowed(self.policy, &domain) {
-            return DnsProxyResult {
+            return DnsProxyPlan::Immediate(DnsProxyResult {
                 response: serialize_response(error_response(&query, ResponseCode::Refused)),
                 log: DnsLogEntry {
                     domain: Some(domain),
                     decision: DnsDecision::Blocked,
                     detail: "domain denied by VmnetPolicy".to_string(),
                 },
-            };
+            });
         }
 
-        match self.upstream.exchange(&query) {
+        DnsProxyPlan::Forward(DnsForwardRequest { query, domain })
+    }
+
+    pub fn complete_forward(
+        &self,
+        request: DnsForwardRequest,
+        exchange: Result<Message, DnsUpstreamError>,
+    ) -> DnsProxyResult {
+        match exchange {
             Ok(response) => DnsProxyResult {
                 response: serialize_response(response),
                 log: DnsLogEntry {
-                    domain: Some(domain),
+                    domain: Some(request.domain),
                     decision: DnsDecision::Allowed,
                     detail: "forwarded to upstream".to_string(),
                 },
             },
             Err(error) => DnsProxyResult {
-                response: serialize_response(error_response(&query, ResponseCode::ServFail)),
+                response: serialize_response(error_response(
+                    &request.query,
+                    ResponseCode::ServFail,
+                )),
                 log: DnsLogEntry {
-                    domain: Some(domain),
+                    domain: Some(request.domain),
                     decision: DnsDecision::UpstreamFailure,
                     detail: format!("{error:?}"),
                 },
@@ -145,6 +166,18 @@ where
     fn exchange(&self, query: &Message) -> Result<Message, DnsUpstreamError> {
         (**self).exchange(query)
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum DnsProxyPlan {
+    Immediate(DnsProxyResult),
+    Forward(DnsForwardRequest),
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsForwardRequest {
+    pub query: Message,
+    pub domain: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,6 +476,44 @@ mod tests {
 
         assert_eq!(result.log.decision, DnsDecision::Blocked);
         assert!(upstream.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn allowed_query_can_be_planned_without_calling_upstream() {
+        let policy = policy_allowing("example.com");
+        let upstream = RecordingUpstream::new(empty_success_response(0x1234, "example.com"));
+        let proxy = DnsProxy::new(&policy, &upstream);
+
+        let plan = proxy.plan_udp_payload(&query("EXAMPLE.com."));
+
+        let DnsProxyPlan::Forward(request) = plan else {
+            panic!("allowed query should be deferred to service IO");
+        };
+        assert_eq!(request.domain, "example.com");
+        assert_eq!(request.query.queries.len(), 1);
+        assert!(upstream.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn planned_upstream_failure_completion_matches_synchronous_servfail() {
+        let policy = policy_allowing("example.com");
+        let proxy = DnsProxy::new(
+            &policy,
+            StaticUpstream {
+                result: Ok(empty_success_response(0x1234, "example.com")),
+            },
+        );
+        let DnsProxyPlan::Forward(request) = proxy.plan_udp_payload(&query("example.com")) else {
+            panic!("allowed query should be deferred to service IO");
+        };
+
+        let result = proxy.complete_forward(request, Err(DnsUpstreamError::Unavailable));
+        let response =
+            Message::from_vec(&result.response.expect("servfail response")).expect("parse");
+
+        assert_eq!(result.log.domain.as_deref(), Some("example.com"));
+        assert_eq!(result.log.decision, DnsDecision::UpstreamFailure);
+        assert_eq!(response.metadata.response_code, ResponseCode::ServFail);
     }
 
     #[test]

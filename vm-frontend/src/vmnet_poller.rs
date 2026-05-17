@@ -13,6 +13,7 @@ pub enum VmnetEventSource {
     HostListener(usize),
     HostSession(SocketHandle),
     UpstreamSession(SocketHandle),
+    ServiceIo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -7,6 +7,7 @@ use crate::tcp_gateway::UpstreamMapping;
 use crate::vmnet_runtime::{
     VmnetRuntimeConfig, DEFAULT_UPSTREAM_CONNECT_TIMEOUT, DEFAULT_VMNET_IDLE_SLEEP,
 };
+use crate::vmnet_service_io::VmnetServiceIoLimits;
 
 pub mod dns_proxy;
 pub mod docker_proxy;
@@ -23,6 +24,7 @@ pub mod tls_mitm;
 pub mod vmnet_gateway;
 pub mod vmnet_poller;
 pub mod vmnet_runtime;
+pub mod vmnet_service_io;
 pub mod vmnet_stream;
 
 #[cfg(test)]
@@ -209,6 +211,7 @@ impl FrontendConfig {
             policy,
             upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
             idle_sleep: DEFAULT_VMNET_IDLE_SLEEP,
+            service_io_limits: VmnetServiceIoLimits::default(),
         }
     }
 
@@ -495,6 +498,7 @@ mod tests {
             DEFAULT_UPSTREAM_CONNECT_TIMEOUT
         );
         assert_eq!(vmnet.idle_sleep, DEFAULT_VMNET_IDLE_SLEEP);
+        assert_eq!(vmnet.service_io_limits, VmnetServiceIoLimits::default());
     }
 
     #[test]

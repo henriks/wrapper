@@ -2,7 +2,7 @@
 id: wra-e9sr
 status: open
 deps: [wra-i3t9]
-links: [wra-57z4, wra-nui7]
+links: [wra-57z4, wra-nui7, wra-jenv, wra-bbgh]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 1
@@ -31,3 +31,13 @@ Validation:
 - Assert bounded socket/slot counts and stable poll cost.
 - Run vmnet runtime tests and required validation before closing.
 
+
+## Notes
+
+**2026-05-16T19:08:35Z**
+
+wra-nui7 BufferLimitExceeded host-ingress failures remove the bridge session and vmnet_runtime deregisters HostSession handles on that event, similar to HostClosed/GuestClosed. This reduces one stale-registration path but does not address broader stale guest TCP socket/session reaping covered by wra-e9sr.
+
+**2026-05-16T21:46:53Z**
+
+Review after closing wra-i3t9: this ticket is now unblocked on the connect-failure side. Async connect failures now close/reset guest sessions through TcpProxyBridge::complete_connect, but GuestTcpCore still needs an explicit reap_closed_sessions path for terminal smoltcp sockets and listener/host slot pruning under churn.

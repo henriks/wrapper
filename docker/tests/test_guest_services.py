@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import json
 import os
 import shutil
@@ -274,6 +275,119 @@ class GuestPayloadServerTests(unittest.TestCase):
             self.assertIn(b"diagnostic timed out", output)
             self.assertEqual(exit_code, 124)
 
+    def test_idle_client_times_out_before_initial_frame(self) -> None:
+        client, server = self.socket_pair()
+        thread = threading.Thread(
+            target=payload_server.handle_client,
+            args=(server, threading.Lock(), None, None, 0.05, 5.0),
+            daemon=True,
+        )
+        thread.start()
+
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(client.recv(1), b"")
+
+    def test_start_client_thread_rejects_when_client_limit_full(self) -> None:
+        client, server = self.socket_pair()
+        client_sem = threading.BoundedSemaphore(1)
+        self.assertTrue(client_sem.acquire(blocking=False))
+
+        accepted = payload_server.start_client_thread(
+            server,
+            threading.Lock(),
+            threading.BoundedSemaphore(1),
+            itertools.count(1),
+            client_sem,
+            initial_timeout=0.05,
+            io_timeout=0.05,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(client.recv(1), b"")
+        client_sem.release()
+
+    def test_slow_diagnostic_client_releases_semaphore(self) -> None:
+        client, server = self.socket_pair()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        diagnostic_sem = threading.BoundedSemaphore(1)
+        request = {
+            "script": "python3 -c 'import sys; sys.stdout.write(\"x\" * (8 * 1024 * 1024)); sys.stdout.flush()'",
+            "cwd": "/tmp",
+            "env": {},
+            "timeout_seconds": 5,
+            "max_output_bytes": payload_server.MAX_DIAGNOSTIC_OUTPUT_BYTES,
+        }
+        send_frame(client, b"D", json.dumps(request).encode("utf-8"))
+        thread = threading.Thread(
+            target=payload_server.handle_client,
+            args=(server, threading.Lock(), diagnostic_sem, itertools.count(1), 1.0, 0.05),
+            daemon=True,
+        )
+        thread.start()
+
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(diagnostic_sem.acquire(blocking=False))
+        diagnostic_sem.release()
+
+    def test_blocked_primary_output_cleans_up_child(self) -> None:
+        client, server = self.socket_pair()
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+        with tempfile.TemporaryDirectory() as cwd:
+            request = {
+                "script": "python3 -c 'import sys,time; sys.stdout.write(\"x\" * (8 * 1024 * 1024)); sys.stdout.flush(); time.sleep(10)'",
+                "cwd": cwd,
+                "env": {},
+                "rows": 24,
+                "cols": 80,
+            }
+            send_frame(client, b"R", json.dumps(request).encode("utf-8"))
+            thread = threading.Thread(
+                target=payload_server.handle_client,
+                args=(server, threading.Lock(), None, None, 1.0, 0.05),
+                daemon=True,
+            )
+            thread.start()
+
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+
+    def test_quiet_primary_payload_outlives_io_timeout(self) -> None:
+        client, server = self.socket_pair()
+        with tempfile.TemporaryDirectory() as cwd:
+            request = {
+                "script": "sleep 0.2; printf done",
+                "cwd": cwd,
+                "env": {},
+                "rows": 24,
+                "cols": 80,
+            }
+            send_frame(client, b"R", json.dumps(request).encode("utf-8"))
+            thread = threading.Thread(
+                target=payload_server.handle_client,
+                args=(server, threading.Lock(), None, None, 1.0, 0.05),
+                daemon=True,
+            )
+            thread.start()
+
+            output = bytearray()
+            exit_code = None
+            for _ in range(16):
+                frame_type, payload = recv_frame(client)
+                if frame_type == b"O":
+                    output.extend(payload)
+                elif frame_type == b"X":
+                    exit_code = json.loads(payload.decode("utf-8"))["exit_code"]
+                    break
+                elif frame_type == b"F":
+                    self.fail(f"primary payload failed: {payload!r}")
+
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+            self.assertIn(b"done", output)
+            self.assertEqual(exit_code, 0)
+
     def test_payload_identity_requires_uid_and_gid_together(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires both"):
             payload_server.payload_identity({"AGENTVM_UID": "1000"})
@@ -342,6 +456,43 @@ class GuestSocketBridgeTests(unittest.TestCase):
         thread.join(timeout=5.0)
         self.assertFalse(thread.is_alive())
 
+    def test_proxy_bidirectional_logs_summary_not_every_chunk(self) -> None:
+        client_side, bridge_left = self.socket_pair()
+        docker_side, bridge_right = self.socket_pair()
+        with mock.patch.object(socket_bridge, "log") as log:
+            thread = threading.Thread(
+                target=socket_bridge.proxy_bidirectional,
+                args=(bridge_left, bridge_right, "client", "docker"),
+                daemon=True,
+            )
+            thread.start()
+            for _ in range(20):
+                client_side.sendall(b"GET /_ping HTTP/1.1\r\n\r\n")
+                self.assertEqual(docker_side.recv(1024), b"GET /_ping HTTP/1.1\r\n\r\n")
+            client_side.shutdown(socket.SHUT_WR)
+            docker_side.shutdown(socket.SHUT_WR)
+            thread.join(timeout=5.0)
+            self.assertFalse(thread.is_alive())
+
+        messages = [call.args[0] for call in log.call_args_list]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("bridge session closed", messages[0])
+        self.assertIn("client_to_docker=460", messages[0])
+
+    def test_proxy_bidirectional_idle_timeout_closes_session(self) -> None:
+        client_side, bridge_left = self.socket_pair()
+        docker_side, bridge_right = self.socket_pair()
+        thread = threading.Thread(
+            target=socket_bridge.proxy_bidirectional,
+            args=(bridge_left, bridge_right, "client", "docker", 0.05),
+            daemon=True,
+        )
+        thread.start()
+        thread.join(timeout=5.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(client_side.recv(1), b"")
+        self.assertEqual(docker_side.recv(1), b"")
+
     def test_handle_client_relays_to_unix_docker_socket(self) -> None:
         client, server = self.socket_pair()
         with tempfile.TemporaryDirectory() as tmp:
@@ -407,9 +558,54 @@ class GuestSocketBridgeTests(unittest.TestCase):
     def test_handle_client_closes_when_docker_socket_missing(self) -> None:
         client, server = self.socket_pair()
 
-        socket_bridge.handle_client(server, "/tmp/agentvm-missing-docker.sock")
+        socket_bridge.handle_client(server, "/tmp/agentvm-missing-docker.sock", connect_timeout=0.01)
 
         self.assertEqual(client.recv(1), b"")
+
+    def test_handle_client_waits_for_delayed_docker_socket(self) -> None:
+        client, server = self.socket_pair()
+        with tempfile.TemporaryDirectory() as tmp:
+            docker_sock = Path(tmp) / "docker.sock"
+            bridge_thread = threading.Thread(
+                target=socket_bridge.handle_client,
+                args=(server, str(docker_sock), None, 1.0, 5.0),
+                daemon=True,
+            )
+            bridge_thread.start()
+
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(docker_sock))
+            listener.listen(1)
+            listener.settimeout(5.0)
+            self.addCleanup(listener.close)
+            upstream, _ = listener.accept()
+            upstream.settimeout(5.0)
+            self.addCleanup(upstream.close)
+
+            client.sendall(b"GET /_ping HTTP/1.1\r\n\r\n")
+            self.assertEqual(upstream.recv(1024), b"GET /_ping HTTP/1.1\r\n\r\n")
+            upstream.sendall(b"OK")
+            self.assertEqual(client.recv(1024), b"OK")
+            client.shutdown(socket.SHUT_WR)
+            upstream.shutdown(socket.SHUT_WR)
+            bridge_thread.join(timeout=5.0)
+            self.assertFalse(bridge_thread.is_alive())
+
+    def test_start_client_thread_rejects_when_session_limit_full(self) -> None:
+        client, server = self.socket_pair()
+        sem = threading.BoundedSemaphore(1)
+        self.assertTrue(sem.acquire(blocking=False))
+
+        accepted = socket_bridge.start_client_thread(
+            server,
+            "/tmp/agentvm-missing-docker.sock",
+            sem,
+            connect_timeout=0.01,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(client.recv(1), b"")
+        sem.release()
 
 
 class GuestInitTests(unittest.TestCase):
