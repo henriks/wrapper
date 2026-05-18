@@ -2,7 +2,7 @@
 id: wra-rh21
 status: open
 deps: []
-links: [wra-vl1o, wra-g13g]
+links: [wra-vl1o, wra-g13g, wra-g34z]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 2
@@ -29,3 +29,9 @@ Validation:
 - Add adversarial resolver tests with many unique SNI names asserting bounded cache size.
 - Add small stress/benchmark-style coverage for generation churn.
 
+
+## Notes
+
+**2026-05-18T10:38:15Z**
+
+Follow-up cleanup epic wra-emj5 links wra-g34z for vmnet event/buffer consolidation. Bound the TLS MITM certificate cache directly inside the existing resolver path, with SNI normalization/rejection before generation. Avoid introducing a second cache layer or separate TLS session cleanup machinery.

@@ -2,7 +2,7 @@
 id: wra-0a0r
 status: closed
 deps: [wra-9glk]
-links: []
+links: [wra-8xsb]
 created: 2026-05-17T10:19:57Z
 type: task
 priority: 2
@@ -56,3 +56,7 @@ Added focused poison-path coverage for the new composed-fs lock-access helpers: 
 **2026-05-17T20:56:37Z**
 
 Required/live-capable validation passed after composed-fs bounded-blocking refactor slices: ./vm-frontend/validate.sh required. This validates formatting, composed-fs/guest-service/payload-protocol/vm-frontend offline tests, fuzz target compilation, docs drift checks, live-smoke, and live-setup-tools with the current Python-default appliance. Acceptance for this option-1 composed-fs slice is met: server/manifest/state module boundaries extracted; vhost thread_pool_size is explicitly positive/bounded; no Tokio dependency or async filesystem execution was introduced; lock poison paths are recoverable in result-returning code; release() avoids holding the handle table lock across flush sync_all(); existing property/fuzz harness coverage is preserved.
+
+**2026-05-18T05:39:57Z**
+
+Cleanup epic wra-9m5h adds wra-8xsb to carry the broader composed-fs structural consolidation. Keep the bounded blocking vhost/filesystem model, but use cleanup work to remove monolithic helper clusters and duplicated traversal/cache/lock support rather than introducing async filesystem machinery.

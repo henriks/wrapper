@@ -72,3 +72,10 @@ path = "fuzz_targets/composed_fs_locks.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "ipv4_policy_range"
+path = "fuzz_targets/ipv4_policy_range.rs"
+test = false
+doc = false
+bench = false

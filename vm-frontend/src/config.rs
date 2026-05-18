@@ -59,8 +59,8 @@ pub(crate) enum ConfigError {
     SerializeSandboxConfig { source: serde_json::Error },
     #[error("failed to write sandbox config {path}: {source}")]
     WriteSandboxConfig { path: PathBuf, source: io::Error },
-    #[error("failed to create setup-tool mise config directory {path}: {source}")]
-    CreateSetupToolMiseConfigDir { path: PathBuf, source: io::Error },
+    #[error("failed to create project mise config directory {path}: {source}")]
+    CreateProjectMiseConfigDir { path: PathBuf, source: io::Error },
     #[error("failed to write setup-tool mise config {path}: {source}")]
     WriteSetupToolMiseConfig { path: PathBuf, source: io::Error },
 }
@@ -485,14 +485,14 @@ pub(crate) fn write_wrapper_sandbox_config(
         .map_err(|source| ConfigError::WriteSandboxConfig { path, source })
 }
 
-pub(crate) fn wrapper_mise_config_path(project: &Path) -> PathBuf {
-    project.join(".sandbox/mise.toml")
+pub(crate) fn project_mise_config_path(project: &Path) -> PathBuf {
+    project.join("mise.toml")
 }
 
 pub(crate) fn write_setup_tool_mise_config(project: &Path, tool: SetupTool) -> ConfigResult<()> {
-    let path = wrapper_mise_config_path(project);
+    let path = project_mise_config_path(project);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| ConfigError::CreateSetupToolMiseConfigDir {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::CreateProjectMiseConfigDir {
             path: parent.to_path_buf(),
             source,
         })?;

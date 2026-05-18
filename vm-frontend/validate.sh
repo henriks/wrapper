@@ -41,11 +41,11 @@ live environment overrides:
   KVM_DEVICE=/dev/kvm
   QEMU=/usr/bin/qemu-system-x86_64
   IMAGE=alpine:3.22
-  PUBLISH_PAYLOAD_PORT=12079
+  PUBLISH_PAYLOAD_PORT=<host port for live-smoke published payload check; default: ephemeral>
   HOSTILE_IMAGE=alpine:3.22
   PAYLOAD_IMAGE=alpine:3.22
   DOCKER_IMAGE=alpine:3.22
-  DOCKER_PUBLISH_HOST_PORT=12080
+  DOCKER_PUBLISH_HOST_PORT=<host port for live-docker published container check; default: ephemeral>
   DOCKER_PUBLISH_GUEST_PORT=18080
   SETUP_TOOL_SMOKE_PROJECT=.sandbox/setup-tool-smoke/codex
   PI_SETUP_TOOL_SMOKE_PROJECT=.sandbox/setup-tool-smoke/pi
@@ -64,7 +64,7 @@ fast() {
   announce "offline tests: payload-protocol"
   cargo test --manifest-path payload-protocol/Cargo.toml --offline
   announce "offline tests: vm-frontend"
-  cargo test --manifest-path vm-frontend/Cargo.toml --offline
+  cargo test --manifest-path vm-frontend/Cargo.toml --offline --features validation-self-test
 }
 
 fmt_check() {
@@ -131,6 +131,15 @@ stress() {
     dns_proxy_stress -- --ignored --nocapture
 }
 
+free_loopback_tcp_port() {
+  python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
 require_kvm() {
   local kvm_device="${KVM_DEVICE:-/dev/kvm}"
   if [ ! -e "${kvm_device}" ]; then
@@ -154,8 +163,7 @@ run_self_test_scenario() {
   local qemu="${QEMU:-/usr/bin/qemu-system-x86_64}"
   local image="${IMAGE:-alpine:3.22}"
   announce "${name}: image=${image} qemu=${qemu}"
-  cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
-    self-test \
+  cargo run --manifest-path vm-frontend/Cargo.toml --offline --features validation-self-test --bin agentvm-self-test -- \
     --project "${ROOT}" \
     --run-dir "${run_dir}" \
     --artifact-manifest "${ROOT}/docker/out/artifact-manifest.json" \
@@ -167,7 +175,7 @@ run_self_test_scenario() {
 live_smoke() {
   require_kvm
   rm -f "${ROOT}/.sandbox/docker-vm/state.raw"
-  local publish_port="${PUBLISH_PAYLOAD_PORT:-12079}"
+  local publish_port="${PUBLISH_PAYLOAD_PORT:-$(free_loopback_tcp_port)}"
   run_self_test_scenario \
     "live-smoke self-test: publish-payload-port=${publish_port}" \
     "${ROOT}/.sandbox/docker-vm/self-test" \
@@ -180,7 +188,7 @@ live_setup_tools() {
   local qemu="${QEMU:-/usr/bin/qemu-system-x86_64}"
   local project="${SETUP_TOOL_SMOKE_PROJECT:-${ROOT}/.sandbox/setup-tool-smoke/codex}"
   local pi_project="${PI_SETUP_TOOL_SMOKE_PROJECT:-${ROOT}/.sandbox/setup-tool-smoke/pi}"
-  local agentvm="${ROOT}/vm-frontend/target/debug/agentvm"
+  local agentvm="${ROOT}/target/debug/agentvm"
   announce "live-setup-tools: building agentvm wrapper"
   cargo build --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm
 
@@ -231,7 +239,7 @@ live_setup_tools() {
     --qemu "${qemu}" \
     --no-tui \
     --no-net \
-    -- bash -c 'set -e; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/.sandbox/mise.toml"; grep -F "\"npm:@openai/codex\" = " "$PWD/.sandbox/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; codex --version' \
+    -- bash -c 'set -e; test ! -e "$PWD/.sandbox"; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/mise.toml"; grep -F "\"npm:@openai/codex\" = " "$PWD/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; codex --version' \
     2>&1 | tee "${metadata_log}"
   grep -Fq "codex-cli" "${metadata_log}" || {
     echo "error: codex metadata verification did not print codex-cli version" >&2
@@ -285,7 +293,7 @@ live_setup_tools() {
     --qemu "${qemu}" \
     --no-tui \
     --no-net \
-    -- bash -c 'set -e; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/.sandbox/mise.toml"; grep -F "\"npm:@mariozechner/pi-coding-agent\" = " "$PWD/.sandbox/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@mariozechner/pi-coding-agent/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; version=$(pi --version); case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "unexpected pi version: $version" >&2; exit 1 ;; esac; echo "pi-version=$version"' \
+    -- bash -c 'set -e; test ! -e "$PWD/.sandbox"; grep -F "https://unofficial-builds.nodejs.org/download/release/v24.15.0/node-v24.15.0-linux-x64-musl.tar.gz" "$PWD/mise.toml"; grep -F "\"npm:@mariozechner/pi-coding-agent\" = " "$PWD/mise.toml"; nodebin=$(find -L "$HOME/.local/share/mise/installs/http-node" -path "*/bin/node" -type f -print -quit); test -n "$nodebin"; ldd "$nodebin" 2>&1 | grep -qi musl; pkg=$(find "$HOME/.local/share/mise/installs" -path "*/lib/node_modules/@mariozechner/pi-coding-agent/package.json" -type f -print -quit); test -n "$pkg"; test -s "$pkg"; node -e '\''const fs=require("fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));'\'' "$pkg"; wc -c "$pkg"; version=$(pi --version 2>&1); case "$version" in [0-9]*.[0-9]*.[0-9]*) ;; *) echo "unexpected pi version: $version" >&2; exit 1 ;; esac; echo "pi-version=$version"' \
     2>&1 | tee "${pi_metadata_log}"
   grep -Fq "pi-version=" "${pi_metadata_log}" || {
     echo "error: pi metadata verification did not print pi-version" >&2
@@ -349,7 +357,7 @@ live_docker() {
     "live-docker self-test: container egress denied no-net" \
     "${ROOT}/.sandbox/docker-vm/self-test-docker-deny" \
     --docker-net-check --no-net
-  local publish_host_port="${DOCKER_PUBLISH_HOST_PORT:-12080}"
+  local publish_host_port="${DOCKER_PUBLISH_HOST_PORT:-$(free_loopback_tcp_port)}"
   local publish_guest_port="${DOCKER_PUBLISH_GUEST_PORT:-18080}"
   run_self_test_scenario \
     "live-docker self-test: host-to-container published port ${publish_host_port}:${publish_guest_port}" \

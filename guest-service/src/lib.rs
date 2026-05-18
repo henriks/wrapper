@@ -1,17 +1,21 @@
 //! Opt-in Rust/Tokio implementation pieces for the AgentVM guest payload service.
 //!
-//! The production appliance still defaults to `docker/guest-payload-server.py`.
+//! This is the production AgentVM guest payload service.
 //! This crate is built up behind the opt-in Rust guest-service path and shares
 //! the frame protocol with the frontend and Python service.
 
-use std::io;
+use std::fs::File;
+use std::io::{self, Read as _};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use agentvm_payload_protocol::*;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream, UnixStream};
 use tokio::process::Command;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time;
@@ -24,6 +28,10 @@ pub const DEFAULT_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(60);
 pub const DEFAULT_DIAGNOSTIC_OUTPUT_BYTES: u64 = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_DOCKER_BRIDGE_MAX_SESSIONS: usize = 64;
+pub const DEFAULT_DOCKER_BRIDGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_DOCKER_BRIDGE_IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DOCKER_BRIDGE_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestServiceLimits {
@@ -42,6 +50,30 @@ impl Default for GuestServiceLimits {
             io_timeout: DEFAULT_SESSION_IO_TIMEOUT,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerBridgeLimits {
+    pub max_sessions: usize,
+    pub connect_timeout: Duration,
+    pub io_timeout: Duration,
+}
+
+impl Default for DockerBridgeLimits {
+    fn default() -> Self {
+        Self {
+            max_sessions: DEFAULT_DOCKER_BRIDGE_MAX_SESSIONS,
+            connect_timeout: DEFAULT_DOCKER_BRIDGE_CONNECT_TIMEOUT,
+            io_timeout: DEFAULT_DOCKER_BRIDGE_IO_TIMEOUT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DockerBridgeStats {
+    pub client_to_docker: u64,
+    pub docker_to_client: u64,
+    pub timed_out: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +105,15 @@ pub enum GuestServiceError {
     AcceptTcp { source: std::io::Error },
     #[error("payload service client limit reached")]
     ClientLimitReached,
+    #[error("docker bridge session limit reached")]
+    DockerBridgeSessionLimitReached,
+    #[error("failed to connect to Docker socket {path}: {source}")]
+    DockerBridgeConnect {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("Docker bridge IO failed: {source}")]
+    DockerBridgeIo { source: std::io::Error },
 }
 
 impl From<agentvm_payload_protocol::AsyncFrameError> for GuestServiceError {
@@ -112,6 +153,135 @@ pub async fn serve_listener(
             }
         });
     }
+}
+
+pub async fn serve_docker_bridge_tcp(
+    tcp_host: &str,
+    tcp_port: u16,
+    docker_sock: impl AsRef<Path>,
+    limits: DockerBridgeLimits,
+) -> Result<(), GuestServiceError> {
+    let addr = format!("{tcp_host}:{tcp_port}");
+    let listener = TcpListener::bind(&addr)
+        .await
+        .map_err(|source| GuestServiceError::BindTcp {
+            addr: addr.clone(),
+            source,
+        })?;
+    serve_docker_bridge_listener(listener, docker_sock, limits).await
+}
+
+pub async fn serve_docker_bridge_listener(
+    listener: TcpListener,
+    docker_sock: impl AsRef<Path>,
+    limits: DockerBridgeLimits,
+) -> Result<(), GuestServiceError> {
+    let docker_sock = docker_sock.as_ref().to_path_buf();
+    let sessions = Arc::new(Semaphore::new(limits.max_sessions));
+    loop {
+        let (client, _) = listener
+            .accept()
+            .await
+            .map_err(|source| GuestServiceError::AcceptTcp { source })?;
+        let Ok(permit) = sessions.clone().try_acquire_owned() else {
+            eprintln!(
+                "agentvm-guest-service: rejecting Docker bridge client: session limit reached"
+            );
+            drop(client);
+            continue;
+        };
+        let docker_sock = docker_sock.clone();
+        let limits = limits.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            match handle_docker_bridge_client(client, &docker_sock, &limits).await {
+                Ok(stats) => eprintln!(
+                    "agentvm-guest-service: Docker bridge session closed client_to_docker={} docker_to_client={} timed_out={}",
+                    stats.client_to_docker, stats.docker_to_client, stats.timed_out
+                ),
+                Err(error) => eprintln!("agentvm-guest-service: Docker bridge client failed: {error}"),
+            }
+        });
+    }
+}
+
+pub async fn handle_docker_bridge_client(
+    client: TcpStream,
+    docker_sock: impl AsRef<Path>,
+    limits: &DockerBridgeLimits,
+) -> Result<DockerBridgeStats, GuestServiceError> {
+    let docker_sock = docker_sock.as_ref();
+    let upstream = connect_docker_bridge_socket(docker_sock, limits.connect_timeout).await?;
+    proxy_docker_bridge(client, upstream, limits.io_timeout).await
+}
+
+async fn connect_docker_bridge_socket(
+    docker_sock: &Path,
+    connect_timeout: Duration,
+) -> Result<UnixStream, GuestServiceError> {
+    let deadline = time::Instant::now() + connect_timeout;
+    loop {
+        match UnixStream::connect(docker_sock).await {
+            Ok(stream) => return Ok(stream),
+            Err(source) if time::Instant::now() >= deadline => {
+                return Err(GuestServiceError::DockerBridgeConnect {
+                    path: docker_sock.display().to_string(),
+                    source,
+                });
+            }
+            Err(_) => {}
+        }
+        time::sleep(DOCKER_BRIDGE_CONNECT_RETRY_INTERVAL).await;
+    }
+}
+
+async fn proxy_docker_bridge(
+    mut client: TcpStream,
+    mut docker: UnixStream,
+    io_timeout: Duration,
+) -> Result<DockerBridgeStats, GuestServiceError> {
+    let mut stats = DockerBridgeStats {
+        client_to_docker: 0,
+        docker_to_client: 0,
+        timed_out: false,
+    };
+    let mut client_read_closed = false;
+    let mut docker_read_closed = false;
+    let mut client_buf = [0_u8; 64 * 1024];
+    let mut docker_buf = [0_u8; 64 * 1024];
+
+    while !client_read_closed || !docker_read_closed {
+        let idle_timeout = time::sleep(io_timeout);
+        tokio::pin!(idle_timeout);
+        tokio::select! {
+            read = client.read(&mut client_buf), if !client_read_closed => {
+                let read = read.map_err(|source| GuestServiceError::DockerBridgeIo { source })?;
+                if read == 0 {
+                    client_read_closed = true;
+                    let _ = docker.shutdown().await;
+                } else {
+                    docker.write_all(&client_buf[..read]).await.map_err(|source| GuestServiceError::DockerBridgeIo { source })?;
+                    stats.client_to_docker += read as u64;
+                }
+            }
+            read = docker.read(&mut docker_buf), if !docker_read_closed => {
+                let read = read.map_err(|source| GuestServiceError::DockerBridgeIo { source })?;
+                if read == 0 {
+                    docker_read_closed = true;
+                    let _ = client.shutdown().await;
+                } else {
+                    client.write_all(&docker_buf[..read]).await.map_err(|source| GuestServiceError::DockerBridgeIo { source })?;
+                    stats.docker_to_client += read as u64;
+                }
+            }
+            _ = &mut idle_timeout => {
+                stats.timed_out = true;
+                return Ok(stats);
+            }
+        }
+    }
+
+    Ok(stats)
 }
 
 #[derive(Debug, Clone)]
@@ -265,14 +435,39 @@ async fn run_primary_request<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let identity = payload_identity(&request.env)?;
+    ensure_home(&request.env, identity)?;
+    let pty = open_primary_pty(request.rows, request.cols)?;
+    let resize_fd = pty
+        .master
+        .try_clone()
+        .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    let master_reader = pty
+        .master
+        .try_clone()
+        .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    let slave_stdin = pty
+        .slave
+        .try_clone()
+        .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    let slave_stdout = pty
+        .slave
+        .try_clone()
+        .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    let slave_stderr = pty
+        .slave
+        .try_clone()
+        .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    let slave_fd = pty.slave.as_raw_fd();
+
     let mut command = Command::new("/bin/sh");
-    configure_process_group(&mut command);
+    configure_process(&mut command, identity, Some(slave_fd));
     command
         .arg("-c")
         .arg(&request.script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdin(Stdio::from(slave_stdin))
+        .stdout(Stdio::from(slave_stdout))
+        .stderr(Stdio::from(slave_stderr))
         .current_dir(if request.cwd.is_empty() {
             "/"
         } else {
@@ -282,14 +477,17 @@ where
     let mut child = command
         .spawn()
         .map_err(|source| GuestServiceError::SpawnPrimary { source })?;
+    drop(pty.slave);
+
     let child_pid = child.id();
-    let mut child_stdin = child.stdin.take();
     let mut control_closed = false;
-    let stdout = child.stdout.take().expect("primary stdout is piped");
-    let stderr = child.stderr.take().expect("primary stderr is piped");
     let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(16);
-    spawn_output_reader(stdout, output_tx.clone());
-    spawn_output_reader(stderr, output_tx);
+    let master_write = tokio::fs::File::from_std(pty.master);
+    let mut primary_io = PrimaryProcessIo {
+        input: master_write,
+        resize: resize_fd,
+    };
+    spawn_pty_output_reader(master_reader, output_tx)?;
     let wait_task = tokio::spawn(async move { child.wait().await });
     tokio::pin!(wait_task);
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -306,7 +504,7 @@ where
             }
             frame = agentvm_payload_protocol::read_frame_async(&mut reader), if !control_closed => {
                 match frame {
-                    Ok(frame) => handle_primary_control_frame(frame, &mut child_stdin, child_pid).await?,
+                    Ok(frame) => handle_primary_control_frame(frame, &mut primary_io, child_pid).await?,
                     Err(_) => {
                         control_closed = true;
                         signal_child_process_group(child_pid, libc::SIGTERM);
@@ -317,9 +515,8 @@ where
                 let status = status
                     .map_err(|source| GuestServiceError::PrimaryIo { source: std::io::Error::other(source.to_string()) })?
                     .map_err(|source| GuestServiceError::PrimaryIo { source })?;
-                while let Some(output) = output_rx.recv().await {
-                    send_output(&mut writer, &output).await?;
-                }
+                drop(primary_io);
+                drain_recent_primary_output(&mut output_rx, &mut writer).await?;
                 send_exit(&mut writer, exit_code_from_status(status)).await?;
                 return Ok(());
             }
@@ -327,19 +524,57 @@ where
     }
 }
 
+struct PrimaryPty {
+    master: File,
+    slave: File,
+}
+
+struct PrimaryProcessIo {
+    input: tokio::fs::File,
+    resize: File,
+}
+
+fn open_primary_pty(rows: u16, cols: u16) -> Result<PrimaryPty, GuestServiceError> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let mut size = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &mut size,
+        )
+    };
+    if rc == -1 {
+        return Err(GuestServiceError::SpawnPrimary {
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(PrimaryPty {
+        master: unsafe { File::from_raw_fd(master) },
+        slave: unsafe { File::from_raw_fd(slave) },
+    })
+}
+
 async fn handle_primary_control_frame(
     frame: Frame,
-    child_stdin: &mut Option<tokio::process::ChildStdin>,
+    process_io: &mut PrimaryProcessIo,
     child_pid: Option<u32>,
 ) -> Result<(), GuestServiceError> {
     match frame.kind {
         FrameKind::INPUT => {
-            if let Some(stdin) = child_stdin.as_mut() {
-                stdin
-                    .write_all(&frame.payload)
-                    .await
-                    .map_err(|source| GuestServiceError::PrimaryIo { source })?;
-            }
+            process_io
+                .input
+                .write_all(&frame.payload)
+                .await
+                .map_err(|source| GuestServiceError::PrimaryIo { source })?;
         }
         FrameKind::SIGNAL => {
             let signal: SignalFrame = serde_json::from_slice(&frame.payload)
@@ -347,32 +582,68 @@ async fn handle_primary_control_frame(
             signal_child_process_group(child_pid, signal.signal);
         }
         FrameKind::RESIZE => {
-            let _resize: ResizeFrame = serde_json::from_slice(&frame.payload)
+            let resize: ResizeFrame = serde_json::from_slice(&frame.payload)
                 .map_err(|source| GuestServiceError::PayloadRequestJson { source })?;
+            resize_primary_pty(&process_io.resize, resize.rows, resize.cols)?;
         }
         _ => {}
     }
     Ok(())
 }
 
-fn spawn_output_reader<R>(mut reader: R, tx: mpsc::Sender<Vec<u8>>)
+fn resize_primary_pty(pty: &File, rows: u16, cols: u16) -> Result<(), GuestServiceError> {
+    let size = libc::winsize {
+        ws_row: rows.max(1),
+        ws_col: cols.max(1),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(pty.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+    if rc == -1 {
+        return Err(GuestServiceError::PrimaryIo {
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
+
+async fn drain_recent_primary_output<S>(
+    output_rx: &mut mpsc::Receiver<Vec<u8>>,
+    writer: &mut S,
+) -> Result<(), GuestServiceError>
 where
-    R: AsyncRead + Unpin + Send + 'static,
+    S: AsyncWrite + Unpin,
 {
-    tokio::spawn(async move {
-        let mut buf = [0_u8; 8192];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(read) => {
-                    if tx.send(buf[..read].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
+    loop {
+        match time::timeout(Duration::from_millis(50), output_rx.recv()).await {
+            Ok(Some(output)) => send_output(writer, &output).await?,
+            Ok(None) | Err(_) => return Ok(()),
         }
-    });
+    }
+}
+
+fn spawn_pty_output_reader(
+    mut reader: File,
+    tx: mpsc::Sender<Vec<u8>>,
+) -> Result<(), GuestServiceError> {
+    std::thread::Builder::new()
+        .name("agentvm-primary-pty-output".to_string())
+        .spawn(move || {
+            let mut buf = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if tx.blocking_send(buf[..read].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .map_err(|source| GuestServiceError::PrimaryIo { source })?;
+    Ok(())
 }
 
 fn signal_child_process_group(child_pid: Option<u32>, signal: i32) {
@@ -384,10 +655,109 @@ fn signal_child_process_group(child_pid: Option<u32>, signal: i32) {
     }
 }
 
-fn configure_process_group(command: &mut Command) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PayloadIdentity {
+    uid: u32,
+    gid: u32,
+}
+
+fn payload_identity(
+    env: &std::collections::BTreeMap<String, String>,
+) -> Result<Option<PayloadIdentity>, GuestServiceError> {
+    let uid = env.get("AGENTVM_UID");
+    let gid = env.get("AGENTVM_GID");
+    match (uid, gid) {
+        (None, None) => Ok(None),
+        (Some(uid), Some(gid)) => {
+            let uid =
+                uid.parse::<u32>()
+                    .map_err(|source| GuestServiceError::PayloadRequestJson {
+                        source: serde_json::Error::io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            source,
+                        )),
+                    })?;
+            let gid =
+                gid.parse::<u32>()
+                    .map_err(|source| GuestServiceError::PayloadRequestJson {
+                        source: serde_json::Error::io(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            source,
+                        )),
+                    })?;
+            Ok(Some(PayloadIdentity { uid, gid }))
+        }
+        _ => Err(GuestServiceError::PayloadRequestJson {
+            source: serde_json::Error::io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "payload identity requires both AGENTVM_UID and AGENTVM_GID",
+            )),
+        }),
+    }
+}
+
+fn ensure_home(
+    env: &std::collections::BTreeMap<String, String>,
+    identity: Option<PayloadIdentity>,
+) -> Result<(), GuestServiceError> {
+    let Some(home) = env.get("HOME") else {
+        return Ok(());
+    };
+    let home_path = Path::new(home);
+    if !home_path.is_absolute() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(home_path).map_err(|source| GuestServiceError::PrimaryIo { source })?;
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    let metadata =
+        std::fs::metadata(home_path).map_err(|source| GuestServiceError::PrimaryIo { source })?;
+    if metadata.uid() == identity.uid && metadata.gid() == identity.gid {
+        return Ok(());
+    }
+    let path =
+        std::ffi::CString::new(home.as_str()).map_err(|source| GuestServiceError::PrimaryIo {
+            source: io::Error::new(io::ErrorKind::InvalidInput, source),
+        })?;
+    let rc = unsafe { libc::chown(path.as_ptr(), identity.uid, identity.gid) };
+    if rc == -1 {
+        return Err(GuestServiceError::PrimaryIo {
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
+
+fn configure_process(
+    command: &mut Command,
+    identity: Option<PayloadIdentity>,
+    controlling_tty: Option<RawFd>,
+) {
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Some(fd) = controlling_tty {
+                if libc::ioctl(fd, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            let Some(identity) = identity else {
+                return Ok(());
+            };
+            if libc::getuid() == identity.uid && libc::getgid() == identity.gid {
+                return Ok(());
+            }
+            let gid = identity.gid as libc::gid_t;
+            if libc::setgroups(1, &gid) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setgid(gid) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::setuid(identity.uid as libc::uid_t) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -404,8 +774,10 @@ where
 {
     let timeout = bounded_diagnostic_timeout(request.timeout_seconds);
     let max_output_bytes = bounded_diagnostic_output(request.max_output_bytes);
+    let identity = payload_identity(&request.env)?;
+    ensure_home(&request.env, identity)?;
     let mut command = Command::new("/bin/sh");
-    configure_process_group(&mut command);
+    configure_process(&mut command, identity, None);
     command
         .arg("-c")
         .arg(&request.script)
@@ -613,8 +985,9 @@ where
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
+    use tokio::net::UnixListener;
 
     fn test_state_with_limits(max_clients: usize, max_diagnostics: usize) -> GuestServiceState {
         GuestServiceState::new(GuestServiceLimits {
@@ -908,6 +1281,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn docker_bridge_relays_tcp_client_to_unix_socket() {
+        let docker_sock = std::env::temp_dir().join(format!(
+            "agentvm-guest-service-docker-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&docker_sock);
+        let docker_listener = UnixListener::bind(&docker_sock).expect("bind docker unix socket");
+        let tcp_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bridge tcp listener");
+        let addr = tcp_listener.local_addr().expect("bridge addr");
+        let bridge = tokio::spawn(serve_docker_bridge_listener(
+            tcp_listener,
+            docker_sock.clone(),
+            DockerBridgeLimits {
+                max_sessions: 4,
+                connect_timeout: Duration::from_secs(1),
+                io_timeout: Duration::from_secs(5),
+            },
+        ));
+
+        let mut client = TcpStream::connect(addr).await.expect("connect bridge");
+        let (mut docker, _) = docker_listener
+            .accept()
+            .await
+            .expect("accept docker socket");
+        let request_bytes = b"GET /_ping HTTP/1.1\r\n\r\n";
+        client
+            .write_all(request_bytes)
+            .await
+            .expect("write request");
+        let mut request = vec![0_u8; request_bytes.len()];
+        docker.read_exact(&mut request).await.expect("read request");
+        assert_eq!(request, request_bytes);
+        docker.write_all(b"OK").await.expect("write response");
+        let mut response = [0_u8; 2];
+        client
+            .read_exact(&mut response)
+            .await
+            .expect("read response");
+        assert_eq!(&response, b"OK");
+
+        bridge.abort();
+        let _ = std::fs::remove_file(&docker_sock);
+    }
+
+    #[tokio::test]
+    async fn docker_bridge_closes_idle_session_after_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tcp listener");
+        let addr = listener.local_addr().expect("tcp addr");
+        let client = TcpStream::connect(addr).await.expect("connect tcp client");
+        let (server, _) = listener.accept().await.expect("accept tcp client");
+        let (docker, _docker_peer) = UnixStream::pair().expect("unix pair");
+
+        let stats = proxy_docker_bridge(server, docker, Duration::from_millis(20))
+            .await
+            .expect("proxy timeout");
+
+        assert_eq!(stats.client_to_docker, 0);
+        assert_eq!(stats.docker_to_client, 0);
+        assert!(stats.timed_out);
+        drop(client);
+    }
+
+    #[tokio::test]
     async fn guest_service_tcp_listener_serves_ping() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -959,6 +1403,115 @@ mod tests {
 
         let output = String::from_utf8_lossy(&output_payloads(&responses)).to_string();
         assert!(output.contains("got:hello from stdin"), "{output:?}");
+        assert_eq!(exit_code_payload(&responses), 0);
+    }
+
+    #[tokio::test]
+    async fn guest_service_primary_runs_inside_requested_tty() {
+        let state = test_state_with_limits(1, 1);
+        let mut request =
+            PayloadRequest::new("test -t 0; test -t 1; test -t 2; printf tty-ok; stty size");
+        request.rows = 13;
+        request.cols = 17;
+        let responses = run_primary_frames(state, request, &[]).await;
+
+        let output = String::from_utf8_lossy(&output_payloads(&responses)).to_string();
+        assert!(output.contains("tty-ok"), "{output:?}");
+        assert!(output.contains("13 17"), "{output:?}");
+        assert_eq!(exit_code_payload(&responses), 0);
+    }
+
+    #[tokio::test]
+    async fn guest_service_primary_applies_resize_to_tty() {
+        let state = test_state_with_limits(1, 1);
+        let (mut client, server) = duplex(64 * 1024);
+        let mut request = PayloadRequest::new("stty size; IFS= read -r _; stty size");
+        request.rows = 5;
+        request.cols = 9;
+        let frame = Frame::new(
+            FrameKind::RUN_PRIMARY,
+            serde_json::to_vec(&request).expect("request json"),
+        )
+        .expect("primary frame");
+        agentvm_payload_protocol::write_frame_async(&mut client, &frame)
+            .await
+            .expect("send primary request");
+        let server_task = tokio::spawn(async move { state.handle_client(server).await });
+        let first = agentvm_payload_protocol::read_frame_async(&mut client)
+            .await
+            .expect("first stty output");
+        assert_eq!(first.kind, FrameKind::OUTPUT);
+        let first_output = String::from_utf8_lossy(&first.payload).to_string();
+        assert!(first_output.contains("5 9"), "{first_output:?}");
+
+        agentvm_payload_protocol::write_frame_async(
+            &mut client,
+            &Frame::new(
+                FrameKind::RESIZE,
+                resize_payload(12, 34).expect("resize json"),
+            )
+            .expect("resize frame"),
+        )
+        .await
+        .expect("send resize");
+        agentvm_payload_protocol::write_frame_async(
+            &mut client,
+            &Frame::new(FrameKind::INPUT, b"\n".to_vec()).expect("input frame"),
+        )
+        .await
+        .expect("send input");
+
+        let mut responses = vec![first];
+        loop {
+            let response = agentvm_payload_protocol::read_frame_async(&mut client)
+                .await
+                .expect("primary response");
+            let terminal = response.kind == FrameKind::EXIT;
+            responses.push(response);
+            if terminal {
+                break;
+            }
+        }
+        server_task
+            .await
+            .expect("guest service task joins")
+            .expect("guest service handles primary client");
+
+        let output = String::from_utf8_lossy(&output_payloads(&responses)).to_string();
+        assert!(output.contains("12 34"), "{output:?}");
+        assert_eq!(exit_code_payload(&responses), 0);
+    }
+
+    #[tokio::test]
+    async fn guest_service_primary_uses_requested_identity_and_home() {
+        let state = test_state_with_limits(1, 1);
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let mut request = PayloadRequest::new(
+            "test \"$(id -u)\" = \"$AGENTVM_UID\"; test \"$(id -g)\" = \"$AGENTVM_GID\"; test -d \"$HOME\"; printf identity-ok",
+        );
+        let home = std::env::temp_dir().join(format!(
+            "agentvm-guest-service-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time after epoch")
+                .as_nanos()
+        ));
+        request
+            .env
+            .insert("AGENTVM_UID".to_string(), uid.to_string());
+        request
+            .env
+            .insert("AGENTVM_GID".to_string(), gid.to_string());
+        request
+            .env
+            .insert("HOME".to_string(), home.display().to_string());
+        let responses = run_primary_frames(state, request, &[]).await;
+        let _ = std::fs::remove_dir_all(home);
+
+        let output = String::from_utf8_lossy(&output_payloads(&responses)).to_string();
+        assert!(output.contains("identity-ok"), "{output:?}");
         assert_eq!(exit_code_payload(&responses), 0);
     }
 

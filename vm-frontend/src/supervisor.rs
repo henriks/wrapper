@@ -355,6 +355,7 @@ mod tests {
             },
             network: GuestNetwork::default(),
             guest_http_smoke_url: None,
+            guest_log_dir: None,
             upstream_mappings: Vec::new(),
         }
     }

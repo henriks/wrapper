@@ -1,32 +1,20 @@
 # Rust/Tokio guest service spike
 
 This note records the `wra-lcbk` spike outcome after the Python guest service
-bounds landed in `wra-g0uv`, `wra-dky9`, and `wra-sum7`.
+bounds landed in `wra-g0uv`, `wra-dky9`, and `wra-sum7`, and the later parity
+validation that made the Rust service the only payload service.
 
 ## Current decision
 
-Do **not** switch the appliance from the Python services to a Rust/Tokio guest
-service yet.
+Use the Rust/Tokio guest service in the appliance for both payload execution and
+the Docker TCP-to-Unix bridge.
 
-The Python services are now bounded and validated:
-
-- `guest-init.sh` waits for Docker `_ping` before exposing payload readiness.
-- `guest-socket-bridge.py` has client/session limits, Docker-socket connect
-  retry, idle/write failure cleanup, and summary logging.
-- `guest-payload-server.py` has initial-frame timeouts, bounded active clients,
-  bounded diagnostic sessions/output, slow-writer cleanup, process-group cleanup,
-  and a regression for quiet long-running primary payloads.
-
-A Rust replacement can be valuable, but it is a packaging and recovery change, not
-just a refactor. Keep the Python services as the default until a Rust guest
-service is built and validated behind an explicit opt-in appliance path.
-
-## Semantics a Rust guest service must preserve
+## Semantics the Rust guest service preserves
 
 ### Payload control TCP service
 
-The Rust service must preserve the existing frame protocol used by
-`vm-frontend/src/payload_client.rs` and `docker/guest-payload-server.py`:
+The Rust service preserves the existing frame protocol used by
+`vm-frontend/src/payload_client.rs`:
 
 - Frame header is `!cI`/network byte order: one frame type byte plus a 32-bit
   payload length.
@@ -76,8 +64,7 @@ Server bounds to preserve:
 
 ### Docker TCP-to-Unix bridge
 
-The Rust service must preserve the Docker bridge behavior from
-`guest-socket-bridge.py`:
+The Rust service must preserve the Docker bridge behavior:
 
 - Listen on the configured guest TCP port and connect each accepted client to
   `/var/run/docker.sock`.
@@ -91,53 +78,43 @@ The Rust service must preserve the Docker bridge behavior from
 
 ## Packaging findings
 
-The appliance builder currently installs Python guest assets directly in
-`docker/build-appliance.sh` and records them in `source_inputs` inside
-`docker/out/artifact-manifest.json`.
+The appliance builder installs a repo-built Rust guest payload-service binary
+and records it in `source_inputs` inside `docker/out/artifact-manifest.json`.
 
-Adding a Rust guest binary requires all of the following before switching
-defaults:
+A guest-service binary build requires:
 
 1. A repo-owned guest-service crate/binary with locked dependencies that compile
    under `./vm-frontend/validate.sh required`'s offline cargo mode.
 2. A build step that produces a Linux guest binary compatible with the Alpine
    appliance environment.
-3. `docker/build-appliance.sh` support to install the binary, while retaining the
-   Python fallback until live parity is proven. The current opt-in install hook
-   is `AGENTVM_GUEST_SERVICE_BIN=/path/to/agentvm-guest-service sudo ./docker/build-appliance.sh`.
+3. `docker/build-appliance.sh` support to install the binary. Build the Rust
+   service for the Alpine/musl guest, for example
+   `cargo build --target x86_64-unknown-linux-musl --bin agentvm-guest-service`.
+   The install hook is
+   `sudo env AGENTVM_GUEST_SERVICE_BIN=target/x86_64-unknown-linux-musl/debug/agentvm-guest-service ./docker/build-appliance.sh`;
+   the builder rejects GNU/glibc-linked host binaries such as
+   `target/debug/agentvm-guest-service`.
 4. Artifact manifest/source freshness updates for the new binary and any source
    inputs that affect it. The opt-in install hook records the installed binary in
    `source_inputs` so stale binaries are rejected before live boot.
-5. Guest init changes to choose Python default vs Rust opt-in explicitly. This is
-   intentionally not implemented yet; installing the binary does not make it the
-   default service.
-6. Live validation of both Docker bridge and payload protocol before any default
-   switch.
+5. Live validation of both Docker bridge and payload protocol before deleting
+   any remaining duplicate guest-service code.
 
 Important constraint: Tokio is not currently a dependency of `vm-frontend`, and
 required validation uses offline cargo commands. Introducing Tokio for a guest
 binary needs a lockfile/vendor/cache plan first; otherwise the required gate will
 not be reproducible.
 
-## Recommended implementation order
+## Completed validation
 
-1. Add a small repo-local Rust guest-service crate that is **not installed into
-   the appliance**. Start with shared frame parsing/serialization and pure unit
-   tests mirroring the Python payload protocol tests.
-2. Add integration tests that run the Rust service locally on loopback or
-   socketpairs and compare payload/Docker bridge behavior against the Python
-   service contract.
-3. Add an opt-in appliance packaging path that installs the Rust binary while
-   retaining the Python services and default startup path.
-4. Add live opt-in validation for Rust guest service mode:
-   - `./vm-frontend/validate.sh live-payload`
-   - `./vm-frontend/validate.sh live-docker`
-   - `./vm-frontend/validate.sh required`
-5. Only after parity, switch the default guest init path and keep a short-lived
-   fallback/remove ticket for the Python services.
+Rust guest-service parity was validated with:
+
+- `./vm-frontend/validate.sh live-payload`
+- `./vm-frontend/validate.sh live-docker`
+- `./vm-frontend/validate.sh required`
 
 ## Spike conclusion
 
-The bounded Python services are now a good compatibility baseline. The Rust
-replacement should proceed as a staged, opt-in migration with tests and packaging
-freshness support, not as an immediate default replacement.
+The Rust payload service replaced the Python payload server after parity
+validation. Keep the Docker bridge as its own component until a dedicated bridge
+replacement is implemented and validated.

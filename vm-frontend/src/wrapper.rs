@@ -16,8 +16,6 @@ pub(crate) enum WrapperError {
     TlsBootstrap(#[from] tls_bootstrap::TlsBootstrapError),
     #[error(transparent)]
     Launch(#[from] LaunchCliError),
-    #[error("startup dialog did not select a payload")]
-    StartupDialogNoPayload,
     #[error("{0}")]
     Path(String),
     #[error("share shadow guest path must be absolute")]
@@ -26,14 +24,25 @@ pub(crate) enum WrapperError {
     EscapingShareShadowGuestPath,
 }
 
-pub(crate) fn run_wrapper(args: Vec<String>) -> WrapperResult<()> {
+pub(crate) async fn run_wrapper_async(args: Vec<String>) -> WrapperResult<()> {
+    let Some((launch, ui_mode)) = prepare_wrapper_launch(args)? else {
+        return Ok(());
+    };
+    run_launch_request_async(launch, ui_mode)
+        .await
+        .map_err(Into::into)
+}
+
+fn prepare_wrapper_launch(
+    args: Vec<String>,
+) -> WrapperResult<Option<(FrontendLaunchRequest, WrapperUiMode)>> {
     let mut wrapper = parse_wrapper_args(&args).map_err(WrapperError::Parse)?;
     if wrapper.help {
-        return Ok(());
+        return Ok(None);
     }
     if wrapper.reset {
         reset_project(&wrapper.project).map_err(WrapperError::Reset)?;
-        return Ok(());
+        return Ok(None);
     }
     if let Some(setup_tool) = wrapper.setup_tool {
         write_wrapper_sandbox_config(
@@ -50,111 +59,22 @@ pub(crate) fn run_wrapper(args: Vec<String>) -> WrapperResult<()> {
         let edited =
             tui::run_config_editor(config).map_err(|error| WrapperError::Tui(error.to_string()))?;
         write_wrapper_sandbox_config(&wrapper.project, &edited)?;
-        return Ok(());
+        return Ok(None);
     }
     if wrapper.tls_bootstrap {
         let ca = ensure_wrapper_mitm_ca(&wrapper.project)?;
-        push_launch_value(
-            &mut wrapper.launch_args,
-            WrapperLaunchFlag::TlsCaCert,
-            ca.cert.display().to_string(),
-        );
-        push_launch_value(
-            &mut wrapper.launch_args,
-            WrapperLaunchFlag::TlsCaKey,
-            ca.key.display().to_string(),
-        );
-        push_launch_flag(
-            &mut wrapper.launch_args,
-            WrapperLaunchFlag::TlsGeneratePerHostCerts,
-        );
+        wrapper.launch.policy.tls_ca_cert = Some(ca.cert);
+        wrapper.launch.policy.tls_ca_key = Some(ca.key);
+        wrapper.launch.policy.tls_generate_per_host_certs = true;
     }
-    let project = wrapper.project.clone();
-    let ui_mode = wrapper.ui_mode;
-    let needs_startup_dialog = ui_mode == WrapperUiMode::Tui
-        && !wrapper.tool_selected
-        && wrapper.command_override.is_none();
-    let mut launch_args = vec!["launch".to_string()];
-    launch_args.extend(wrapper.into_launch_args());
-    if needs_startup_dialog {
-        let selection =
-            tui::run_startup_dialog().map_err(|error| WrapperError::Tui(error.to_string()))?;
-        if selection.enable_codex {
-            let config = WrapperSandboxConfig::codex_default()?;
-            write_wrapper_sandbox_config(&project, &config)?;
-            write_setup_tool_mise_config(&project, SetupTool::Codex)?;
-            apply_configured_launch_defaults(&mut launch_args, &config, &project, false, false)?;
-            apply_payload_script(
-                &mut launch_args,
-                setup_tool_install_then_exec_script(
-                    &project,
-                    SetupTool::Codex,
-                    payload_script_from_config_command(&config.default_command),
-                ),
-            );
-        } else {
-            return Err(WrapperError::StartupDialogNoPayload);
-        }
-    }
-    run_launch(&launch_args[1..], ui_mode).map_err(Into::into)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WrapperLaunchFlag {
-    Project,
-    NoNet,
-    AllowIp,
-    AllowDomain,
-    Gh,
-    Aws,
-    Ro,
-    Rw,
-    Qemu,
-    ArtifactManifest,
-    Publish,
-    AllowPublicInternet,
-    ShareRo,
-    ShareRw,
-    ShareShadow,
-    PayloadScript,
-    TlsCaCert,
-    TlsCaKey,
-    TlsGeneratePerHostCerts,
-}
-
-impl WrapperLaunchFlag {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Project => "--project",
-            Self::NoNet => "--no-net",
-            Self::AllowIp => "--allow-ip",
-            Self::AllowDomain => "--allow-domain",
-            Self::Gh => "--gh",
-            Self::Aws => "--aws",
-            Self::Ro => "--ro",
-            Self::Rw => "--rw",
-            Self::Qemu => "--qemu",
-            Self::ArtifactManifest => "--artifact-manifest",
-            Self::Publish => "--publish",
-            Self::AllowPublicInternet => "--allow-public-internet",
-            Self::ShareRo => "--share-ro",
-            Self::ShareRw => "--share-rw",
-            Self::ShareShadow => "--share-shadow",
-            Self::PayloadScript => "--payload-script",
-            Self::TlsCaCert => "--tls-ca-cert",
-            Self::TlsCaKey => "--tls-ca-key",
-            Self::TlsGeneratePerHostCerts => "--tls-generate-per-host-certs",
-        }
-    }
+    Ok(Some((wrapper.launch, wrapper.ui_mode)))
 }
 
 #[derive(Debug)]
 pub(crate) struct WrapperArgs {
     pub(crate) project: PathBuf,
-    pub(crate) launch_args: Vec<String>,
+    pub(crate) launch: FrontendLaunchRequest,
     pub(crate) ui_mode: WrapperUiMode,
-    pub(crate) tool_selected: bool,
-    pub(crate) command_override: Option<WrapperCommandOverride>,
     pub(crate) setup_tool: Option<SetupTool>,
     pub(crate) tls_bootstrap: bool,
     pub(crate) reset: bool,
@@ -181,12 +101,6 @@ impl WrapperCommandOverride {
     }
 }
 
-impl WrapperArgs {
-    fn into_launch_args(self) -> Vec<String> {
-        self.launch_args
-    }
-}
-
 pub(crate) fn parse_wrapper_args(args: &[String]) -> Result<WrapperArgs, String> {
     parse_wrapper_args_with_terminal(args, io::stdin().is_terminal(), io::stdout().is_terminal())
 }
@@ -210,12 +124,11 @@ pub(crate) fn parse_wrapper_args_with_terminal(
         Err(error) if error.kind() == clap::error::ErrorKind::DisplayHelp => {
             error.print().map_err(|error| error.to_string())?;
             let project = env::current_dir().map_err(|error| error.to_string())?;
+            let launch = FrontendLaunchRequest::for_project(project.clone());
             return Ok(WrapperArgs {
+                launch,
                 project,
-                launch_args: Vec::new(),
                 ui_mode: wrapper_ui_mode(false, stdin_is_tty, stdout_is_tty),
-                tool_selected: false,
-                command_override: None,
                 setup_tool: None,
                 tls_bootstrap: false,
                 reset: false,
@@ -226,12 +139,12 @@ pub(crate) fn parse_wrapper_args_with_terminal(
         Err(error) => return Err(error.to_string().trim().to_string()),
     };
 
-    let mut launch_args = Vec::new();
     let mut project = matches
         .get_one::<PathBuf>("project")
         .map(|path| absolute_cli_path(&path.display().to_string()))
         .transpose()?
         .unwrap_or(env::current_dir().map_err(|error| error.to_string())?);
+    let mut launch = FrontendLaunchRequest::for_project(project.clone());
     let mut command_override: Option<WrapperCommandOverride> = None;
     let setup_tool = matches
         .get_one::<String>("setup_tool")
@@ -241,6 +154,7 @@ pub(crate) fn parse_wrapper_args_with_terminal(
     let help = false;
     let no_net = matches.get_flag("no_net");
     let no_tui = matches.get_flag("no_tui");
+    let mirror_guest_logs = matches.get_flag("mirror_guest_logs");
     let mut tls_bootstrap = false;
     let edit_config = matches.get_flag("config");
     let saw_network_override =
@@ -255,61 +169,56 @@ pub(crate) fn parse_wrapper_args_with_terminal(
 
     if let Some(path) = matches.get_one::<PathBuf>("project") {
         project = absolute_cli_path(&path.display().to_string())?;
-        push_launch_value(
-            &mut launch_args,
-            WrapperLaunchFlag::Project,
-            project.display().to_string(),
-        );
+        launch.project = project.clone();
+        launch.run_dir = project.join(".sandbox/docker-vm/run");
     }
     if no_net {
-        push_launch_flag(&mut launch_args, WrapperLaunchFlag::NoNet);
+        launch.policy.no_net = true;
     }
     if let Some(values) = matches.get_many::<String>("allow_ip") {
-        for value in values {
-            push_launch_value(&mut launch_args, WrapperLaunchFlag::AllowIp, value.clone());
-        }
+        launch.policy.allow_ips.extend(values.cloned());
     }
     if let Some(values) = matches.get_many::<String>("allow_domain") {
-        for value in values {
-            push_launch_value(
-                &mut launch_args,
-                WrapperLaunchFlag::AllowDomain,
-                value.clone(),
-            );
-        }
+        launch.policy.allow_domains.extend(values.cloned());
     }
     if matches.get_flag("gh") {
-        push_launch_flag(&mut launch_args, WrapperLaunchFlag::Gh);
+        launch.policy.gh = true;
     }
-    for (id, flag) in [
-        ("aws", WrapperLaunchFlag::Aws),
-        ("ro", WrapperLaunchFlag::Ro),
-        ("rw", WrapperLaunchFlag::Rw),
-        ("qemu", WrapperLaunchFlag::Qemu),
-        ("artifact_manifest", WrapperLaunchFlag::ArtifactManifest),
-    ] {
-        if let Some(values) = matches.get_many::<String>(id) {
-            for value in values {
-                push_launch_value(&mut launch_args, flag, value.clone());
-            }
+    if let Some(value) = matches.get_one::<String>("aws") {
+        launch.policy.aws_profile = Some(value.clone());
+    }
+    if let Some(values) = matches.get_many::<String>("ro") {
+        for value in values {
+            launch.policy.extra_ro.push(absolute_cli_path(value)?);
         }
+    }
+    if let Some(values) = matches.get_many::<String>("rw") {
+        for value in values {
+            launch.policy.extra_rw.push(absolute_cli_path(value)?);
+        }
+    }
+    if let Some(value) = matches.get_one::<String>("qemu") {
+        launch.qemu = PathBuf::from(value);
+    }
+    if let Some(value) = matches.get_one::<String>("artifact_manifest") {
+        launch.artifact_manifest = PathBuf::from(value);
+    }
+    if mirror_guest_logs {
+        launch.guest_log_dir = Some(project.join(".vmlogs"));
     }
     if let Some(values) = matches.get_many::<PortPair>("docker_publish") {
         for value in values {
-            push_launch_value(
-                &mut launch_args,
-                WrapperLaunchFlag::Publish,
-                value.to_string(),
-            );
+            launch
+                .policy
+                .host_listeners
+                .push(HostListener::published_tcp(value.host, value.guest));
         }
     }
     if help {
         return Ok(WrapperArgs {
             project,
-            launch_args,
+            launch,
             ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
-            tool_selected: false,
-            command_override,
             setup_tool,
             tls_bootstrap,
             reset,
@@ -320,23 +229,14 @@ pub(crate) fn parse_wrapper_args_with_terminal(
     if reset {
         return Ok(WrapperArgs {
             project,
-            launch_args,
+            launch,
             ui_mode: wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty),
-            tool_selected: false,
-            command_override,
             setup_tool,
             tls_bootstrap,
             reset,
             edit_config,
             help,
         });
-    }
-    if !has_launch_flag(&launch_args, WrapperLaunchFlag::Project) {
-        push_launch_value(
-            &mut launch_args,
-            WrapperLaunchFlag::Project,
-            project.display().to_string(),
-        );
     }
     let ui_mode = wrapper_ui_mode(no_tui, stdin_is_tty, stdout_is_tty);
     let sandbox_config = if let Some(setup_tool) = setup_tool {
@@ -346,19 +246,13 @@ pub(crate) fn parse_wrapper_args_with_terminal(
     };
     if let Some(config) = sandbox_config.as_ref() {
         apply_configured_launch_defaults(
-            &mut launch_args,
+            &mut launch,
             config,
             &project,
             saw_network_override,
             no_net,
         )
         .map_err(|error| error.to_string())?;
-    }
-    let mut tool_selected = sandbox_config.is_some();
-    if ui_mode == WrapperUiMode::Plain && command_override.is_none() && sandbox_config.is_none() {
-        return Err(
-            "project is not configured; run agentvm --setup-tool codex|pi, use -- COMMAND, or start interactive TUI setup".to_string(),
-        );
     }
     if let Some(tool) = setup_tool {
         let final_script = if let Some(command) = command_override.as_ref() {
@@ -372,43 +266,37 @@ pub(crate) fn parse_wrapper_args_with_terminal(
             )
         };
         apply_payload_script(
-            &mut launch_args,
-            setup_tool_install_then_exec_script(&project, tool, final_script),
+            &mut launch,
+            setup_tool_mise_exec_script(&project, tool, final_script),
         );
-        tool_selected = true;
     } else if let Some(command) = command_override.as_ref() {
-        apply_wrapper_command_override(&mut launch_args, command);
+        apply_wrapper_command_override(&mut launch, command);
     } else if let Some(config) = sandbox_config.as_ref() {
-        apply_configured_default_command(&mut launch_args, config);
-        tool_selected = true;
+        apply_configured_default_command(&mut launch, config);
+    } else {
+        apply_default_bash_payload(&mut launch);
     }
-    if setup_tool.is_none() && wrapper_mise_config_path(&project).exists() {
-        wrap_payload_script_with_project_mise(&mut launch_args, &project);
+    if setup_tool.is_none() && project_mise_config_path(&project).exists() {
+        wrap_payload_script_with_project_mise(&mut launch, &project);
     }
     if !no_net
-        && !has_launch_flag(&launch_args, WrapperLaunchFlag::NoNet)
-        && !has_launch_flag(&launch_args, WrapperLaunchFlag::AllowIp)
-        && !has_launch_flag(&launch_args, WrapperLaunchFlag::AllowDomain)
-        && !has_launch_flag(&launch_args, WrapperLaunchFlag::AllowPublicInternet)
+        && !launch.policy.no_net
+        && launch.policy.allow_ips.is_empty()
+        && launch.policy.allow_domains.is_empty()
+        && !launch.policy.allow_public
     {
-        push_launch_flag(&mut launch_args, WrapperLaunchFlag::AllowPublicInternet);
+        launch.policy.allow_public = true;
         tls_bootstrap = true;
-    } else if has_any_launch_flag(
-        &launch_args,
-        &[
-            WrapperLaunchFlag::AllowPublicInternet,
-            WrapperLaunchFlag::AllowIp,
-            WrapperLaunchFlag::AllowDomain,
-        ],
-    ) {
+    } else if launch.policy.allow_public
+        || !launch.policy.allow_ips.is_empty()
+        || !launch.policy.allow_domains.is_empty()
+    {
         tls_bootstrap = true;
     }
     Ok(WrapperArgs {
         project,
-        launch_args,
+        launch,
         ui_mode,
-        tool_selected,
-        command_override,
         setup_tool,
         tls_bootstrap,
         reset,
@@ -447,6 +335,11 @@ fn wrapper_clap_command() -> ClapCommand {
                 .action(ArgAction::Append),
         )
         .arg(Arg::new("no_tui").long("no-tui").action(ArgAction::SetTrue))
+        .arg(
+            Arg::new("mirror_guest_logs")
+                .long("mirror-guest-logs")
+                .action(ArgAction::SetTrue),
+        )
         .arg(Arg::new("gh").long("gh").action(ArgAction::SetTrue))
         .arg(Arg::new("aws").long("aws").value_name("PROFILE"))
         .arg(
@@ -486,7 +379,7 @@ fn wrapper_clap_command() -> ClapCommand {
 }
 
 pub(crate) fn apply_configured_launch_defaults(
-    launch_args: &mut Vec<String>,
+    launch: &mut FrontendLaunchRequest,
     config: &WrapperSandboxConfig,
     project: &Path,
     saw_network_override: bool,
@@ -495,30 +388,33 @@ pub(crate) fn apply_configured_launch_defaults(
     if !saw_network_override {
         match config.network.mode {
             ConfigNetworkMode::Public => {
-                push_launch_flag(launch_args, WrapperLaunchFlag::AllowPublicInternet);
+                launch.policy.allow_public = true;
             }
             ConfigNetworkMode::None => {
-                push_launch_flag(launch_args, WrapperLaunchFlag::NoNet);
+                launch.policy.no_net = true;
             }
             ConfigNetworkMode::Allowlist => {
-                for domain in &config.network.allowed_domains {
-                    push_launch_value(launch_args, WrapperLaunchFlag::AllowDomain, domain.clone());
-                }
-                for host in &config.network.allowed_hosts {
-                    push_launch_value(launch_args, WrapperLaunchFlag::AllowDomain, host.clone());
-                }
-                for ip in &config.network.allowed_ips {
-                    push_launch_value(launch_args, WrapperLaunchFlag::AllowIp, ip.clone());
-                }
+                launch
+                    .policy
+                    .allow_domains
+                    .extend(config.network.allowed_domains.iter().cloned());
+                launch
+                    .policy
+                    .allow_domains
+                    .extend(config.network.allowed_hosts.iter().cloned());
+                launch
+                    .policy
+                    .allow_ips
+                    .extend(config.network.allowed_ips.iter().cloned());
             }
         }
     }
-    if config.auth.github && !has_launch_flag(launch_args, WrapperLaunchFlag::Gh) {
-        push_launch_flag(launch_args, WrapperLaunchFlag::Gh);
+    if config.auth.github {
+        launch.policy.gh = true;
     }
     if let Some(profile) = &config.auth.aws_profile {
-        if !has_launch_flag(launch_args, WrapperLaunchFlag::Aws) {
-            push_launch_value(launch_args, WrapperLaunchFlag::Aws, profile.clone());
+        if launch.policy.aws_profile.is_none() {
+            launch.policy.aws_profile = Some(profile.clone());
         }
     }
     for share in &config.shares {
@@ -529,44 +425,33 @@ pub(crate) fn apply_configured_launch_defaults(
             .map(|path| absolute_cli_path(path).map_err(WrapperError::Path))
             .transpose()?
             .unwrap_or_else(|| host.clone());
-        let flag = match share.access {
-            ConfigShareAccess::Ro => WrapperLaunchFlag::ShareRo,
-            ConfigShareAccess::Rw => WrapperLaunchFlag::ShareRw,
-        };
-        let required = if share.required {
-            "required"
-        } else {
-            "optional"
-        };
-        push_launch_value(
-            launch_args,
-            flag,
-            format!("{}={}={required}", host.display(), guest.display()),
-        );
+        launch.policy.extra_shares.push(GuestPathShare {
+            host_path: host,
+            guest_path: guest.clone(),
+            readonly: share.access == ConfigShareAccess::Ro,
+            required: share.required,
+        });
         for shadow in &share.shadows {
             let relative_path = validate_share_shadow_path(shadow)?;
             let shadow_guest_path = guest.join(&relative_path);
-            let backing = config_share_shadow_backing_path(project, &shadow_guest_path)?;
-            push_launch_value(
-                launch_args,
-                WrapperLaunchFlag::ShareShadow,
-                format!(
-                    "{}={}={}",
-                    guest.display(),
-                    relative_path.display(),
-                    backing.display()
-                ),
-            );
+            let backing_path = config_share_shadow_backing_path(project, &shadow_guest_path)?;
+            launch
+                .policy
+                .extra_share_shadows
+                .push(GuestPathShareShadow {
+                    parent_guest_path: guest.clone(),
+                    relative_path,
+                    backing_path,
+                });
         }
     }
     let config_no_net = !saw_network_override && config.network.mode == ConfigNetworkMode::None;
     if !cli_no_net && !config_no_net {
         for port in &config.published_ports {
-            push_launch_value(
-                launch_args,
-                WrapperLaunchFlag::Publish,
-                format!("{}:{}", port.host, port.guest),
-            );
+            launch
+                .policy
+                .host_listeners
+                .push(HostListener::published_tcp(port.host, port.guest));
         }
     }
     Ok(())
@@ -589,35 +474,55 @@ fn config_share_shadow_backing_path(project: &Path, guest_path: &Path) -> Wrappe
     Ok(backing)
 }
 
-fn apply_configured_default_command(launch_args: &mut Vec<String>, config: &WrapperSandboxConfig) {
+fn apply_configured_default_command(
+    launch: &mut FrontendLaunchRequest,
+    config: &WrapperSandboxConfig,
+) {
     apply_payload_script(
-        launch_args,
+        launch,
         payload_script_from_config_command(&config.default_command),
     );
 }
 
-fn apply_wrapper_command_override(launch_args: &mut Vec<String>, command: &WrapperCommandOverride) {
-    apply_payload_script(launch_args, command.script());
+fn apply_default_bash_payload(launch: &mut FrontendLaunchRequest) {
+    apply_payload_script(
+        launch,
+        payload_script_from_config_command(&ConfigCommand::new("bash")),
+    );
 }
 
-fn apply_payload_script(launch_args: &mut Vec<String>, script: String) {
-    upsert_launch_value(launch_args, WrapperLaunchFlag::PayloadScript, script);
+fn apply_wrapper_command_override(
+    launch: &mut FrontendLaunchRequest,
+    command: &WrapperCommandOverride,
+) {
+    apply_payload_script(launch, command.script());
 }
 
-fn wrap_payload_script_with_project_mise(launch_args: &mut Vec<String>, project: &Path) {
-    let mut index = 0;
-    while index + 1 < launch_args.len() {
-        if launch_args[index] == WrapperLaunchFlag::PayloadScript.as_str() {
-            let script = launch_args[index + 1].clone();
-            launch_args[index + 1] = mise_install_then_exec_script(
-                &wrapper_mise_config_path(project),
-                "agentvm: mise is required to install tools from .sandbox/mise.toml",
-                script,
-            );
-            return;
-        }
-        index += 1;
-    }
+fn apply_payload_script(launch: &mut FrontendLaunchRequest, script: String) {
+    payload_launch_args(&mut launch.policy).script = script;
+}
+
+fn wrap_payload_script_with_project_mise(launch: &mut FrontendLaunchRequest, project: &Path) {
+    let Some(payload) = launch.policy.payload.as_mut() else {
+        return;
+    };
+    payload.script = mise_exec_script(
+        &project_mise_config_path(project),
+        "agentvm: mise is required to run tools from project mise.toml",
+        payload.script.clone(),
+    );
+}
+
+fn payload_launch_args(policy: &mut PolicyArgs) -> &mut PayloadLaunchArgs {
+    let (rows, cols) = terminal_size();
+    policy.payload.get_or_insert_with(|| PayloadLaunchArgs {
+        script: String::new(),
+        cwd: String::new(),
+        env: BTreeMap::new(),
+        rows,
+        cols,
+        no_stdin: false,
+    })
 }
 
 pub(crate) fn payload_script_from_config_command(command: &ConfigCommand) -> String {
@@ -627,34 +532,6 @@ pub(crate) fn payload_script_from_config_command(command: &ConfigCommand) -> Str
         script.push_str(&shell_quote(arg));
     }
     script
-}
-
-fn push_launch_flag(launch_args: &mut Vec<String>, flag: WrapperLaunchFlag) {
-    launch_args.push(flag.as_str().to_string());
-}
-
-fn push_launch_value(launch_args: &mut Vec<String>, flag: WrapperLaunchFlag, value: String) {
-    launch_args.extend([flag.as_str().to_string(), value]);
-}
-
-fn has_launch_flag(launch_args: &[String], flag: WrapperLaunchFlag) -> bool {
-    launch_args.iter().any(|arg| arg == flag.as_str())
-}
-
-fn has_any_launch_flag(launch_args: &[String], flags: &[WrapperLaunchFlag]) -> bool {
-    flags.iter().any(|flag| has_launch_flag(launch_args, *flag))
-}
-
-fn upsert_launch_value(launch_args: &mut Vec<String>, flag: WrapperLaunchFlag, value: String) {
-    let mut index = 0;
-    while index < launch_args.len() {
-        if launch_args[index] == flag.as_str() && index + 1 < launch_args.len() {
-            launch_args[index + 1] = value;
-            return;
-        }
-        index += 1;
-    }
-    push_launch_value(launch_args, flag, value);
 }
 
 pub(crate) fn wrapper_ui_mode(

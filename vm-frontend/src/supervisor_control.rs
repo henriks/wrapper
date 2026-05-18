@@ -8,8 +8,9 @@ use tokio::io::{
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
+use crate::network_policy::HostListenerPurpose;
 use crate::supervisor::{LaunchSupervisor, SupervisorShutdown, SupervisorTaskResult};
-use crate::RuntimePaths;
+use crate::{ManagedTask, RuntimePaths, SupervisorPlan};
 
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const CONTROL_SOCKET_FILE_NAME: &str = "agentvm-control.sock";
@@ -57,6 +58,12 @@ impl SupervisorControlClient {
                 response: format!("{response:?}"),
             }),
         }
+    }
+
+    pub async fn payload_control_endpoint(
+        &self,
+    ) -> Result<Option<PayloadControlEndpoint>, SupervisorControlIoError> {
+        Ok(self.status_snapshot().await?.payload_control_endpoint)
     }
 
     pub async fn request_shutdown(
@@ -156,6 +163,13 @@ pub enum SupervisorControlResponse {
 pub struct SupervisorControlSnapshot {
     pub shutdown: SupervisorShutdown,
     pub tasks: Vec<SupervisorTaskResult>,
+    pub payload_control_endpoint: Option<PayloadControlEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PayloadControlEndpoint {
+    pub host_addr: String,
+    pub host_port: u16,
 }
 
 impl SupervisorControlSnapshot {
@@ -163,8 +177,24 @@ impl SupervisorControlSnapshot {
         Self {
             shutdown: supervisor.current_shutdown(),
             tasks: supervisor.task_statuses(),
+            payload_control_endpoint: payload_control_endpoint_from_plan(supervisor.plan()),
         }
     }
+}
+
+fn payload_control_endpoint_from_plan(plan: &SupervisorPlan) -> Option<PayloadControlEndpoint> {
+    let ManagedTask::VmnetGateway(vmnet) = &plan.vmnet else {
+        return None;
+    };
+    vmnet
+        .policy
+        .host_listeners
+        .iter()
+        .find(|listener| listener.purpose == HostListenerPurpose::PayloadControl)
+        .map(|listener| PayloadControlEndpoint {
+            host_addr: listener.host_addr.clone(),
+            host_port: listener.host_port,
+        })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -442,6 +472,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network_policy::HostListener;
     use crate::supervisor::{LaunchSupervisor, SupervisorTaskName, SupervisorTaskStatus};
     use crate::{
         FrontendConfig, GuestNetwork, RuntimePaths, ToolPaths, VmArtifacts, VmShape,
@@ -470,6 +501,7 @@ mod tests {
             },
             network: GuestNetwork::default(),
             guest_http_smoke_url: None,
+            guest_log_dir: None,
             upstream_mappings: Vec::new(),
         }
     }
@@ -515,6 +547,29 @@ mod tests {
             task.name == SupervisorTaskName::VmnetGateway
                 && task.status == SupervisorTaskStatus::Ready
         }));
+    }
+
+    #[test]
+    fn control_snapshot_exposes_planned_payload_control_endpoint() {
+        let mut plan = config().supervisor_plan();
+        let ManagedTask::VmnetGateway(vmnet) = &mut plan.vmnet else {
+            panic!("expected vmnet gateway task");
+        };
+        vmnet
+            .policy
+            .host_listeners
+            .push(HostListener::payload_control(12076, 1076));
+        let supervisor = LaunchSupervisor::new(plan);
+
+        let snapshot = SupervisorControlSnapshot::from_supervisor(&supervisor);
+
+        assert_eq!(
+            snapshot.payload_control_endpoint,
+            Some(PayloadControlEndpoint {
+                host_addr: "127.0.0.1".to_string(),
+                host_port: 12076,
+            })
+        );
     }
 
     #[test]
@@ -594,7 +649,15 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let socket = tempdir.path().join(CONTROL_SOCKET_FILE_NAME);
         let listener = bind_control_socket(&socket).expect("bind control socket");
-        let supervisor = Arc::new(LaunchSupervisor::new(config().supervisor_plan()));
+        let mut plan = config().supervisor_plan();
+        let ManagedTask::VmnetGateway(vmnet) = &mut plan.vmnet else {
+            panic!("expected vmnet gateway task");
+        };
+        vmnet
+            .policy
+            .host_listeners
+            .push(HostListener::payload_control(12076, 1076));
+        let supervisor = Arc::new(LaunchSupervisor::new(plan));
         supervisor
             .task_controller(SupervisorTaskName::Qemu)
             .expect("qemu controller")
@@ -610,6 +673,16 @@ mod tests {
         assert!(snapshot.tasks.iter().any(|task| {
             task.name == SupervisorTaskName::Qemu && task.status == SupervisorTaskStatus::Starting
         }));
+        assert_eq!(
+            client
+                .payload_control_endpoint()
+                .await
+                .expect("payload endpoint"),
+            Some(PayloadControlEndpoint {
+                host_addr: "127.0.0.1".to_string(),
+                host_port: 12076,
+            })
+        );
 
         client
             .request_shutdown("adapter requested shutdown")

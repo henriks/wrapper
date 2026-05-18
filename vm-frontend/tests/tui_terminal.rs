@@ -106,21 +106,32 @@ fn write_codex_config(project: &TempDir) {
 }
 
 #[test]
-fn startup_dialog_terminal_cancel_reports_no_payload_without_config() {
+fn unconfigured_terminal_defaults_to_bash_without_persisting_config() {
     let project = TempDir::new().expect("temp project");
+    let artifact_manifest = artifact_manifest();
+    let args = vec![
+        "--qemu".to_string(),
+        "/tmp/agentvm-no-qemu-for-tui-test".to_string(),
+        "--artifact-manifest".to_string(),
+        artifact_manifest.display().to_string(),
+    ];
 
-    let run = run_agentvm_in_pty(&project, &[] as &[&str], "n");
+    let run = run_agentvm_in_pty_with_timeout(&project, &args, "", 20);
 
     assert!(!run.status.success(), "unexpected success: {}", run.output);
     assert!(
+        !run.output.contains("Initialize Codex"),
+        "unconfigured launch should not show Codex setup prompt: {}",
         run.output
-            .contains("startup dialog did not select a payload"),
-        "missing startup cancel diagnostic in output: {}",
+    );
+    assert!(
+        run.output.contains("launch: phase=starting-frontend"),
+        "missing launch phase diagnostic: {}",
         run.output
     );
     assert!(
         !project.path().join(".sandbox/config.json").exists(),
-        "cancelled first-run dialog should not persist config"
+        "implicit bash default should not persist config"
     );
 }
 
@@ -147,7 +158,7 @@ fn config_editor_terminal_keys_update_and_save_config() {
 }
 
 #[test]
-fn configured_startup_terminal_skips_dialog_and_reports_launch_artifacts() {
+fn configured_terminal_reports_launch_artifacts_without_setup_prompt() {
     let project = TempDir::new().expect("temp project");
     write_codex_config(&project);
     let artifact_manifest = artifact_manifest();
@@ -162,9 +173,8 @@ fn configured_startup_terminal_skips_dialog_and_reports_launch_artifacts() {
 
     assert!(!run.status.success(), "unexpected success: {}", run.output);
     assert!(
-        !run.output
-            .contains("startup dialog did not select a payload"),
-        "configured project should not reprompt: {}",
+        !run.output.contains("Initialize Codex"),
+        "configured project should not prompt for Codex setup: {}",
         run.output
     );
     assert!(

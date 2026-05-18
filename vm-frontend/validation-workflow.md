@@ -57,10 +57,11 @@ vm-frontend/validate.sh guest-services
 `docs` asserts that `AGENTS.md`, this workflow, and `vm-frontend/validate.sh`
 stay aligned on the required gate. `fuzz-check` compiles/checks the fuzz targets
 without running libFuzzer. `guest-services` runs offline `unittest` coverage for
-`docker/guest-init.sh`, `docker/build-appliance.sh`,
-`docker/guest-payload-server.py`, and `docker/guest-socket-bridge.py`. The Rust `guest-service` and `payload-protocol` crates are covered by the
-`fast`, `fmt`, and `required` tiers; `guest-service` is not installed into the
-appliance by these offline tests.
+`docker/guest-init.sh` and `docker/build-appliance.sh`. The Rust `guest-service`
+and `payload-protocol` crates are covered by the `fast`, `fmt`, and `required`
+tiers; `guest-service` is installed into the appliance from
+`AGENTVM_GUEST_SERVICE_BIN` during appliance builds and owns both payload and
+Docker bridge guest services.
 
 ## Stress And Property
 
@@ -138,7 +139,7 @@ Run after rebuilding appliance artifacts and before closing live frontend
 contract work. The live matrix has named scenarios:
 
 - `live-smoke` (also `host-live`/`live`): quick required self-test with the published payload listener.
-- `live-setup-tools`: required Codex and Pi setup-tool bootstrap through `.sandbox/mise.toml` over npm/TLS MITM, then no-net relaunch from persisted guest state, bare CLI availability, and package metadata verification.
+- `live-setup-tools`: required Codex and Pi setup-tool bootstrap through project-root `mise.toml` over npm/TLS MITM, then no-net relaunch from persisted guest state, bare CLI availability, and package metadata verification.
 - `live-hostile`: slower hostile/no-net self-test that probes denied metadata/loopback/DNS behavior.
 - `live-payload`: payload protocol stress self-test with a large request environment and large guest output.
 - `live-dns`: allowed resolver-path and denied/no-net resolver-path self-tests with explicit query diagnostics.
@@ -162,14 +163,20 @@ vm-frontend/validate.sh live-full
 Equivalent command:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
-  self-test \
+publish_port=$(python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+cargo run --manifest-path vm-frontend/Cargo.toml --offline --features validation-self-test --bin agentvm-self-test -- \
   --project "$PWD" \
   --run-dir "$PWD/.sandbox/docker-vm/self-test" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
   --image alpine:3.22 \
-  --publish-payload-port 12079
+  --publish-payload-port "${publish_port}"
 ```
 
 Prerequisites:
@@ -207,7 +214,7 @@ cargo test --manifest-path vm-frontend/Cargo.toml --offline --test tui_terminal 
 ```
 
 Run the manual smoke below after touching wrapper TUI behavior, terminal
-sizing/input, prompt focus, startup setup, or wrapper entrypoint semantics. It
+sizing/input, prompt focus, setup-tool flow, or wrapper entrypoint semantics. It
 requires a real terminal and user interaction in addition to the live KVM
 prerequisites above.
 
@@ -222,14 +229,13 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
 
 Expected behavior:
 
-- On an unconfigured project, a startup dialog appears because no setup recipe
-  or `.sandbox/config.json` exists.
-- Accepting the default initializes Codex and the generated
+- On an unconfigured project, no setup dialog appears; the wrapper starts
+  `bash` without writing `.sandbox/config.json`.
+- Running with `--setup-tool codex` initializes Codex and the generated
   `.sandbox/docker-vm/run/composed-fs-manifest.json` contains a writable
   `$HOME/.codex` tool-state mount backed by the same host path.
-- The accepted setup is persisted to `.sandbox/config.json`; rerunning the same
-  `agentvm` command starts the configured default command without showing the
-  startup dialog.
+- The explicit setup is persisted to `.sandbox/config.json`; rerunning the same
+  `agentvm` command starts the configured default command without prompting.
 - The guest payload renders inside the terminal viewport, with a
   one-line wrapper status/prompt area below it.
 - Typed input in guest focus reaches the guest payload.
@@ -255,7 +261,7 @@ cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm -- \
 
 Expected behavior:
 
-- No startup dialog or alternate-screen TUI appears.
+- No setup dialog or alternate-screen TUI appears.
 - Payload output streams directly to stdout.
 - The process exits with the guest payload exit status.
 
@@ -292,6 +298,7 @@ points to:
 - `composed-fs-manifest.json`
 - `config-fs-manifest.json`
 - `guest-config/composed-binds.json`
+- `guest-config/launch.json`
 
 `vmnet-events.log` is the primary network artifact. It records DNS decisions,
 UDP denials, unsupported protocol classifications, TCP policy/setup failures,

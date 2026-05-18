@@ -61,8 +61,14 @@ pub(crate) const REQUIRED_APPLIANCE_SOURCE_INPUTS: &[&str] = &[
     "docker/appliance.env",
     "docker/build-appliance.sh",
     "docker/guest-init.sh",
-    "docker/guest-payload-server.py",
-    "docker/guest-socket-bridge.py",
+    "docker/refresh-pins.sh",
+    "Cargo.toml",
+    "Cargo.lock",
+    "guest-service/Cargo.toml",
+    "guest-service/src/lib.rs",
+    "guest-service/src/main.rs",
+    "payload-protocol/Cargo.toml",
+    "payload-protocol/src/lib.rs",
 ];
 
 pub(crate) fn ensure_appliance_sources_fresh(artifact_manifest: &Path) -> ApplianceResult<()> {

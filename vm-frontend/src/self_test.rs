@@ -1,6 +1,10 @@
 use super::*;
 
-pub(crate) use crate::self_test_payload::self_test_payload_script;
+use agentvm_frontend::payload_client::{
+    ping_payload_async_tcp, run_payload_tcp_async_with_control,
+};
+
+pub(crate) use super::self_test_payload::self_test_payload_script;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SelfTestConfig {
@@ -22,7 +26,7 @@ pub(crate) struct SelfTestConfig {
     pub(crate) expect_root_persistence: bool,
 }
 
-pub(crate) fn run_self_test(args: &[String]) -> Result<(), String> {
+pub(crate) async fn run_self_test(args: &[String]) -> Result<(), String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print_self_test_usage();
         return Ok(());
@@ -114,24 +118,55 @@ pub(crate) fn run_self_test(args: &[String]) -> Result<(), String> {
             sqlite_concurrency_host_db.display().to_string(),
         );
     }
-    let mut policy = policy_from_args(config.network.clone(), policy_args);
+    let mut policy = policy_from_args(config.network.clone(), policy_args)?;
     let _lock = ProjectLock::acquire(&config)?;
-    let host_port = ensure_payload_listener(&mut policy);
+    let mut payload_listener = ensure_payload_listener(&mut policy)?;
+    let host_port = payload_listener.host_port();
     println!("self-test: phase=starting-frontend");
-    let running = start_frontend_with_policy(config.clone(), mounts, policy)
-        .map_err(|error| format!("self-test launch failed: {error}\n{artifacts}"))?;
+    let control_client = SupervisorControlClient::for_runtime(&config.runtime);
+    let launch_config = config.clone();
+    let reserved_host_ports = payload_listener.take_listener().into_iter().collect();
+    let mut launch_task = tokio::spawn(async move {
+        run_frontend_until_qemu_exit_with_policy_and_timeout_reserving_host_ports_async(
+            launch_config,
+            mounts,
+            policy,
+            None,
+            reserved_host_ports,
+        )
+        .await
+    });
     let payload_addr = socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
     println!("self-test: phase=waiting-for-payload-ready timeout=120s");
-    wait_for_payload_ready(payload_addr, Duration::from_secs(120))
-        .map_err(|error| format!("self-test payload readiness failed: {error}\n{artifacts}"))?;
+    let readiness = wait_for_payload_ready_async(payload_addr, Duration::from_secs(120));
+    tokio::select! {
+        readiness = readiness => {
+            readiness
+                .map_err(|error| format!("self-test payload readiness failed: {error}\n{artifacts}"))?;
+        }
+        launch = &mut launch_task => {
+            let launch_result = launch
+                .map_err(|error| format!("self-test launch task failed: {error}\n{artifacts}"))?;
+            return match launch_result {
+                Ok(qemu_exit) => Err(format!(
+                    "self-test launch failed: qemu exited before payload ready: status={} timed_out={}\n{artifacts}",
+                    qemu_exit.status,
+                    qemu_exit.timed_out,
+                )),
+                Err(error) => Err(format!("self-test launch failed: {error}\n{artifacts}")),
+            };
+        }
+    }
 
     if let Some(host_port) = self_test.publish_payload_port {
         let publish_addr =
             socket_addr("127.0.0.1", host_port).map_err(|error| error.to_string())?;
         println!("self-test: phase=checking-published-payload-port port={host_port}");
-        ping_payload(publish_addr).map_err(|error| {
-            format!("published payload-port check failed: {error}\n{artifacts}")
-        })?;
+        ping_payload_async_tcp(publish_addr)
+            .await
+            .map_err(|error| {
+                format!("published payload-port check failed: {error}\n{artifacts}")
+            })?;
         println!("self-test: published payload port {host_port} ok");
     }
 
@@ -166,15 +201,18 @@ pub(crate) fn run_self_test(args: &[String]) -> Result<(), String> {
         )
     };
     let exit_code = if let Some(port) = self_test.publish_container_port {
-        run_payload_with_published_container_check(payload_addr, request, port, &artifacts)
+        run_payload_with_published_container_check(payload_addr, request, port, &artifacts).await
     } else {
-        run_payload_tcp_with_control(
+        let mut output = tokio::io::stdout();
+        run_payload_tcp_async_with_control(
             payload_addr,
             &request,
             None,
-            &mut io::stdout(),
+            &mut output,
             PayloadControlOptions::disabled(),
         )
+        .await
+        .and_then(|outcome| outcome.into_exit_code())
         .map_err(|error| format!("self-test payload failed: {error}\n{artifacts}"))
     };
     let host_sqlite_wait_result = if let Some(host_sqlite) = host_sqlite.as_mut() {
@@ -184,9 +222,15 @@ pub(crate) fn run_self_test(args: &[String]) -> Result<(), String> {
     };
     println!("self-test: phase=shutting-down-frontend");
     flush_guest_filesystems(payload_addr)
+        .await
         .map_err(|error| format!("self-test guest sync failed: {error}\n{artifacts}"))?;
-    running
-        .terminate()
+    control_client
+        .request_shutdown("self-test completed")
+        .await
+        .map_err(|error| format!("self-test shutdown request failed: {error}\n{artifacts}"))?;
+    launch_task
+        .await
+        .map_err(|error| format!("self-test launch task failed: {error}\n{artifacts}"))?
         .map_err(|error| format!("self-test shutdown failed: {error}\n{artifacts}"))?;
     let exit_code = exit_code?;
     if exit_code != 0 {
@@ -231,50 +275,52 @@ fn verify_self_test_fs_check(project: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn run_payload_with_published_container_check(
+async fn run_payload_with_published_container_check(
     payload_addr: std::net::SocketAddr,
     request: PayloadRequest,
     port: PortPair,
     artifacts: &str,
 ) -> Result<i32, String> {
     let marker = "self-test: docker-publish-ready".to_string();
-    let (ready_tx, ready_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let thread_artifacts = artifacts.to_string();
-    let handle = thread::Builder::new()
-        .name("agentvm-self-test-published-container".to_string())
-        .spawn(move || {
-            let mut output = ReadyMarkerWriter::new(marker, ready_tx);
-            run_payload_tcp_with_control(
-                payload_addr,
-                &request,
-                None,
-                &mut output,
-                PayloadControlOptions::disabled(),
-            )
-            .map_err(|error| format!("self-test payload failed: {error}\n{thread_artifacts}"))
-        })
-        .map_err(|error| format!("failed to spawn published-container payload: {error}"))?;
+    let handle = tokio::spawn(async move {
+        let mut output = ReadyMarkerWriter::new(marker, ready_tx);
+        run_payload_tcp_async_with_control(
+            payload_addr,
+            &request,
+            None,
+            &mut output,
+            PayloadControlOptions::disabled(),
+        )
+        .await
+        .and_then(|outcome| outcome.into_exit_code())
+        .map_err(|error| format!("self-test payload failed: {error}\n{thread_artifacts}"))
+    });
 
-    ready_rx
-        .recv_timeout(Duration::from_secs(90))
+    tokio::time::timeout(Duration::from_secs(90), ready_rx)
+        .await
+        .map_err(|error| format!("published container did not become ready: {error}\n{artifacts}"))?
         .map_err(|error| {
             format!("published container did not become ready: {error}\n{artifacts}")
         })?;
-    check_published_container_port(port.host)
+    tokio::task::spawn_blocking(move || check_published_container_port(port.host))
+        .await
+        .map_err(|error| format!("published-container check task failed: {error}\n{artifacts}"))?
         .map_err(|error| format!("published container check failed: {error}\n{artifacts}"))?;
     handle
-        .join()
-        .map_err(|_| format!("published-container payload thread panicked\n{artifacts}"))?
+        .await
+        .map_err(|error| format!("published-container payload task failed: {error}\n{artifacts}"))?
 }
 
 struct ReadyMarkerWriter {
     marker: String,
-    ready_tx: Option<mpsc::Sender<()>>,
+    ready_tx: Option<tokio::sync::oneshot::Sender<()>>,
     recent: Vec<u8>,
 }
 
 impl ReadyMarkerWriter {
-    fn new(marker: String, ready_tx: mpsc::Sender<()>) -> Self {
+    fn new(marker: String, ready_tx: tokio::sync::oneshot::Sender<()>) -> Self {
         Self {
             marker,
             ready_tx: Some(ready_tx),
@@ -283,8 +329,12 @@ impl ReadyMarkerWriter {
     }
 }
 
-impl Write for ReadyMarkerWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+impl tokio::io::AsyncWrite for ReadyMarkerWriter {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        bytes: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
         io::stdout().write_all(bytes)?;
         self.recent.extend_from_slice(bytes);
         let max_len = self.marker.len().saturating_mul(2).max(1024);
@@ -297,11 +347,21 @@ impl Write for ReadyMarkerWriter {
                 let _ = tx.send(());
             }
         }
-        Ok(bytes.len())
+        std::task::Poll::Ready(Ok(bytes.len()))
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        io::stdout().flush()
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(io::stdout().flush())
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        self.poll_flush(cx)
     }
 }
 
@@ -702,6 +762,9 @@ mod tests {
         assert!(script.contains("self-test: payload-start"));
         assert!(script.contains("id -u"));
         assert!(script.contains("AGENTVM_UID"));
+        assert!(script.contains("/run/agentvm-config/launch.json"));
+        assert!(script.contains("self-test: launch-config-ok"));
+        assert!(script.contains("agentvm_project="));
         assert!(script.contains("/run/agentvm-config/mitm-ca.crt"));
         assert!(script.contains("test ! -e /run/agentvm-config/mitm-ca.key"));
         assert!(script.contains("NODE_EXTRA_CA_CERTS"));
@@ -1085,7 +1148,12 @@ mod tests {
             );
             return;
         }
-        run_self_test(&["--hostile".to_string(), "--no-net".to_string()])
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(run_self_test(&[
+                "--hostile".to_string(),
+                "--no-net".to_string(),
+            ]))
             .expect("hostile self-test");
     }
 }

@@ -1,11 +1,9 @@
-use std::net::ToSocketAddrs;
-use std::sync::mpsc;
-use std::thread;
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use agentvm_frontend::payload_client::{
-    PayloadClientError, PayloadControlAction, PayloadControlPolicy, PayloadEvent, PayloadRequest,
-    PayloadSession, PayloadWriter,
+    AsyncPayloadCommandSender, AsyncPayloadSession, PayloadClientError, PayloadControlAction,
+    PayloadControlPolicy, PayloadEvent, PayloadRequest, PayloadSessionOutcome,
 };
 use agentvm_frontend::supervisor::{SupervisorShutdown, SupervisorTaskStatus};
 use agentvm_frontend::supervisor_control::{
@@ -27,6 +25,7 @@ use super::{
 };
 
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RENDER_INTERVAL: Duration = Duration::from_millis(16);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TuiLayout {
@@ -52,76 +51,11 @@ pub(crate) fn viewport_layout(area: Rect) -> TuiLayout {
 }
 
 pub(crate) fn initial_guest_size(terminal_size: Size) -> (u16, u16) {
+    if terminal_size.width == 0 || terminal_size.height == 0 {
+        return (24, 80);
+    }
     let layout = viewport_layout(Rect::new(0, 0, terminal_size.width, terminal_size.height));
-    (layout.guest_rows, layout.guest_cols)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StartupSelection {
-    pub(crate) enable_codex: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StartupDialogResult {
-    Accepted(StartupSelection),
-    Cancelled,
-    Redraw,
-    Ignored,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct StartupDialog {
-    enable_codex: bool,
-}
-
-impl StartupDialog {
-    fn new() -> Self {
-        Self { enable_codex: true }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> StartupDialogResult {
-        if key.kind == KeyEventKind::Release {
-            return StartupDialogResult::Ignored;
-        }
-        match key.code {
-            KeyCode::Enter => StartupDialogResult::Accepted(StartupSelection {
-                enable_codex: self.enable_codex,
-            }),
-            KeyCode::Esc => StartupDialogResult::Cancelled,
-            KeyCode::Char('y' | 'Y') => {
-                self.enable_codex = true;
-                StartupDialogResult::Accepted(StartupSelection { enable_codex: true })
-            }
-            KeyCode::Char('n' | 'N') => {
-                self.enable_codex = false;
-                StartupDialogResult::Accepted(StartupSelection {
-                    enable_codex: false,
-                })
-            }
-            KeyCode::Char(' ') => {
-                self.enable_codex = !self.enable_codex;
-                StartupDialogResult::Redraw
-            }
-            _ => StartupDialogResult::Ignored,
-        }
-    }
-
-    fn render(&self, frame: &mut Frame) {
-        let area = centered_rect(frame.area(), 64, 11);
-        let choice = if self.enable_codex { "yes" } else { "no" };
-        let body = format!(
-            "Initialize Codex for this sandbox?\n\nCodex state will be mounted read-write at its normal home path.\n\n[Y] yes  [N] no  [Space] toggle  [Enter] accept  [Esc] cancel\n\nCurrent: {choice}"
-        );
-        let paragraph = Paragraph::new(body)
-            .block(
-                Block::default()
-                    .title(" Sandbox Setup ")
-                    .borders(Borders::ALL),
-            )
-            .alignment(Alignment::Left)
-            .wrap(Wrap { trim: true });
-        frame.render_widget(paragraph, area);
-    }
+    (payload_rows(layout.guest_rows), layout.guest_cols.max(1))
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -133,33 +67,6 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     )
-}
-
-pub(crate) fn run_startup_dialog() -> Result<StartupSelection, String> {
-    let mut terminal = ratatui::try_init().map_err(|error| error.to_string())?;
-    let _restore = RestoreTerminal;
-    let mut dialog = StartupDialog::new();
-    terminal
-        .draw(|frame| dialog.render(frame))
-        .map_err(|error| error.to_string())?;
-    loop {
-        if event::poll(INPUT_POLL_INTERVAL).map_err(|error| error.to_string())? {
-            let event = event::read().map_err(|error| error.to_string())?;
-            if let Event::Key(key) = event {
-                match dialog.handle_key(key) {
-                    StartupDialogResult::Accepted(selection) => return Ok(selection),
-                    StartupDialogResult::Cancelled => {
-                        return Err("startup dialog cancelled".to_string());
-                    }
-                    StartupDialogResult::Redraw => terminal
-                        .draw(|frame| dialog.render(frame))
-                        .map_err(|error| error.to_string())
-                        .map(|_| ())?,
-                    StartupDialogResult::Ignored => {}
-                }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,7 +256,7 @@ pub(crate) struct GuestTerminalView {
 impl GuestTerminalView {
     pub(crate) fn new(rows: u16, cols: u16) -> Self {
         Self {
-            parser: vt100::Parser::new(rows.max(1), cols.max(1), 2000),
+            parser: vt100::Parser::new(vt100_rows(rows), cols.max(1), 2000),
             status: StatusBar::new(rows.max(1), cols.max(1)),
             prompt: None,
             prefix_armed: false,
@@ -363,7 +270,9 @@ impl GuestTerminalView {
     }
 
     pub(crate) fn set_guest_size(&mut self, rows: u16, cols: u16) {
-        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+        self.parser
+            .screen_mut()
+            .set_size(vt100_rows(rows), cols.max(1));
         self.status.guest_rows = rows.max(1);
         self.status.guest_cols = cols.max(1);
     }
@@ -440,6 +349,9 @@ impl GuestTerminalView {
     }
 
     pub(crate) fn render(&self, frame: &mut Frame) {
+        if frame.area().width == 0 || frame.area().height == 0 {
+            return;
+        }
         let layout = viewport_layout(frame.area());
         let terminal = PseudoTerminal::new(self.parser.screen())
             .style(Style::default().fg(Color::White).bg(Color::Black));
@@ -451,6 +363,14 @@ impl GuestTerminalView {
             .unwrap_or_else(|| self.status.text(layout.status.width));
         frame.render_widget(Paragraph::new(status_text), layout.status);
     }
+}
+
+fn payload_rows(rows: u16) -> u16 {
+    rows.max(2)
+}
+
+fn vt100_rows(rows: u16) -> u16 {
+    payload_rows(rows)
 }
 
 #[derive(Debug, Clone)]
@@ -718,14 +638,34 @@ fn ctrl_char_bytes(ch: char) -> Option<Vec<u8>> {
     }
 }
 
-fn handle_guest_input(
+async fn handle_guest_input(
     input: GuestInput,
-    writer: &mut PayloadWriter,
+    commands: &AsyncPayloadCommandSender,
 ) -> Result<(), PayloadClientError> {
     match input {
-        GuestInput::Bytes(bytes) => writer.send_input(&bytes),
-        GuestInput::Signal(signal) => writer.send_signal(signal),
+        GuestInput::Bytes(bytes) => commands.send_input(bytes).await,
+        GuestInput::Signal(signal) => commands.send_signal(signal).await,
         GuestInput::Reserved => Ok(()),
+    }
+}
+
+#[derive(Debug, Default)]
+struct RenderCoalescer {
+    dirty: bool,
+}
+
+impl RenderCoalescer {
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn consume_tick(&mut self) -> bool {
+        if self.dirty {
+            self.dirty = false;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -737,10 +677,10 @@ impl Drop for RestoreTerminal {
     }
 }
 
-pub(crate) fn run_payload_viewport(
-    addr: impl ToSocketAddrs,
+pub(crate) async fn run_payload_viewport(
+    addr: SocketAddr,
     request: &PayloadRequest,
-) -> Result<i32, PayloadClientError> {
+) -> Result<PayloadSessionOutcome, PayloadClientError> {
     let mut terminal = ratatui::try_init()?;
     let _restore = RestoreTerminal;
     let terminal_size = terminal.size()?;
@@ -751,70 +691,66 @@ pub(crate) fn run_payload_viewport(
     let mut view = GuestTerminalView::new(rows, cols);
     terminal.draw(|frame| view.render(frame))?;
 
-    let mut session = PayloadSession::connect(addr, &request)?;
-    let mut writer = session.try_clone_writer()?;
-    let (payload_tx, payload_rx) = mpsc::channel();
-    thread::Builder::new()
-        .name("agentvm-tui-payload-reader".to_string())
-        .spawn(move || loop {
-            let event = session.recv_event();
-            let terminal_event = matches!(
-                event,
-                Ok(PayloadEvent::Exit(_) | PayloadEvent::Failure(_)) | Err(_)
-            );
-            if payload_tx.send(event).is_err() || terminal_event {
-                break;
-            }
-        })
-        .map_err(PayloadClientError::Io)?;
+    let stream = tokio::net::TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+    let mut session = AsyncPayloadSession::from_stream(stream, &request).await?;
+    let commands = session.command_sender();
+    let mut render_tick = tokio::time::interval(RENDER_INTERVAL);
+    render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut renderer = RenderCoalescer::default();
 
     loop {
-        let mut redraw = false;
-        while let Ok(payload_event) = payload_rx.try_recv() {
-            match payload_event? {
-                PayloadEvent::Output(bytes) => {
-                    view.process_output(&bytes);
-                    redraw = true;
-                }
-                PayloadEvent::Exit(exit_code) => {
-                    view.set_phase(SessionPhase::Exited(exit_code));
-                    terminal.draw(|frame| view.render(frame))?;
-                    return Ok(exit_code);
-                }
-                PayloadEvent::Failure(message) => {
-                    view.set_phase(SessionPhase::Error(message.clone()));
-                    terminal.draw(|frame| view.render(frame))?;
-                    return Err(PayloadClientError::Protocol(message));
+        tokio::select! {
+            payload_event = session.recv_event() => {
+                match payload_event? {
+                    PayloadEvent::Output(bytes) => {
+                        view.process_output(&bytes);
+                        renderer.mark_dirty();
+                    }
+                    PayloadEvent::Exit(exit_code) => {
+                        view.set_phase(SessionPhase::Exited(exit_code));
+                        terminal.draw(|frame| view.render(frame))?;
+                        return Ok(PayloadSessionOutcome::Exit(exit_code));
+                    }
+                    PayloadEvent::Failure(message) => {
+                        view.set_phase(SessionPhase::Error(message.clone()));
+                        terminal.draw(|frame| view.render(frame))?;
+                        return Ok(PayloadSessionOutcome::Failure(message));
+                    }
                 }
             }
+            _ = render_tick.tick() => {
+                if renderer.consume_tick() {
+                    terminal.draw(|frame| view.render(frame))?;
+                }
+            }
+            _ = tokio::time::sleep(INPUT_POLL_INTERVAL) => {}
         }
 
-        if event::poll(INPUT_POLL_INTERVAL)? {
+        while event::poll(Duration::ZERO)? {
             match event::read()? {
                 Event::Key(key) => match view.handle_wrapper_key(key) {
                     WrapperKeyOutcome::GuestInput(input) => {
-                        handle_guest_input(input, &mut writer)?;
+                        handle_guest_input(input, &commands).await?;
                     }
                     WrapperKeyOutcome::PromptFinished | WrapperKeyOutcome::Redraw => {
-                        redraw = true;
+                        renderer.mark_dirty();
                     }
                     WrapperKeyOutcome::Ignored => {}
                 },
                 Event::Paste(text) => {
-                    writer.send_input(text.as_bytes())?;
+                    commands.send_input(text.into_bytes()).await?;
                 }
                 Event::Resize(cols, rows) => {
                     let layout = viewport_layout(Rect::new(0, 0, cols, rows));
                     view.set_guest_size(layout.guest_rows, layout.guest_cols);
-                    writer.send_resize(layout.guest_rows, layout.guest_cols)?;
-                    redraw = true;
+                    commands
+                        .send_resize(payload_rows(layout.guest_rows), layout.guest_cols.max(1))
+                        .await?;
+                    renderer.mark_dirty();
                 }
                 _ => {}
             }
-        }
-
-        if redraw {
-            terminal.draw(|frame| view.render(frame))?;
         }
     }
 }
@@ -857,6 +793,12 @@ mod tests {
     }
 
     #[test]
+    fn initial_guest_size_uses_payload_safe_dimensions_for_tiny_or_zero_terminals() {
+        assert_eq!(initial_guest_size(Size::new(0, 0)), (24, 80));
+        assert_eq!(initial_guest_size(Size::new(1, 1)), (2, 1));
+    }
+
+    #[test]
     fn renders_guest_output_through_tui_term_widget() {
         let backend = TestBackend::new(24, 6);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -874,6 +816,39 @@ mod tests {
             .collect::<String>();
         assert!(contents.contains("hello"));
         assert!(contents.contains("red"));
+    }
+
+    #[test]
+    fn render_ignores_zero_sized_terminal_area() {
+        for (width, height) in [(0, 0), (0, 24), (80, 0)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            let view = GuestTerminalView::new(1, 1);
+
+            terminal.draw(|frame| view.render(frame)).expect("draw");
+        }
+    }
+
+    #[test]
+    fn single_row_guest_view_processes_wrapping_output_without_vt100_underflow() {
+        let mut view = GuestTerminalView::new(1, 1);
+
+        view.process_output(b"abcd\r\nefgh");
+
+        assert_eq!(view.status.guest_rows, 1);
+        assert_eq!(view.status.guest_cols, 1);
+    }
+
+    #[test]
+    fn render_coalescer_batches_multiple_dirty_events_until_tick() {
+        let mut renderer = RenderCoalescer::default();
+
+        assert!(!renderer.consume_tick());
+        renderer.mark_dirty();
+        renderer.mark_dirty();
+        renderer.mark_dirty();
+        assert!(renderer.consume_tick());
+        assert!(!renderer.consume_tick());
     }
 
     #[test]
@@ -909,6 +884,7 @@ mod tests {
                     status: SupervisorTaskStatus::Starting,
                 },
             ],
+            payload_control_endpoint: None,
         };
         assert_eq!(
             supervisor_status_summary(&snapshot),
@@ -943,6 +919,7 @@ mod tests {
                     },
                 },
             ],
+            payload_control_endpoint: None,
         };
 
         assert_eq!(
@@ -1027,60 +1004,6 @@ mod tests {
             WrapperKeyOutcome::PromptFinished
         );
         assert_eq!(view.last_prompt_result, Some(PromptResult::Cancelled));
-    }
-
-    #[test]
-    fn startup_dialog_defaults_to_codex_and_accepts_choices() {
-        let mut dialog = StartupDialog::new();
-
-        assert_eq!(
-            dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            StartupDialogResult::Accepted(StartupSelection { enable_codex: true })
-        );
-        assert_eq!(
-            dialog.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
-            StartupDialogResult::Accepted(StartupSelection {
-                enable_codex: false
-            })
-        );
-    }
-
-    #[test]
-    fn startup_dialog_can_toggle_and_cancel() {
-        let mut dialog = StartupDialog::new();
-
-        assert_eq!(
-            dialog.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
-            StartupDialogResult::Redraw
-        );
-        assert!(!dialog.enable_codex);
-        assert_eq!(
-            dialog.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
-            StartupDialogResult::Cancelled
-        );
-    }
-
-    #[test]
-    fn startup_dialog_renders_at_representative_terminal_sizes() {
-        for (width, height) in [(80, 24), (42, 12)] {
-            let backend = TestBackend::new(width, height);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            let dialog = StartupDialog::new();
-
-            terminal.draw(|frame| dialog.render(frame)).expect("draw");
-
-            let text = backend_text(&terminal, width, height);
-            assert!(text.contains("Sandbox Setup"), "{width}x{height}\n{text}");
-            assert!(
-                text.contains("Initialize Codex"),
-                "{width}x{height}\n{text}"
-            );
-            assert!(text.contains("Current: yes"), "{width}x{height}\n{text}");
-            assert_eq!(
-                backend_rows(&terminal, width, height).len(),
-                usize::from(height)
-            );
-        }
     }
 
     #[test]

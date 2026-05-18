@@ -73,12 +73,11 @@ rewrite_env_file() {
   local e2fsprogs_version=$6
   local iproute2_version=$7
   local util_linux_version=$8
-  local bubblewrap_version=$9
-  local bash_version=${10}
-  local nodejs_version=${11}
-  local npm_version=${12}
-  local mise_version=${13}
-  local mise_sha256=${14}
+  local bash_version=$9
+  local nodejs_version=${10}
+  local npm_version=${11}
+  local mise_version=${12}
+  local mise_sha256=${13}
   local tmp
 
   tmp=$(mktemp)
@@ -91,7 +90,6 @@ rewrite_env_file() {
     -v e2fsprogs_version="${e2fsprogs_version}" \
     -v iproute2_version="${iproute2_version}" \
     -v util_linux_version="${util_linux_version}" \
-    -v bubblewrap_version="${bubblewrap_version}" \
     -v bash_version="${bash_version}" \
     -v nodejs_version="${nodejs_version}" \
     -v npm_version="${npm_version}" \
@@ -105,7 +103,6 @@ rewrite_env_file() {
       /^E2FSPROGS_VERSION=/ { print "E2FSPROGS_VERSION=" e2fsprogs_version; next }
       /^IPROUTE2_VERSION=/ { print "IPROUTE2_VERSION=" iproute2_version; next }
       /^UTIL_LINUX_VERSION=/ { print "UTIL_LINUX_VERSION=" util_linux_version; next }
-      /^BUBBLEWRAP_VERSION=/ { print "BUBBLEWRAP_VERSION=" bubblewrap_version; next }
       /^BASH_VERSION=/ { print "BASH_VERSION=" bash_version; next }
       /^NODEJS_VERSION=/ { print "NODEJS_VERSION=" nodejs_version; next }
       /^NPM_VERSION=/ { print "NPM_VERSION=" npm_version; next }
@@ -162,7 +159,6 @@ main() {
   local e2fsprogs_version
   local iproute2_version
   local util_linux_version
-  local bubblewrap_version
   local bash_version
   local nodejs_version
   local npm_version
@@ -179,7 +175,6 @@ main() {
   e2fsprogs_version=$(resolve_version e2fsprogs "${main_index}" "${community_index}")
   iproute2_version=$(resolve_version iproute2 "${main_index}" "${community_index}")
   util_linux_version=$(resolve_version util-linux "${main_index}" "${community_index}")
-  bubblewrap_version=$(resolve_version bubblewrap "${main_index}" "${community_index}")
   bash_version=$(resolve_version bash "${main_index}" "${community_index}")
   nodejs_version=$(resolve_version nodejs "${main_index}" "${community_index}")
   npm_version=$(resolve_version npm "${main_index}" "${community_index}")
@@ -193,7 +188,7 @@ main() {
   mise_version=$(printf '%s\n' "${mise_release_info}" | sed -n '1p')
   mise_sha256=$(printf '%s\n' "${mise_release_info}" | sed -n '2p')
 
-  if [[ -z "${docker_engine_version}" || -z "${docker_cli_version}" || -z "${linux_virt_version}" || -z "${mkinitfs_version}" || -z "${python3_version}" || -z "${e2fsprogs_version}" || -z "${iproute2_version}" || -z "${util_linux_version}" || -z "${bubblewrap_version}" || -z "${bash_version}" || -z "${nodejs_version}" || -z "${npm_version}" || -z "${mise_version}" || -z "${mise_sha256}" ]]; then
+  if [[ -z "${docker_engine_version}" || -z "${docker_cli_version}" || -z "${linux_virt_version}" || -z "${mkinitfs_version}" || -z "${python3_version}" || -z "${e2fsprogs_version}" || -z "${iproute2_version}" || -z "${util_linux_version}" || -z "${bash_version}" || -z "${nodejs_version}" || -z "${npm_version}" || -z "${mise_version}" || -z "${mise_sha256}" ]]; then
     echo "error: failed to resolve one or more Alpine package versions" >&2
     exit 1
   fi
@@ -207,7 +202,6 @@ main() {
     "${e2fsprogs_version}" \
     "${iproute2_version}" \
     "${util_linux_version}" \
-    "${bubblewrap_version}" \
     "${bash_version}" \
     "${nodejs_version}" \
     "${npm_version}" \
@@ -224,7 +218,6 @@ Updated ${ENV_PATH}
   E2FSPROGS_VERSION=${e2fsprogs_version}
   IPROUTE2_VERSION=${iproute2_version}
   UTIL_LINUX_VERSION=${util_linux_version}
-  BUBBLEWRAP_VERSION=${bubblewrap_version}
   BASH_VERSION=${bash_version}
   NODEJS_VERSION=${nodejs_version}
   NPM_VERSION=${npm_version}

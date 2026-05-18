@@ -1,8 +1,8 @@
 ---
 id: wra-662v
-status: in_progress
+status: closed
 deps: [wra-cvmy, wra-n0fe]
-links: [wra-y335]
+links: [wra-y335, wra-ylcz, wra-vd8g, wra-o75s]
 created: 2026-05-17T10:19:50Z
 type: task
 priority: 2
@@ -160,3 +160,31 @@ wra-xcvq iteration 55: rechecked execution environment. target/debug/agentvm-gue
 **2026-05-17T21:38:35Z**
 
 wra-xcvq iteration 59 near-loop-end status: no Rust opt-in appliance rebuild or explicit scope-narrowing decision has been provided. Keep this ticket in_progress under current acceptance; do not close it on default Python required validation alone. Closure requires either a manifest containing agentvm_payload_service=rust plus Rust opt-in live validation, or an explicit acceptance/scope change assigning all opt-in appliance live proof to wra-y335.
+
+**2026-05-18T04:33:19Z**
+
+Rust opt-in live-payload failed after user rebuild because guest-init selected the Rust payload service but /usr/local/libexec/agentvm-guest-service was not visible inside the guest. Host-side debugfs confirmed docker/out/rootfs.raw does contain that binary, so the likely cause is stale .sandbox/docker-vm/state.raw root overlay masking newly added lower-rootfs files. Filed bug wra-ylcz to reset/isolate live-payload root overlay state after appliance rebuilds. For current validation, reset .sandbox/docker-vm/state.raw before rerunning live-payload.
+
+**2026-05-18T04:35:40Z**
+
+Rust opt-in live-payload still fails after resetting .sandbox/docker-vm/state.raw. Host-side rootfs.raw contains /usr/local/libexec/agentvm-guest-service, but guest shell reports '/usr/local/libexec/agentvm-guest-service: not found'. This is consistent with copying a host glibc-linked target/debug/agentvm-guest-service into the Alpine/musl appliance, where the ELF interpreter is absent. Need build/provide a guest-compatible (likely musl/static) agentvm-guest-service binary before rebuilding the Rust opt-in appliance.
+
+**2026-05-18T04:36:39Z**
+
+Built a guest-compatible Rust service binary successfully with: cargo build --manifest-path guest-service/Cargo.toml --offline --bin agentvm-guest-service --target x86_64-unknown-linux-musl. Host inspection shows target/x86_64-unknown-linux-musl/debug/agentvm-guest-service is static-pie linked with no GNU interpreter. Next rebuild should use AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/x86_64-unknown-linux-musl/debug/agentvm-guest-service, not target/debug/agentvm-guest-service. Filed wra-vd8g to reject/document non-guest-compatible glibc binaries in the appliance build.
+
+**2026-05-18T05:36:09Z**
+
+User reported rebuild after musl/static guidance, but inspection shows docker/out/artifact-manifest.json still records target/debug/agentvm-guest-service with sha256 4bcc60e0..., and dumping /usr/local/libexec/agentvm-guest-service from docker/out/rootfs.raw shows the same GNU/glibc binary with interpreter /lib64/ld-linux-x86-64.so.2. The musl/static binary at target/x86_64-unknown-linux-musl/debug/agentvm-guest-service has sha256 384eee... and is not in the rebuilt rootfs. Need rerun rebuild with AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/x86_64-unknown-linux-musl/debug/agentvm-guest-service before live validation.
+
+**2026-05-18T05:40:05Z**
+
+Linked to cleanup epic wra-9m5h through wra-o75s. The opt-in Rust service work should avoid becoming a permanent duplicate implementation; wra-y335 owns parity validation and wra-o75s owns deleting the Python path after the default switch decision.
+
+**2026-05-18T05:42:35Z**
+
+Rust opt-in appliance was rebuilt with the musl/static guest-service binary and rootfs verification now matches target/x86_64-unknown-linux-musl/debug/agentvm-guest-service. live-payload progressed past guest-service startup and Docker readiness but failed in the payload script after `payload-start`/`home-ok`: output ended at `payload-start\nhome-ok\n` with exit_status 1. This identifies a Rust service parity gap: primary payloads were launched as root instead of honoring AGENTVM_UID/AGENTVM_GID and HOME setup like docker/guest-payload-server.py. Implemented UID/GID/HOME handling in guest-service for primary and diagnostics (create HOME, chown when needed, setsid then setgroups/setgid/setuid in pre_exec) and added `guest_service_primary_uses_requested_identity_and_home`. Focused validation passed: cargo test --manifest-path guest-service/Cargo.toml --offline -- --nocapture; cargo build --manifest-path guest-service/Cargo.toml --offline --bin agentvm-guest-service --target x86_64-unknown-linux-musl. Need rebuild Rust opt-in appliance again with the updated musl binary before rerunning live-payload.
+
+**2026-05-18T06:33:46Z**
+
+Rust opt-in appliance closure validation completed. User rebuilt with AGENTVM_PAYLOAD_SERVICE=rust and AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/x86_64-unknown-linux-musl/debug/agentvm-guest-service after the UID/GID/HOME fix. Verified docker/out/artifact-manifest.json kernel_cmdline contains agentvm_payload_service=rust; manifest source input, target musl binary, and /usr/local/libexec/agentvm-guest-service dumped from docker/out/rootfs.raw all share sha256 a6601c1000e833a0e1b18a0313246fbbb4427a926d7fb8a6ec0d50715b15ccb5. Rootfs binary is static-pie linked with no GNU interpreter. Live validation passed: ./vm-frontend/validate.sh live-payload; ./vm-frontend/validate.sh live-docker; ./vm-frontend/validate.sh required. Required initially exposed validation bug wra-zyi5, fixed and closed, then required passed. Python remains the default/default-switch gate under wra-y335; this ticket proves the opt-in Rust appliance path is usable.

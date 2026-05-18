@@ -1,5 +1,7 @@
 use super::*;
 
+use agentvm_frontend::payload_client::ping_payload_async_tcp;
+
 const DEFAULT_ARTIFACT_MANIFEST_RELATIVE: &str = "docker/out/artifact-manifest.json";
 
 pub(crate) type LaunchCliResult<T> = Result<T, LaunchCliError>;
@@ -60,6 +62,13 @@ pub(crate) enum LaunchCliError {
     LockProjectVmState { source: io::Error },
     #[error("failed to remove .sandbox: {source}")]
     RemoveSandbox { source: io::Error },
+    #[error("failed to bind payload control listener on {host_addr}:0: {source}")]
+    BindPayloadControlPort {
+        host_addr: String,
+        source: io::Error,
+    },
+    #[error("failed to inspect payload control listener address: {source}")]
+    PayloadControlPortAddr { source: io::Error },
     #[error("failed to bind local HTTP smoke upstream: {source}")]
     BindLocalHttpSmokeUpstream { source: io::Error },
     #[error("failed to inspect local HTTP smoke upstream address: {source}")]
@@ -68,6 +77,8 @@ pub(crate) enum LaunchCliError {
     SpawnLocalHttpSmokeUpstream { source: io::Error },
     #[error("--no-net cannot be combined with egress allow options")]
     NoNetWithEgressAllow,
+    #[error("invalid --allow-ip: {source}")]
+    InvalidAllowIpRange { source: Ipv4RangeParseError },
     #[error("--no-net cannot be combined with --publish")]
     NoNetWithPublish,
 }
@@ -94,9 +105,18 @@ pub(crate) async fn run_launch_async(
     args: &[String],
     ui_mode: WrapperUiMode,
 ) -> LaunchCliResult<()> {
-    let (config, policy_args) = frontend_config_from_args(args)?;
-    if launch_payload_args(&config, &policy_args)?.is_some() || ui_mode == WrapperUiMode::Tui {
-        return run_launch(args, ui_mode);
+    let request = frontend_launch_request_from_args(args)?;
+    run_launch_request_async(request, ui_mode).await
+}
+
+pub(crate) async fn run_launch_request_async(
+    request: FrontendLaunchRequest,
+    ui_mode: WrapperUiMode,
+) -> LaunchCliResult<()> {
+    let (config, policy_args) = frontend_config_from_launch_request(&request)?;
+    let payload = launch_payload_args(&config, &policy_args)?;
+    if let Some(payload) = payload {
+        return run_payload_launch_request_async(config, policy_args, payload, ui_mode).await;
     }
     let span = tracing::info_span!(
         "launch.cli.async",
@@ -105,13 +125,13 @@ pub(crate) async fn run_launch_async(
         ui_mode = ?ui_mode,
     );
     let _span_guard = span.enter();
-    tracing::info!(argc = args.len(), "launch command configured for async run");
+    tracing::info!("launch request configured for async run");
     let artifacts = frontend_artifact_summary(&config);
     let _lock = ProjectLock::acquire(&config)?;
     let qemu_timeout = policy_args.qemu_timeout;
     let local_http_smoke_upstream = policy_args.local_http_smoke_upstream;
     let mounts = runtime_mounts(&config, &policy_args)?;
-    let policy = policy_from_args(config.network.clone(), policy_args);
+    let policy = policy_from_args(config.network.clone(), policy_args)?;
     let mut config = config;
     if let Some(destination) = local_http_smoke_upstream {
         tracing::info!(?destination, "starting local HTTP smoke upstream");
@@ -135,24 +155,27 @@ pub(crate) async fn run_launch_async(
     handle_qemu_exit(qemu_exit, qemu_timeout, &artifacts)
 }
 
-pub(crate) fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> LaunchCliResult<()> {
-    let (config, policy_args) = frontend_config_from_args(args)?;
+async fn run_payload_launch_request_async(
+    config: FrontendConfig,
+    policy_args: PolicyArgs,
+    payload: PayloadLaunchArgs,
+    ui_mode: WrapperUiMode,
+) -> LaunchCliResult<()> {
     let span = tracing::info_span!(
-        "launch.cli",
+        "launch.cli.async.payload",
         project = %config.project.display(),
         run_dir = %config.runtime.run_dir.display(),
         ui_mode = ?ui_mode,
     );
     let _span_guard = span.enter();
-    tracing::info!(argc = args.len(), "launch command configured");
+    tracing::info!("payload launch configured for async supervisor run");
     let artifacts = frontend_artifact_summary(&config);
     let _lock = ProjectLock::acquire(&config)?;
     let qemu_timeout = policy_args.qemu_timeout;
     let local_http_smoke_upstream = policy_args.local_http_smoke_upstream;
-    let payload = launch_payload_args(&config, &policy_args)?;
     let mounts = runtime_mounts(&config, &policy_args)?;
     let guest_env = guest_payload_env(&config, &policy_args)?;
-    let mut policy = policy_from_args(config.network.clone(), policy_args);
+    let mut policy = policy_from_args(config.network.clone(), policy_args)?;
     let mut config = config;
     if let Some(destination) = local_http_smoke_upstream {
         tracing::info!(?destination, "starting local HTTP smoke upstream");
@@ -160,70 +183,151 @@ pub(crate) fn run_launch(args: &[String], ui_mode: WrapperUiMode) -> LaunchCliRe
             .upstream_mappings
             .push(start_local_http_smoke_upstream(destination)?);
     }
-    if let Some(payload) = payload {
-        let host_port = ensure_payload_listener(&mut policy);
-        tracing::info!(host_port, "starting frontend for payload launch");
-        println!("launch: phase=starting-frontend");
-        let running = start_frontend_with_policy(config.clone(), mounts, policy)
-            .map_err(|error| format!("launch failed: {error}\n{artifacts}"))?;
-        let addr = socket_addr("127.0.0.1", host_port)?;
-        println!("launch: phase=waiting-for-payload-ready timeout=120s");
-        wait_for_payload_ready(addr, Duration::from_secs(120))
-            .map_err(|error| format!("launch payload readiness failed: {error}\n{artifacts}"))?;
-        tracing::info!(%addr, "payload listener ready");
-        let request = PayloadRequest {
-            script: payload.script,
-            cwd: payload.cwd,
-            env: merged_payload_env(guest_env, payload.env),
-            rows: payload.rows,
-            cols: payload.cols,
-        };
-        let payload_result = match ui_mode {
-            WrapperUiMode::Tui => {
-                tracing::info!("running payload in TUI viewport");
-                tui::run_payload_viewport(addr, &request).map_err(|error| error.to_string())
-            }
-            WrapperUiMode::Plain => {
-                tracing::info!(
-                    stdin = !payload.no_stdin,
-                    "running payload over control connection"
-                );
-                let input =
-                    (!payload.no_stdin).then(|| Box::new(io::stdin()) as Box<dyn io::Read + Send>);
-                run_payload_tcp_with_control(
-                    addr,
-                    &request,
-                    input,
-                    &mut io::stdout(),
-                    PayloadControlOptions::interactive(),
-                )
-                .map_err(|error| error.to_string())
-            }
-        };
-        if let Err(error) = flush_guest_filesystems(addr) {
-            tracing::warn!(%error, "failed to flush guest filesystem before VM shutdown");
-            eprintln!("warning: failed to flush guest filesystem before VM shutdown: {error}");
-        }
-        running
-            .terminate()
-            .map_err(|error| format!("launch shutdown failed: {error}"))?;
-        let exit_code = payload_result?;
-        tracing::info!(exit_code, "payload finished");
-        std::process::exit(payload_exit_status(exit_code));
-    }
-    tracing::info!(
-        qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
-        "starting frontend without payload client"
-    );
+    let mut payload_listener = ensure_payload_listener(&mut policy)?;
+    let host_port = payload_listener.host_port();
+    tracing::info!(host_port, "starting async frontend for payload launch");
     println!("launch: phase=starting-frontend");
-    let qemu_exit = run_frontend_until_qemu_exit_with_policy_and_timeout(
-        config.clone(),
-        mounts,
-        policy,
-        qemu_timeout,
-    )
-    .map_err(|error| format!("launch failed: {error}\n{artifacts}"))?;
-    handle_qemu_exit(qemu_exit, qemu_timeout, &artifacts)
+    let control_client = SupervisorControlClient::for_runtime(&config.runtime);
+    let launch_config = config.clone();
+    let reserved_host_ports = payload_listener.take_listener().into_iter().collect();
+    let mut launch_task = tokio::spawn(async move {
+        run_frontend_until_qemu_exit_with_policy_and_timeout_reserving_host_ports_async(
+            launch_config,
+            mounts,
+            policy,
+            qemu_timeout,
+            reserved_host_ports,
+        )
+        .await
+    });
+
+    let endpoint = wait_for_supervisor_payload_endpoint(&control_client, Duration::from_secs(30));
+    let addr = tokio::select! {
+        endpoint = endpoint => match endpoint {
+            Ok(addr) => addr,
+            Err(error) => {
+                let _ = control_client
+                    .request_shutdown("payload control discovery failed")
+                    .await;
+                let _ = launch_task.await;
+                return Err(
+                    format!("launch payload control discovery failed: {error}\n{artifacts}").into(),
+                );
+            }
+        },
+        launch = &mut launch_task => {
+            let launch_result = launch.map_err(|error| {
+                LaunchCliError::Message(format!("async launch task failed: {error}"))
+            })?;
+            return match launch_result {
+                Ok(qemu_exit) => Err(format!(
+                    "launch failed: qemu exited before payload endpoint was published: status={} timed_out={}\n{artifacts}",
+                    qemu_exit.status,
+                    qemu_exit.timed_out,
+                ).into()),
+                Err(error) => Err(format!("launch failed: {error}\n{artifacts}").into()),
+            };
+        }
+    };
+    println!("launch: phase=waiting-for-payload-ready timeout=120s");
+    let readiness_task = tokio::spawn(wait_for_payload_ready_async(addr, Duration::from_secs(120)));
+    let readiness = tokio::select! {
+        readiness = readiness_task => readiness,
+        launch = &mut launch_task => {
+            let launch_result = launch.map_err(|error| {
+                LaunchCliError::Message(format!("async launch task failed: {error}"))
+            })?;
+            return match launch_result {
+                Ok(qemu_exit) => Err(format!(
+                    "launch failed: qemu exited before payload ready: status={} timed_out={}\n{artifacts}",
+                    qemu_exit.status,
+                    qemu_exit.timed_out,
+                ).into()),
+                Err(error) => Err(format!("launch failed: {error}\n{artifacts}").into()),
+            };
+        }
+    };
+    if let Err(error) = readiness.map_err(|error| {
+        LaunchCliError::Message(format!("payload readiness task failed: {error}"))
+    })? {
+        let _ = control_client
+            .request_shutdown("payload readiness failed")
+            .await;
+        let _ = launch_task.await;
+        return Err(format!("launch payload readiness failed: {error}\n{artifacts}").into());
+    }
+    tracing::info!(%addr, "payload listener ready through supervisor control");
+    let request = PayloadRequest {
+        script: payload.script,
+        cwd: payload.cwd,
+        env: merged_payload_env(guest_env, payload.env),
+        rows: payload.rows,
+        cols: payload.cols,
+    };
+    let payload_result = match ui_mode {
+        WrapperUiMode::Plain => {
+            let input = (!payload.no_stdin).then(|| {
+                Box::new(tokio::io::stdin()) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+            });
+            let mut output = tokio::io::stdout();
+            run_payload_tcp_async_with_control(
+                addr,
+                &request,
+                input,
+                &mut output,
+                PayloadControlOptions::interactive(),
+            )
+            .await
+        }
+        WrapperUiMode::Tui => {
+            tracing::info!("running payload in TUI viewport through supervisor endpoint");
+            tui::run_payload_viewport(addr, &request).await
+        }
+    };
+
+    if let Err(error) = flush_guest_filesystems(addr).await {
+        tracing::warn!(%error, "failed to flush guest filesystem before VM shutdown");
+        eprintln!("warning: failed to flush guest filesystem before VM shutdown: {error}");
+    }
+    if let Err(error) = control_client.request_shutdown("payload finished").await {
+        tracing::warn!(%error, "failed to request supervisor shutdown after payload");
+        eprintln!("warning: failed to request supervisor shutdown after payload: {error}");
+    }
+    let launch_result = launch_task
+        .await
+        .map_err(|error| LaunchCliError::Message(format!("async launch task failed: {error}")))?;
+    if let Err(error) = launch_result {
+        return Err(format!("launch failed: {error}\n{artifacts}").into());
+    }
+    let exit_code = payload_result?.into_exit_code()?;
+    tracing::info!(exit_code, "payload finished");
+    std::process::exit(payload_exit_status(exit_code));
+}
+
+async fn wait_for_supervisor_payload_endpoint(
+    client: &SupervisorControlClient,
+    timeout: Duration,
+) -> LaunchCliResult<std::net::SocketAddr> {
+    let deadline = Instant::now() + timeout;
+    let mut last_error = None;
+    loop {
+        match client.payload_control_endpoint().await {
+            Ok(Some(endpoint)) => {
+                return socket_addr(&endpoint.host_addr, endpoint.host_port).map_err(Into::into)
+            }
+            Ok(None) => {}
+            Err(error) => last_error = Some(error),
+        }
+        if Instant::now() >= deadline {
+            let detail = last_error
+                .map(|error| format!("; last control error: {error}"))
+                .unwrap_or_default();
+            return Err(LaunchCliError::Message(format!(
+                "timed out waiting for supervisor payload endpoint{detail}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn handle_qemu_exit(
@@ -348,7 +452,7 @@ fn acquire_project_file_lock(file: &File, busy_message: String) -> LaunchCliResu
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct PolicyArgs {
     pub(crate) allow_ips: Vec<String>,
     pub(crate) allow_domains: Vec<String>,
@@ -395,9 +499,34 @@ pub(crate) struct GuestPathShareShadow {
     pub(crate) backing_path: PathBuf,
 }
 
-pub(crate) fn frontend_config_from_args(
+#[derive(Debug, Clone)]
+pub(crate) struct FrontendLaunchRequest {
+    pub(crate) project: PathBuf,
+    pub(crate) run_dir: PathBuf,
+    pub(crate) artifact_manifest: PathBuf,
+    pub(crate) qemu: PathBuf,
+    pub(crate) guest_http_smoke_url: Option<String>,
+    pub(crate) guest_log_dir: Option<PathBuf>,
+    pub(crate) policy: PolicyArgs,
+}
+
+impl FrontendLaunchRequest {
+    pub(crate) fn for_project(project: PathBuf) -> Self {
+        Self {
+            project: project.clone(),
+            run_dir: project.join(".sandbox/docker-vm/run"),
+            artifact_manifest: default_artifact_manifest_path(),
+            qemu: PathBuf::from("qemu-system-x86_64"),
+            guest_http_smoke_url: None,
+            guest_log_dir: None,
+            policy: PolicyArgs::default(),
+        }
+    }
+}
+
+pub(crate) fn frontend_launch_request_from_args(
     args: &[String],
-) -> LaunchCliResult<(FrontendConfig, PolicyArgs)> {
+) -> LaunchCliResult<FrontendLaunchRequest> {
     let matches = parse_clap_matches(frontend_clap_command(), args)?;
     let mut project = matches
         .get_one::<String>("project")
@@ -437,6 +566,7 @@ pub(crate) fn frontend_config_from_args(
             .push(parse_guest_path_share_shadow(&shadow)?);
     }
     let guest_http_smoke_url = matches.get_one::<String>("guest_http_smoke_url").cloned();
+    let mirror_guest_logs = matches.get_flag("mirror_guest_logs");
     policy.allow_ips = append_many(&matches, "allow_ip");
     policy.allow_domains = append_many(&matches, "allow_domain");
     policy.allow_public = matches.get_flag("allow_public_internet");
@@ -511,10 +641,50 @@ pub(crate) fn frontend_config_from_args(
         run_dir = project.join(&run_dir);
     }
 
-    let mut config =
-        FrontendConfig::from_artifact_manifest_file(project, run_dir, qemu, &artifact_manifest)
-            .map_err(|source| LaunchCliError::LoadFrontendConfig { source })?;
-    config.guest_http_smoke_url = guest_http_smoke_url;
+    validate_launch_policy_args(&policy)?;
+    let guest_log_dir = mirror_guest_logs.then(|| project.join(".vmlogs"));
+
+    Ok(FrontendLaunchRequest {
+        project,
+        run_dir,
+        artifact_manifest,
+        qemu,
+        guest_http_smoke_url,
+        guest_log_dir,
+        policy,
+    })
+}
+
+pub(crate) fn frontend_config_from_args(
+    args: &[String],
+) -> LaunchCliResult<(FrontendConfig, PolicyArgs)> {
+    let request = frontend_launch_request_from_args(args)?;
+    frontend_config_from_launch_request(&request)
+}
+
+pub(crate) fn frontend_config_from_launch_request(
+    request: &FrontendLaunchRequest,
+) -> LaunchCliResult<(FrontendConfig, PolicyArgs)> {
+    let mut config = FrontendConfig::from_artifact_manifest_file(
+        request.project.clone(),
+        request.run_dir.clone(),
+        request.qemu.clone(),
+        &request.artifact_manifest,
+    )
+    .map_err(|source| LaunchCliError::LoadFrontendConfig { source })?;
+    config.guest_http_smoke_url = request.guest_http_smoke_url.clone();
+    config.guest_log_dir = request
+        .guest_log_dir
+        .as_ref()
+        .map(|path| path.display().to_string());
+    validate_launch_policy_args(&request.policy)?;
+    if config.guest_http_smoke_url.is_some() {
+        ensure_appliance_sources_fresh(&request.artifact_manifest)?;
+    }
+    Ok((config, request.policy.clone()))
+}
+
+fn validate_launch_policy_args(policy: &PolicyArgs) -> LaunchCliResult<()> {
     validate_no_net_args(
         policy.no_net,
         policy.allow_public,
@@ -522,9 +692,6 @@ pub(crate) fn frontend_config_from_args(
         &policy.allow_domains,
         &policy.host_listeners,
     )?;
-    if config.guest_http_smoke_url.is_some() {
-        ensure_appliance_sources_fresh(&artifact_manifest)?;
-    }
     if policy
         .payload
         .as_ref()
@@ -532,7 +699,7 @@ pub(crate) fn frontend_config_from_args(
     {
         return Err(LaunchCliError::EmptyPayloadScript);
     }
-    Ok((config, policy))
+    Ok(())
 }
 
 fn frontend_clap_command() -> ClapCommand {
@@ -582,6 +749,11 @@ fn frontend_clap_command() -> ClapCommand {
             Arg::new("guest_http_smoke_url")
                 .long("guest-http-smoke-url")
                 .value_name("URL"),
+        )
+        .arg(
+            Arg::new("mirror_guest_logs")
+                .long("mirror-guest-logs")
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("allow_ip")
@@ -964,9 +1136,14 @@ fn start_local_http_smoke_upstream(
     })
 }
 
-pub(crate) fn policy_from_args(network: GuestNetwork, args: PolicyArgs) -> VmnetPolicy {
+pub(crate) fn policy_from_args(
+    network: GuestNetwork,
+    args: PolicyArgs,
+) -> LaunchCliResult<VmnetPolicy> {
     let mut policy = VmnetPolicy::default_sandbox(network);
-    policy.egress.allow_ips = args.allow_ips;
+    policy.egress.allow_ip_ranges =
+        agentvm_frontend::network_policy::parse_ipv4_ranges(&args.allow_ips)
+            .map_err(|source| LaunchCliError::InvalidAllowIpRange { source })?;
     policy.egress.allow_domains = args.allow_domains;
     if args.allow_public {
         policy.egress.default_action = EgressAction::AllowPublicInternet;
@@ -981,35 +1158,80 @@ pub(crate) fn policy_from_args(network: GuestNetwork, args: PolicyArgs) -> Vmnet
     policy.tls_mitm.generate_per_host_certs = args.tls_generate_per_host_certs;
     policy.capture.pcap_path = args.pcap_path;
     policy.capture.capture_guest_side_frames = policy.capture.pcap_path.is_some();
-    policy
+    Ok(policy)
 }
 
-pub(crate) fn ensure_payload_listener(policy: &mut VmnetPolicy) -> u16 {
+pub(crate) struct PayloadListenerReservation {
+    host_port: u16,
+    listener: Option<TcpListener>,
+}
+
+impl PayloadListenerReservation {
+    pub(crate) fn host_port(&self) -> u16 {
+        self.host_port
+    }
+
+    pub(crate) fn take_listener(&mut self) -> Option<TcpListener> {
+        self.listener.take()
+    }
+}
+
+pub(crate) fn ensure_payload_listener(
+    policy: &mut VmnetPolicy,
+) -> LaunchCliResult<PayloadListenerReservation> {
     if let Some(listener) = policy
         .host_listeners
         .iter()
         .find(|listener| listener.purpose == HostListenerPurpose::PayloadControl)
     {
-        return listener.host_port;
+        return Ok(PayloadListenerReservation {
+            host_port: listener.host_port,
+            listener: None,
+        });
     }
-    const DEFAULT_HOST_PAYLOAD_PORT: u16 = 12076;
-    const DEFAULT_GUEST_PAYLOAD_PORT: u16 = 1076;
-    policy.host_listeners.push(HostListener::payload_control(
-        DEFAULT_HOST_PAYLOAD_PORT,
-        DEFAULT_GUEST_PAYLOAD_PORT,
-    ));
-    DEFAULT_HOST_PAYLOAD_PORT
-}
 
-pub(crate) fn wait_for_payload_ready(
-    addr: std::net::SocketAddr,
-    timeout: Duration,
-) -> Result<(), String> {
-    wait_for_payload_ready_with_probe(timeout, Duration::from_millis(250), || {
-        ping_payload(addr).map_err(|error| error.to_string())
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|source| {
+        LaunchCliError::BindPayloadControlPort {
+            host_addr: Ipv4Addr::LOCALHOST.to_string(),
+            source,
+        }
+    })?;
+    let host_port = listener
+        .local_addr()
+        .map_err(|source| LaunchCliError::PayloadControlPortAddr { source })?
+        .port();
+    const GUEST_PAYLOAD_PORT: u16 = 1076;
+    policy
+        .host_listeners
+        .push(HostListener::payload_control(host_port, GUEST_PAYLOAD_PORT));
+    Ok(PayloadListenerReservation {
+        host_port,
+        listener: Some(listener),
     })
 }
 
+pub(crate) async fn wait_for_payload_ready_async(
+    addr: std::net::SocketAddr,
+    timeout: Duration,
+) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        match ping_payload_async_tcp(addr).await {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if started.elapsed() >= timeout {
+                    return Err(format!(
+                        "timed out waiting for guest payload control path after {} seconds; last error: {error}",
+                        timeout.as_secs()
+                    ));
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn wait_for_payload_ready_with_probe(
     timeout: Duration,
     interval: Duration,

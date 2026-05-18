@@ -79,6 +79,15 @@ struct HostManifest {
     mounts: Vec<HostMount>,
     synthetic: SyntheticSpec,
     protected_guest_paths: Vec<&'static str>,
+    shadow_root: Option<String>,
+    filters: Vec<FilterSpec>,
+}
+
+#[derive(Debug, Serialize)]
+struct FilterSpec {
+    mount_id: String,
+    suffixes: Vec<&'static str>,
+    action: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -122,6 +131,24 @@ struct BindEntry {
     target: String,
     required: bool,
     create_parent: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct GuestLaunchConfig<'a> {
+    schema_version: u32,
+    project_path: String,
+    network: GuestLaunchNetwork<'a>,
+    http_smoke_url: Option<&'a str>,
+    guest_log_dir: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct GuestLaunchNetwork<'a> {
+    guest_ip: &'a str,
+    gateway_ip: &'a str,
+    prefix_len: u8,
+    dns_ip: &'a str,
+    guest_mac: &'a str,
 }
 
 pub fn workspace_mounts(project: impl Into<PathBuf>) -> Vec<RuntimeMount> {
@@ -274,6 +301,19 @@ pub fn write_runtime_manifests_with_config_mounts(
             dir_mode: "0555",
         },
         protected_guest_paths: protected_guest_paths(),
+        shadow_root: Some(
+            config
+                .runtime
+                .run_dir
+                .join("composed-fs-shadows")
+                .display()
+                .to_string(),
+        ),
+        filters: vec![FilterSpec {
+            mount_id: "m0001_workspace".to_string(),
+            suffixes: vec![".sandbox"],
+            action: "hide-and-shadow",
+        }],
     };
     let bind_manifest = BindManifest {
         schema_version: 1,
@@ -283,6 +323,7 @@ pub fn write_runtime_manifests_with_config_mounts(
 
     write_json(&config.runtime.composed_fs_manifest, &host_manifest)?;
     write_json(&config.runtime.composed_bind_manifest, &bind_manifest)?;
+    write_guest_launch_config(config)?;
     write_config_fs_manifest(config, config_mounts)?;
 
     Ok(RuntimeManifestSummary {
@@ -347,11 +388,37 @@ fn validated_host_mounts(mounts: &[RuntimeMount]) -> io::Result<Vec<HostMount>> 
     Ok(host_mounts)
 }
 
+fn write_guest_launch_config(config: &FrontendConfig) -> io::Result<()> {
+    let launch_config = GuestLaunchConfig {
+        schema_version: 1,
+        project_path: config.project.display().to_string(),
+        network: GuestLaunchNetwork {
+            guest_ip: &config.network.guest_ip,
+            gateway_ip: &config.network.gateway_ip,
+            prefix_len: config.network.prefix_len,
+            dns_ip: &config.network.dns_ip,
+            guest_mac: &config.network.guest_mac,
+        },
+        http_smoke_url: config.guest_http_smoke_url.as_deref(),
+        guest_log_dir: config.guest_log_dir.as_deref(),
+    };
+    write_json(&config.runtime.guest_launch_config, &launch_config)
+}
+
 fn write_config_fs_manifest(
     config: &FrontendConfig,
     extra_mounts: &[RuntimeMount],
 ) -> io::Result<()> {
-    let mount = RuntimeMount {
+    let launch_config = RuntimeMount {
+        id: "m0000_launch_config".to_string(),
+        host_path: config.runtime.guest_launch_config.clone(),
+        guest_path: PathBuf::from("/launch.json"),
+        readonly: true,
+        source_class: ManifestSourceClass::SystemRo,
+        required: true,
+        bind: false,
+    };
+    let bind_manifest = RuntimeMount {
         id: "m0001_composed_binds".to_string(),
         host_path: config.runtime.composed_bind_manifest.clone(),
         guest_path: PathBuf::from("/composed-binds.json"),
@@ -360,8 +427,9 @@ fn write_config_fs_manifest(
         required: true,
         bind: false,
     };
-    let mut config_mounts = Vec::with_capacity(1 + extra_mounts.len());
-    config_mounts.push(mount);
+    let mut config_mounts = Vec::with_capacity(2 + extra_mounts.len());
+    config_mounts.push(launch_config);
+    config_mounts.push(bind_manifest);
     config_mounts.extend(extra_mounts.iter().cloned());
     let mounts = validated_host_mounts(&config_mounts)?;
     let manifest = HostManifest {
@@ -375,6 +443,8 @@ fn write_config_fs_manifest(
             dir_mode: "0555",
         },
         protected_guest_paths: Vec::new(),
+        shadow_root: None,
+        filters: Vec::new(),
     };
     write_json(&config.runtime.config_fs_manifest, &manifest)
 }
@@ -480,6 +550,7 @@ mod tests {
             },
             network: GuestNetwork::default(),
             guest_http_smoke_url: None,
+            guest_log_dir: None,
             upstream_mappings: Vec::new(),
         }
     }
@@ -507,8 +578,15 @@ mod tests {
 
         let config_manifest =
             fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
+        assert!(config_manifest.contains("\"guest_path\": \"/launch.json\""));
         assert!(config_manifest.contains("\"guest_path\": \"/composed-binds.json\""));
         assert!(config_manifest.contains("\"host_path\": \""));
+
+        let launch_config =
+            fs::read_to_string(&config.runtime.guest_launch_config).expect("launch config");
+        assert!(launch_config.contains("\"schema_version\": 1"));
+        assert!(launch_config.contains("\"project_path\":"));
+        assert!(launch_config.contains("\"guest_ip\": \"10.0.2.15\""));
     }
 
     #[test]
@@ -537,6 +615,7 @@ mod tests {
 
         let config_manifest =
             fs::read_to_string(&config.runtime.config_fs_manifest).expect("config manifest");
+        assert!(config_manifest.contains("\"guest_path\": \"/launch.json\""));
         assert!(config_manifest.contains("\"guest_path\": \"/composed-binds.json\""));
         assert!(config_manifest.contains("\"guest_path\": \"/mitm-ca.crt\""));
     }
@@ -614,6 +693,9 @@ mod tests {
         assert!(host_manifest.contains("\"source_class\": \"user-rw\""));
         assert!(host_manifest.contains(&extra_ro.display().to_string()));
         assert!(host_manifest.contains(&extra_rw.display().to_string()));
+        assert!(host_manifest.contains("\"mount_id\": \"m0001_workspace\""));
+        assert!(host_manifest.contains("\".sandbox\""));
+        assert!(host_manifest.contains("\"action\": \"hide-and-shadow\""));
     }
 
     #[test]

@@ -1,8 +1,8 @@
 ---
 id: wra-57z4
-status: open
+status: closed
 deps: [wra-bbgh]
-links: [wra-t2uv, wra-olu4, wra-i3t9, wra-bbgh, wra-e9sr, wra-nui7, wra-jenv]
+links: [wra-t2uv, wra-olu4, wra-i3t9, wra-bbgh, wra-e9sr, wra-nui7, wra-jenv, wra-73tn, wra-f762, wra-ynx7, wra-wv0w]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 2
@@ -60,3 +60,25 @@ Host ingress per-owner-pass fairness now covers both directions: host->guest rea
 **2026-05-16T21:47:02Z**
 
 Review after wra-kiv5/wra-nui7 refactors: keep open. DNS and TCP connect blocking are now handled by bounded workers, and host-ingress plus upstream read paths have several owner-pass caps and queue limits, but this ticket still covers the broader all-vmnet per-session/per-tick policy and remains correctly blocked by QEMU write-backpressure work in wra-bbgh. Production byte-IO worker wiring should still wait for wra-bbgh/e9sr rather than treating these partial bounds as complete.
+
+**2026-05-18T05:39:48Z**
+
+Cleanup epic wra-9m5h adds wra-ynx7 as a follow-up structural cleanup. While bounding buffers and per-tick drains, avoid adding a second readiness/backpressure model; shape the fix so wra-ynx7 can collapse duplicated HostIngress/TcpProxy accounting instead of preserving it.
+
+**2026-05-18T08:23:40Z**
+
+Cleanup-loop dependency note from wra-bbgh: treat production QEMU writes as backpressured by awaiting write_frame_async rather than adding another guest-bound queue. wra-57z4 should focus on per-session buffers and per-owner-pass read/write budgets in host-ingress/TcpProxy paths, plus tests for slow peer fairness. Do not design a second QEMU readiness/backpressure model only to preserve sync vmnet helper scaffolding.
+
+**2026-05-18T09:00:14Z**
+
+Iteration 34 cleanup-prerequisite progress: added a tcp-proxy HTTP request accumulation cap (`TcpProxyBufferLimits::http_request_bytes`, default 64 KiB). Incomplete intercepted HTTP/HTTPS request bytes are now checked before append; overflow emits `TcpProxyEvent::BufferLimitExceeded` with `HttpRequestBytes`, closes/fails closed via the existing helper, and does not grow the session `http_buffer`. Added regression `tcp_proxy::tests::incomplete_http_header_limit_fails_closed_before_buffering_unbounded`.
+
+Validation for this slice: targeted new test passed; full `tcp_proxy::tests` passed; targeted `vmnet_runtime::tests::event_log_includes_representative_failure_artifacts_without_secrets` passed during the split turn; `./vm-frontend/validate.sh fast` passed in the split turn; first required validation found a pre-existing property-test overreach (`proptest_default_policy_denied_syns_do_not_create_sessions` generated invalid dst_port=0, which smoltcp ignores rather than treating as a policy-denied SYN), so the proptest domain was narrowed to nonzero TCP ports and the targeted test was rerun. Final `./vm-frontend/validate.sh required` passed: /tmp/pi-bash-22b3f93b38d6ca41.log.
+
+Keep ticket open: this closes the unbounded incomplete HTTP request buffer seam, but the ticket still needs a final all-vmnet audit/closure decision for per-session buffers and per-tick read drains before unblocking `wra-jenv`/`wra-ynx7`.
+
+**2026-05-18T09:02:36Z**
+
+Final cleanup-loop audit before closure: the vmnet per-session/per-owner-pass bounds now cover the originally identified seams without adding a parallel QEMU/session worker model. Host ingress has bounded pending host/guest writes, bounded accept queues, per-listener accept caps, and per-session host read/write pump budgets. TcpProxy has bounded pending upstream bytes, pending upstream plaintext, pending guest bytes, a capped upstream read per owner pass, and the new 64 KiB incomplete HTTP request accumulation cap. DNS/TCP connect blocking is already off-owner via bounded Tokio service tasks; QEMU writes remain owner-side with awaited `write_frame_async` backpressure per closed `wra-bbgh`; closed socket/slot reaping is centralized per closed `wra-e9sr`. Current `wra-57z4` code changes passed required validation at `/tmp/pi-bash-22b3f93b38d6ca41.log`.
+
+Closure decision: do not add established-session byte-IO workers here. With the current owner-driven fd readiness plus bounded per-session pumps, the buffer/drain correctness target is met; adding another established-session worker layer would recreate transitional code that cleanup child `wra-ynx7` is supposed to remove.

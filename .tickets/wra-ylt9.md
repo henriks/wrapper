@@ -26,3 +26,7 @@ Investigation findings: reproduced data loss with a running VM using diagnostic 
 **2026-05-16T07:58:56Z**
 
 Received and reviewed sqlite_wal_virtiofs_safety_memo.md. It confirms the likely root cause is not simple byte-range locking but SQLite WAL's X-shm shared-memory coherency contract across host-direct mmap and guest virtiofs/FUSE mmap. Recommended contract: do not support normal WAL concurrency across host-direct + guest-through-composed-fs; fail closed for WAL sidecars/persisted WAL DBs by default, validate rollback-journal mode separately, and allow EXCLUSIVE WAL only as controlled single-client workaround. Memo includes concrete implementation and test plan: deny X-shm/X-wal or persisted WAL opens, exact SQLite lock byte bridge tests, mmap coherency probe, WAL fail-closed tests, rollback crash/stress tests, and docs contract text.
+
+**2026-05-18T10:38:08Z**
+
+Follow-up cleanup scan under wra-emj5: avoid trying to make unsafe host-direct plus guest-virtiofs SQLite WAL concurrency work through a large compatibility layer. Prefer fail-closed/documented unsupported WAL sidecars for normal use, keep any concurrency probe isolated to hostile/stress validation, and validate rollback-journal or EXCLUSIVE-WAL contracts only if they are explicitly supported.

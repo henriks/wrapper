@@ -2,7 +2,7 @@
 id: wra-y5l6
 status: open
 deps: []
-links: [wra-xaf5, wra-xo1i]
+links: [wra-xaf5, wra-xo1i, wra-b9b1]
 created: 2026-05-15T21:09:57Z
 type: feature
 priority: 3
@@ -21,3 +21,9 @@ Current appliance build lives under docker/: docker/build-appliance.sh sources d
 
 A design/implementation ticket is complete when there is a concrete plan or implementation for single-binary appliance rehydration: (1) documents host prerequisites and security/consent model; (2) defines cache layout and content-hash invalidation; (3) defines how embedded builder/assets map to artifact-manifest.json source/build metadata; (4) defines CLI UX for appliance build/ensure and launch behavior when artifacts are missing/stale; (5) preserves or intentionally replaces existing docker/build-appliance.sh development workflow; (6) includes tests for missing/stale artifact detection, cache key changes, lock behavior, and clear failure messages. If implementation changes config parsing/serialization/defaults, update vm-frontend/config-json.md and relevant tests. Before closing any implementation work, run ./vm-frontend/validate.sh required, including live-smoke where available.
 
+
+## Notes
+
+**2026-05-18T10:38:29Z**
+
+Follow-up cleanup epic wra-emj5 links wra-b9b1. Single-binary appliance rehydration should account for the intended guest Docker bridge ownership and avoid embedding or rehydrating stale Python bridge assets if wra-b9b1 moves the bridge into Rust or deletes the guest TCP bridge contract.

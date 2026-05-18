@@ -173,6 +173,8 @@ print("self-test: fs-live-ok")
     let mut steps = vec![
         "set -eu".to_string(),
         "echo self-test: payload-start".to_string(),
+        "test -t 0; test -t 1; test -t 2".to_string(),
+        "echo self-test: tty-ok".to_string(),
         "test \"$HOME\" = \"${AGENTVM_SELF_TEST_HOME:?}\"".to_string(),
         "echo self-test: home-ok".to_string(),
         "test \"$(id -u)\" = \"${AGENTVM_UID:?}\"".to_string(),
@@ -187,6 +189,26 @@ print("self-test: fs-live-ok")
         "echo self-test: home-write-ok".to_string(),
         "test \"$PWD\" = \"$AGENTVM_SELF_TEST_PROJECT\"".to_string(),
         "echo self-test: cwd-ok".to_string(),
+        "test ! -e .sandbox".to_string(),
+        "echo self-test: sandbox-hidden-ok".to_string(),
+        "test -f /run/agentvm-config/launch.json".to_string(),
+        format!(
+            "python3 -c {}",
+            shell_quote(
+                r#"import json, os
+with open("/run/agentvm-config/launch.json", encoding="utf-8") as handle:
+    config = json.load(handle)
+assert config["schema_version"] == 1
+assert config["project_path"] == os.environ["AGENTVM_SELF_TEST_PROJECT"]
+network = config["network"]
+assert isinstance(network["prefix_len"], int)
+for key in ("guest_ip", "gateway_ip", "dns_ip", "guest_mac"):
+    assert isinstance(network[key], str) and network[key]
+assert "agentvm_project=" not in open("/proc/cmdline", encoding="utf-8").read()
+"#
+            )
+        ),
+        "echo self-test: launch-config-ok".to_string(),
         "test -f /run/agentvm-config/mitm-ca.crt".to_string(),
         "echo self-test: ca-cert-ok".to_string(),
         "test ! -e /run/agentvm-config/mitm-ca.key".to_string(),

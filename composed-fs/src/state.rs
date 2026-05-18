@@ -20,8 +20,8 @@ pub(crate) struct HandleTable {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct LockKey {
-    pub(crate) inode: u64,
-    pub(crate) handle: u64,
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
     pub(crate) owner: u64,
 }
 

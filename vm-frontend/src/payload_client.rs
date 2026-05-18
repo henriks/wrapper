@@ -1,24 +1,31 @@
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::io;
+#[cfg(test)]
+use std::io::{Read, Write};
+#[cfg(test)]
+use std::net::{Shutdown, TcpStream};
+use std::net::{SocketAddr, ToSocketAddrs};
+#[cfg(test)]
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc, Mutex,
 };
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub use agentvm_payload_protocol::{DiagnosticRequest, PayloadEvent, PayloadRequest};
 
+#[cfg(test)]
+use agentvm_payload_protocol::{decode_header, encode_frame, FRAME_HEADER_LEN};
 use agentvm_payload_protocol::{
-    decode_header, encode_frame, payload_event_from_frame, read_frame_async, resize_payload,
-    signal_payload, write_frame_async, AsyncFrameError, Frame, FrameError, FrameKind,
-    PayloadEventError, FRAME_HEADER_LEN,
+    payload_event_from_frame, read_frame_async, resize_payload, signal_payload, write_frame_async,
+    AsyncFrameError, Frame, FrameError, FrameKind, PayloadEventError,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 static SIGNAL_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
 #[derive(Debug)]
@@ -79,18 +86,21 @@ pub enum PayloadControlAction {
     Ignore,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PayloadControlLoopDecision {
     Continue,
     Stop,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub struct PayloadCancelToken {
     done: Arc<AtomicBool>,
     stream: Arc<Mutex<Option<TcpStream>>>,
 }
 
+#[cfg(test)]
 impl PayloadCancelToken {
     pub fn new() -> Self {
         Self {
@@ -132,6 +142,7 @@ impl PayloadCancelToken {
     }
 }
 
+#[cfg(test)]
 impl Default for PayloadCancelToken {
     fn default() -> Self {
         Self::new()
@@ -145,11 +156,13 @@ pub enum PayloadSessionOutcome {
     Cancelled,
 }
 
+#[cfg(test)]
 pub struct PayloadSessionRunner {
     control: PayloadControlOptions,
     cancel: PayloadCancelToken,
 }
 
+#[cfg(test)]
 impl PayloadSessionRunner {
     pub fn new(control: PayloadControlOptions) -> Self {
         Self::with_cancel_token(control, PayloadCancelToken::new())
@@ -434,6 +447,184 @@ impl Drop for AsyncPayloadSession {
     }
 }
 
+pub async fn run_payload_tcp_async_with_control<W>(
+    addr: SocketAddr,
+    request: &PayloadRequest,
+    input: Option<Box<dyn AsyncRead + Send + Unpin>>,
+    output: &mut W,
+    control: PayloadControlOptions,
+) -> Result<PayloadSessionOutcome, PayloadClientError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| PayloadClientError::DeadlineExceeded)??;
+    stream.set_nodelay(true)?;
+    let mut session = AsyncPayloadSession::from_stream(stream, request).await?;
+    run_payload_session_async(&mut session, input, output, control).await
+}
+
+pub async fn run_payload_session_async<W>(
+    session: &mut AsyncPayloadSession,
+    input: Option<Box<dyn AsyncRead + Send + Unpin>>,
+    output: &mut W,
+    control: PayloadControlOptions,
+) -> Result<PayloadSessionOutcome, PayloadClientError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let command_sender = session.command_sender();
+    let (abort_tx, mut abort_rx) = mpsc::channel(1);
+    let signal_task = spawn_async_signal_forwarder(control, command_sender.clone(), abort_tx)?;
+    let mut input = input;
+    let mut buffer = [0; 64 * 1024];
+
+    let result = loop {
+        tokio::select! {
+            _ = abort_rx.recv(), if signal_task.is_some() => {
+                session.cancel();
+                break Ok(PayloadSessionOutcome::Cancelled);
+            }
+            read = async {
+                let input = input.as_mut().expect("input branch is disabled when input is absent");
+                tokio::io::AsyncReadExt::read(input, &mut buffer).await
+            }, if input.is_some() => {
+                let count = read?;
+                if count == 0 {
+                    input = None;
+                } else {
+                    command_sender.send_input(buffer[..count].to_vec()).await?;
+                }
+            }
+            event = session.recv_event() => {
+                match event {
+                    Ok(PayloadEvent::Output(payload)) => {
+                        output.write_all(&payload).await?;
+                        output.flush().await?;
+                    }
+                    Ok(PayloadEvent::Exit(exit_code)) => {
+                        break Ok(PayloadSessionOutcome::Exit(exit_code));
+                    }
+                    Ok(PayloadEvent::Failure(message)) => {
+                        break Ok(PayloadSessionOutcome::Failure(message));
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        }
+    };
+
+    if let Some(task) = signal_task {
+        task.abort();
+    }
+    session.cancel();
+    result
+}
+
+fn spawn_async_signal_forwarder(
+    control: PayloadControlOptions,
+    command_sender: AsyncPayloadCommandSender,
+    abort_tx: mpsc::Sender<()>,
+) -> Result<Option<TokioJoinHandle<()>>, PayloadClientError> {
+    if !control.forward_signals && !control.forward_resize {
+        return Ok(None);
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(Some(tokio::spawn(async move {
+            async_signal_forward_loop(control.policy(), command_sender, abort_tx).await;
+        })))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (command_sender, abort_tx);
+        Err(PayloadClientError::Unsupported(
+            "payload signal forwarding is only supported on Unix hosts".to_string(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+async fn async_signal_forward_loop(
+    policy: PayloadControlPolicy,
+    command_sender: AsyncPayloadCommandSender,
+    abort_tx: mpsc::Sender<()>,
+) {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut interrupt = if policy.forward_signals {
+        signal(SignalKind::interrupt()).ok()
+    } else {
+        None
+    };
+    let mut terminate = if policy.forward_signals || policy.terminate_aborts {
+        signal(SignalKind::terminate()).ok()
+    } else {
+        None
+    };
+    let mut hangup = if policy.forward_signals {
+        signal(SignalKind::hangup()).ok()
+    } else {
+        None
+    };
+    let mut resize = if policy.forward_resize {
+        signal(SignalKind::window_change()).ok()
+    } else {
+        None
+    };
+    if interrupt.is_none() && terminate.is_none() && hangup.is_none() && resize.is_none() {
+        return;
+    }
+    let mut forwarded_interrupts = 0;
+
+    loop {
+        let signal = tokio::select! {
+            _ = async { interrupt.as_mut().expect("interrupt stream").recv().await }, if interrupt.is_some() => libc::SIGINT,
+            _ = async { terminate.as_mut().expect("terminate stream").recv().await }, if terminate.is_some() => libc::SIGTERM,
+            _ = async { hangup.as_mut().expect("hangup stream").recv().await }, if hangup.is_some() => libc::SIGHUP,
+            _ = async { resize.as_mut().expect("resize stream").recv().await }, if resize.is_some() => libc::SIGWINCH,
+        };
+        let action = policy.host_signal_action(signal, forwarded_interrupts);
+        match action {
+            PayloadControlAction::ForwardSignal(signal) => {
+                if command_sender.send_signal(signal).await.is_err() {
+                    return;
+                }
+                if signal == libc::SIGINT {
+                    forwarded_interrupts += 1;
+                }
+            }
+            PayloadControlAction::ForwardResize => {
+                let (rows, cols) = terminal_size();
+                if command_sender.send_resize(rows, cols).await.is_err() {
+                    return;
+                }
+            }
+            PayloadControlAction::LocalAbort => {
+                let _ = abort_tx.send(()).await;
+                return;
+            }
+            PayloadControlAction::Ignore => {}
+        }
+    }
+}
+
+pub async fn ping_payload_async_tcp(addr: SocketAddr) -> Result<(), PayloadClientError> {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await?;
+        stream.set_nodelay(true)?;
+        ping_payload_async_io(&mut stream).await
+    })
+    .await
+    .map_err(|_| PayloadClientError::DeadlineExceeded)?
+}
+
 pub async fn ping_payload_async_io<S>(stream: &mut S) -> Result<(), PayloadClientError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -452,6 +643,42 @@ where
         frame.kind.as_byte(),
         String::from_utf8_lossy(&frame.payload)
     )))
+}
+
+pub async fn run_diagnostic_tcp_async<W>(
+    addr: SocketAddr,
+    request: &DiagnosticRequest,
+    output: &mut W,
+) -> Result<i32, PayloadClientError>
+where
+    W: AsyncWrite + Unpin,
+{
+    run_diagnostic_tcp_async_with_deadline(
+        addr,
+        request,
+        output,
+        Duration::from_secs(request.timeout_seconds.max(1)),
+    )
+    .await
+}
+
+pub async fn run_diagnostic_tcp_async_with_deadline<W>(
+    addr: SocketAddr,
+    request: &DiagnosticRequest,
+    output: &mut W,
+    deadline: Duration,
+) -> Result<i32, PayloadClientError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| PayloadClientError::DeadlineExceeded)??;
+    stream.set_nodelay(true)?;
+    run_diagnostic_async_io(&mut stream, request, output, deadline).await
 }
 
 pub async fn run_diagnostic_async_io<S, W>(
@@ -526,6 +753,7 @@ impl PayloadControlPolicy {
         self.host_signal_action(libc::SIGINT, forwarded_interrupts)
     }
 
+    #[cfg(test)]
     fn installed_unix_signals(self) -> Vec<i32> {
         let mut signals = Vec::new();
         if self.forward_signals {
@@ -538,10 +766,12 @@ impl PayloadControlPolicy {
     }
 }
 
+#[cfg(test)]
 pub struct PayloadSession<S> {
     stream: S,
 }
 
+#[cfg(test)]
 impl<S: Read + Write> PayloadSession<S> {
     pub fn from_stream(
         mut stream: S,
@@ -572,6 +802,7 @@ impl<S: Read + Write> PayloadSession<S> {
     }
 }
 
+#[cfg(test)]
 impl PayloadSession<TcpStream> {
     pub fn connect(
         addr: impl ToSocketAddrs,
@@ -591,10 +822,12 @@ impl PayloadSession<TcpStream> {
     }
 }
 
+#[cfg(test)]
 pub struct PayloadWriter {
     stream: TcpStream,
 }
 
+#[cfg(test)]
 impl PayloadWriter {
     pub fn send_input(&mut self, input: &[u8]) -> Result<(), PayloadClientError> {
         send_frame(&mut self.stream, b'I', input)?;
@@ -612,6 +845,7 @@ impl PayloadWriter {
     }
 }
 
+#[cfg(test)]
 pub fn ping_payload(addr: impl ToSocketAddrs) -> Result<(), PayloadClientError> {
     let mut stream = connect_payload(addr, Duration::from_secs(1))?;
     send_frame(&mut stream, b'P', &[])?;
@@ -625,6 +859,7 @@ pub fn ping_payload(addr: impl ToSocketAddrs) -> Result<(), PayloadClientError> 
     )))
 }
 
+#[cfg(test)]
 pub fn run_payload_tcp(
     addr: impl ToSocketAddrs,
     request: &PayloadRequest,
@@ -640,6 +875,7 @@ pub fn run_payload_tcp(
     )
 }
 
+#[cfg(test)]
 pub fn run_diagnostic_tcp(
     addr: impl ToSocketAddrs,
     request: &DiagnosticRequest,
@@ -653,6 +889,7 @@ pub fn run_diagnostic_tcp(
     )
 }
 
+#[cfg(test)]
 pub fn run_diagnostic_tcp_with_deadline(
     addr: impl ToSocketAddrs,
     request: &DiagnosticRequest,
@@ -672,6 +909,7 @@ pub fn run_diagnostic_tcp_with_deadline(
     })
 }
 
+#[cfg(test)]
 pub fn run_payload_tcp_with_control(
     addr: impl ToSocketAddrs,
     request: &PayloadRequest,
@@ -683,6 +921,7 @@ pub fn run_payload_tcp_with_control(
     run_payload_session(&mut session, input, output, control)
 }
 
+#[cfg(test)]
 fn connect_payload(
     addr: impl ToSocketAddrs,
     timeout: Duration,
@@ -710,6 +949,7 @@ pub fn socket_addr(host: &str, port: u16) -> Result<SocketAddr, PayloadClientErr
         .ok_or_else(|| PayloadClientError::Address(format!("no socket address for {host}:{port}")))
 }
 
+#[cfg(test)]
 fn run_payload_session(
     session: &mut PayloadSession<TcpStream>,
     input: Option<Box<dyn Read + Send>>,
@@ -740,6 +980,7 @@ fn run_payload_io(
     }
 }
 
+#[cfg(test)]
 fn run_diagnostic_io(
     stream: &mut (impl Read + Write),
     request: &DiagnosticRequest,
@@ -759,6 +1000,7 @@ fn run_diagnostic_io(
     }
 }
 
+#[cfg(test)]
 fn payload_event_from_stream(stream: &mut impl Read) -> Result<PayloadEvent, PayloadClientError> {
     let (frame_type, payload) = recv_frame(stream)?;
     payload_event_from_frame(Frame {
@@ -768,25 +1010,30 @@ fn payload_event_from_stream(stream: &mut impl Read) -> Result<PayloadEvent, Pay
     .map_err(PayloadClientError::from)
 }
 
+#[cfg(test)]
 fn send_signal_frame(writer: &mut impl Write, signal: i32) -> io::Result<()> {
     let payload = signal_payload(signal).map_err(json_io_error)?;
     send_frame(writer, b'S', &payload)
 }
 
+#[cfg(test)]
 fn send_resize_frame(writer: &mut impl Write, rows: u16, cols: u16) -> io::Result<()> {
     let payload = resize_payload(rows, cols).map_err(json_io_error)?;
     send_frame(writer, b'W', &payload)
 }
 
+#[cfg(test)]
 fn json_io_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
+#[cfg(test)]
 struct SignalForwarder {
     #[cfg(unix)]
     _inner: Option<UnixSignalForwarder>,
 }
 
+#[cfg(test)]
 impl SignalForwarder {
     fn install(
         control: PayloadControlOptions,
@@ -817,7 +1064,7 @@ impl SignalForwarder {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 struct UnixSignalForwarder {
     read_fd: i32,
     write_fd: i32,
@@ -825,7 +1072,7 @@ struct UnixSignalForwarder {
     thread: Option<JoinHandle<()>>,
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 impl UnixSignalForwarder {
     fn install(
         control: PayloadControlOptions,
@@ -856,7 +1103,7 @@ impl UnixSignalForwarder {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 impl Drop for UnixSignalForwarder {
     fn drop(&mut self) {
         for (signal, old) in &self.old_actions {
@@ -880,7 +1127,7 @@ impl Drop for UnixSignalForwarder {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn create_signal_pipe() -> io::Result<(i32, i32)> {
     let mut fds = [0; 2];
     // SAFETY: pipe initializes both fd slots on success.
@@ -900,7 +1147,7 @@ fn create_signal_pipe() -> io::Result<(i32, i32)> {
     Ok((fds[0], fds[1]))
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_signal_pipe_flags(fd: i32) -> io::Result<()> {
     // SAFETY: fcntl is called with a valid fd and flag command.
     let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -923,7 +1170,7 @@ fn set_signal_pipe_flags(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn install_signal_handler(signal: i32) -> Result<libc::sigaction, PayloadClientError> {
     // SAFETY: zeroed sigaction is immediately initialized before use.
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -943,7 +1190,7 @@ fn install_signal_handler(signal: i32) -> Result<libc::sigaction, PayloadClientE
     Ok(old)
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 extern "C" fn payload_signal_handler(signal: i32) {
     let fd = SIGNAL_WRITE_FD.load(Ordering::SeqCst);
     if fd < 0 {
@@ -956,7 +1203,7 @@ extern "C" fn payload_signal_handler(signal: i32) {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn signal_forward_loop(
     read_fd: i32,
     send_lock: Arc<Mutex<TcpStream>>,
@@ -1007,6 +1254,7 @@ fn signal_forward_loop(
     }
 }
 
+#[cfg(test)]
 fn apply_payload_control_action<W, F>(
     action: PayloadControlAction,
     writer: &mut W,
@@ -1058,12 +1306,14 @@ pub fn terminal_size() -> (u16, u16) {
     (24, 80)
 }
 
+#[cfg(test)]
 fn send_frame(writer: &mut impl Write, frame_type: u8, payload: &[u8]) -> io::Result<()> {
     let encoded =
         encode_frame(FrameKind::from_byte(frame_type), payload).map_err(frame_io_error)?;
     writer.write_all(&encoded)
 }
 
+#[cfg(test)]
 fn recv_frame(reader: &mut impl Read) -> Result<(u8, Vec<u8>), PayloadClientError> {
     let mut header = [0; FRAME_HEADER_LEN];
     reader.read_exact(&mut header)?;
@@ -1073,6 +1323,7 @@ fn recv_frame(reader: &mut impl Read) -> Result<(u8, Vec<u8>), PayloadClientErro
     Ok((kind.as_byte(), payload))
 }
 
+#[cfg(test)]
 fn frame_io_error(error: FrameError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error)
 }
@@ -1114,6 +1365,7 @@ impl From<PayloadEventError> for PayloadClientError {
     }
 }
 
+#[cfg(test)]
 impl PayloadClientError {
     fn is_timeout(&self) -> bool {
         matches!(
@@ -1639,73 +1891,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_client_runs_real_python_payload_server() {
-        let Some((mut child, port)) = start_python_payload_server() else {
-            return;
-        };
-
-        let request = PayloadRequest::new("printf rust-python-ok; exit 6");
-        let mut output = Vec::new();
-        let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
-            .expect("python payload server run");
-
-        assert_eq!(exit_code, 6);
-        assert!(output
-            .windows(b"rust-python-ok".len())
-            .any(|window| window == b"rust-python-ok"));
-        child.kill_and_wait();
-    }
-
-    #[test]
-    fn python_payload_server_gives_interactive_bash_a_controlling_tty() {
-        let Some((mut child, port)) = start_python_payload_server() else {
-            return;
-        };
-
-        let request = PayloadRequest::new("bash --noprofile --norc -i -c 'printf bash-ready'");
-        let mut output = Vec::new();
-        let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
-            .expect("interactive bash payload run");
-        let output = String::from_utf8_lossy(&output);
-
-        assert_eq!(exit_code, 0);
-        assert!(output.contains("bash-ready"), "bash output was {output:?}");
-        assert!(!output.contains("cannot set terminal process group"));
-        assert!(!output.contains("no job control"));
-        child.kill_and_wait();
-    }
-
-    #[test]
-    fn diagnostic_can_run_while_primary_payload_is_active() {
-        let Some((mut child, port)) = start_python_payload_server() else {
-            return;
-        };
-
-        let primary = thread::spawn(move || {
-            let request = PayloadRequest::new("printf primary-start; sleep 1; printf primary-done");
-            let mut output = Vec::new();
-            let exit_code = run_payload_tcp(("127.0.0.1", port), &request, None, &mut output)
-                .expect("primary payload run");
-            (exit_code, output)
-        });
-        thread::sleep(Duration::from_millis(200));
-
-        let request = DiagnosticRequest::new("printf diagnostic-ok; exit 7");
-        let mut output = Vec::new();
-        let exit_code =
-            run_diagnostic_tcp(("127.0.0.1", port), &request, &mut output).expect("diagnostic run");
-
-        assert_eq!(exit_code, 7);
-        assert_eq!(output, b"diagnostic-ok");
-        let (primary_exit, primary_output) = primary.join().expect("primary thread");
-        assert_eq!(primary_exit, 0);
-        assert!(primary_output
-            .windows(b"primary-done".len())
-            .any(|window| window == b"primary-done"));
-        child.kill_and_wait();
-    }
-
-    #[test]
     fn payload_session_sends_control_frames_and_receives_events() {
         let mut server_frames = Vec::new();
         send_frame(&mut server_frames, b'O', b"ready").expect("output");
@@ -1821,6 +2006,59 @@ mod tests {
             session.recv_event().await.expect("exit event"),
             PayloadEvent::Exit(5)
         );
+    }
+
+    #[tokio::test]
+    async fn async_payload_runner_forwards_input_output_and_exit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (mut input_writer, input_reader) = tokio::io::duplex(4096);
+        let (mut output_writer, mut output_reader) = tokio::io::duplex(4096);
+        let mut session = AsyncPayloadSession::from_stream(client, &PayloadRequest::new("async"))
+            .await
+            .expect("async session");
+        input_writer.write_all(b"stdin").await.expect("input write");
+        drop(input_writer);
+
+        let client_fut = run_payload_session_async(
+            &mut session,
+            Some(Box::new(input_reader) as Box<dyn AsyncRead + Send + Unpin>),
+            &mut output_writer,
+            PayloadControlOptions::disabled(),
+        );
+        let server_fut = async {
+            let request = read_frame_async(&mut server).await.expect("request frame");
+            assert_eq!(request.kind, FrameKind::RUN_PRIMARY);
+            let input = read_frame_async(&mut server).await.expect("input frame");
+            assert_eq!(input.kind, FrameKind::INPUT);
+            assert_eq!(input.payload, b"stdin");
+            write_frame_async(
+                &mut server,
+                &Frame::new(FrameKind::OUTPUT, b"stdout".to_vec()).expect("output frame"),
+            )
+            .await
+            .expect("write output");
+            write_frame_async(
+                &mut server,
+                &Frame::new(FrameKind::EXIT, br#"{"exit_code":3}"#.to_vec()).expect("exit frame"),
+            )
+            .await
+            .expect("write exit");
+        };
+
+        let (outcome, ()) = tokio::join!(client_fut, server_fut);
+        assert_eq!(
+            outcome.expect("payload outcome"),
+            PayloadSessionOutcome::Exit(3)
+        );
+        drop(output_writer);
+        let mut output = Vec::new();
+        output_reader
+            .read_to_end(&mut output)
+            .await
+            .expect("read output");
+        assert_eq!(output, b"stdout");
     }
 
     #[tokio::test]
@@ -2043,61 +2281,6 @@ mod tests {
         .map_err(PayloadClientError::from)
         .expect_err("invalid");
         assert!(matches!(error, PayloadClientError::Json(_)));
-    }
-
-    fn start_python_payload_server() -> Option<(ChildGuard, u16)> {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("repo root");
-        let server_path = repo_root.join("docker/guest-payload-server.py");
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
-        let port = listener.local_addr().expect("addr").port();
-        drop(listener);
-
-        let child = match std::process::Command::new("python3")
-            .arg(server_path)
-            .arg("--tcp-host")
-            .arg("127.0.0.1")
-            .arg("--tcp-port")
-            .arg(port.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
-            Err(error) => panic!("spawn python payload server: {error}"),
-        };
-        let child = ChildGuard(Some(child));
-
-        let mut ready = false;
-        for _ in 0..50 {
-            if ping_payload(("127.0.0.1", port)).is_ok() {
-                ready = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        assert!(ready, "python payload server did not become ready");
-
-        Some((child, port))
-    }
-
-    struct ChildGuard(Option<std::process::Child>);
-
-    impl ChildGuard {
-        fn kill_and_wait(&mut self) {
-            if let Some(mut child) = self.0.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
-    }
-
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            self.kill_and_wait();
-        }
     }
 
     #[derive(Debug)]

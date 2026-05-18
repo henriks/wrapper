@@ -1,4 +1,7 @@
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
+
+use ipnet::Ipv4Net;
 
 use crate::GuestNetwork;
 
@@ -54,8 +57,19 @@ pub struct EgressPolicy {
     pub default_action: EgressAction,
     pub reason: EgressReason,
     pub allow_domains: Vec<String>,
-    pub allow_ips: Vec<String>,
-    pub deny_ranges: Vec<String>,
+    pub allow_ip_ranges: Vec<Ipv4Range>,
+    pub deny_ip_ranges: Vec<Ipv4Range>,
+}
+
+impl EgressPolicy {
+    pub fn allow_ip_or_cidr(
+        &mut self,
+        value: impl std::fmt::Display,
+    ) -> Result<(), Ipv4RangeParseError> {
+        self.allow_ip_ranges
+            .push(Ipv4Range::parse(&value.to_string())?);
+        Ok(())
+    }
 }
 
 impl Default for EgressPolicy {
@@ -64,10 +78,58 @@ impl Default for EgressPolicy {
             default_action: EgressAction::Deny,
             reason: EgressReason::DenyByDefault,
             allow_domains: Vec::new(),
-            allow_ips: Vec::new(),
-            deny_ranges: default_deny_ranges(),
+            allow_ip_ranges: Vec::new(),
+            deny_ip_ranges: default_deny_ranges(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ipv4Range {
+    net: Ipv4Net,
+}
+
+impl Ipv4Range {
+    pub fn parse(value: &str) -> Result<Self, Ipv4RangeParseError> {
+        if let Ok(net) = value.parse::<Ipv4Net>() {
+            return Ok(Self { net });
+        }
+        let ip = value.parse::<Ipv4Addr>().map_err(|_| Ipv4RangeParseError {
+            value: value.to_string(),
+        })?;
+        Ok(Self {
+            net: Ipv4Net::new(ip, 32).expect("/32 is a valid IPv4 prefix length"),
+        })
+    }
+
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        self.net.contains(&ip)
+    }
+
+    pub fn as_net(&self) -> Ipv4Net {
+        self.net
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ipv4RangeParseError {
+    value: String,
+}
+
+impl std::fmt::Display for Ipv4RangeParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "invalid IPv4 address or CIDR range: {}",
+            self.value
+        )
+    }
+}
+
+impl std::error::Error for Ipv4RangeParseError {}
+
+pub fn parse_ipv4_ranges(values: &[String]) -> Result<Vec<Ipv4Range>, Ipv4RangeParseError> {
+    values.iter().map(|value| Ipv4Range::parse(value)).collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +273,7 @@ pub enum PolicyError {
     PublishedPortsRequireGuestEgress,
 }
 
-fn default_deny_ranges() -> Vec<String> {
+fn default_deny_ranges() -> Vec<Ipv4Range> {
     [
         "0.0.0.0/8",
         "10.0.0.0/8",
@@ -225,13 +287,14 @@ fn default_deny_ranges() -> Vec<String> {
         "240.0.0.0/4",
     ]
     .into_iter()
-    .map(str::to_string)
+    .map(|range| Ipv4Range::parse(range).expect("default deny range is valid"))
     .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn default_policy_is_deny_by_default_and_blocks_bypass_protocols() {
@@ -243,8 +306,9 @@ mod tests {
         assert_eq!(policy.protocols.udp.default_action, EgressAction::Deny);
         assert!(policy
             .egress
-            .deny_ranges
-            .contains(&"169.254.169.254/32".to_string()));
+            .deny_ip_ranges
+            .iter()
+            .any(|range| range.as_net().to_string() == "169.254.169.254/32"));
     }
 
     #[test]
@@ -291,6 +355,35 @@ mod tests {
     }
 
     #[test]
+    fn parses_single_ipv4_and_cidr_ranges() {
+        let single = Ipv4Range::parse("93.184.216.34").expect("single IP");
+        assert_eq!(single.as_net().to_string(), "93.184.216.34/32");
+        assert!(single.contains(Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(!single.contains(Ipv4Addr::new(93, 184, 216, 35)));
+
+        let cidr = Ipv4Range::parse("93.184.216.0/24").expect("CIDR");
+        assert_eq!(cidr.as_net().to_string(), "93.184.216.0/24");
+        assert!(cidr.contains(Ipv4Addr::new(93, 184, 216, 34)));
+        assert!(!cidr.contains(Ipv4Addr::new(93, 184, 217, 1)));
+    }
+
+    #[test]
+    fn rejects_invalid_ipv4_policy_ranges() {
+        let error = Ipv4Range::parse("example.com").expect_err("not an IPv4 range");
+        assert_eq!(
+            error.to_string(),
+            "invalid IPv4 address or CIDR range: example.com"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn proptest_ipv4_range_parser_accepts_or_rejects_without_panic(input in ".{0,128}") {
+            let _ = Ipv4Range::parse(&input);
+        }
+    }
+
+    #[test]
     fn default_deny_ranges_cover_private_metadata_loopback_and_nonunicast() {
         let policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
 
@@ -307,7 +400,11 @@ mod tests {
             "240.0.0.0/4",
         ] {
             assert!(
-                policy.egress.deny_ranges.contains(&range.to_string()),
+                policy
+                    .egress
+                    .deny_ip_ranges
+                    .iter()
+                    .any(|deny_range| deny_range.as_net().to_string() == range),
                 "missing deny range {range}"
             );
         }

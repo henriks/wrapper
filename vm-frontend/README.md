@@ -67,21 +67,30 @@ Coverage-guided fuzz targets and seed corpora live in `vm-frontend/fuzz/`.
 Run the KVM-required VM-only self-test:
 
 ```sh
-cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- \
-  self-test \
+publish_port=$(python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
+cargo run --manifest-path vm-frontend/Cargo.toml --offline \
+  --features validation-self-test \
+  --bin agentvm-self-test -- \
   --project "$PWD" \
   --run-dir "$PWD/.sandbox/docker-vm/self-test" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
-  --publish-payload-port 12079
+  --publish-payload-port "${publish_port}"
 ```
 
 This boots the real microvm path, verifies the guest payload control channel,
 checks optional host-published guest access by pinging the payload service
 through `--publish-payload-port`, runs a trivial payload inside the guest,
-checks `$HOME` and workspace sharing, verifies the guest-visible MITM CA bundle
-and cert-only config filesystem, confirms config FS is read-only, performs a
-guest DNS lookup when network is enabled, verifies `dockerd` with
+checks `$HOME` and workspace sharing, validates the structured guest launch
+config at `/run/agentvm-config/launch.json`, verifies the guest-visible MITM CA
+bundle and cert-only config filesystem, confirms config FS is read-only,
+performs a guest DNS lookup when network is enabled, verifies `dockerd` with
 `docker version` and `docker info`, then runs
 `docker run --rm -v "$PWD:/work:ro" alpine:3.22` and reads a workspace file
 from inside that container. The image is pulled into the project-local Docker
@@ -89,8 +98,9 @@ data disk if it is not already present.
 
 When validation fails, collect the run directory shown in `state.json`. The
 state file records the primary diagnostics: `qemu.log`, `console.log`,
-`vmnet-events.log`, the composed/config filesystem manifests, and the guest bind
-manifest. Event logs include DNS decisions, UDP denials, unsupported protocol
+`vmnet-events.log`, the composed/config filesystem manifests,
+`guest-config/launch.json`, and the guest bind manifest. Event logs include DNS
+decisions, UDP denials, unsupported protocol
 classification, TCP policy/setup failures, TLS MITM failures, and host-ingress
 errors without logging private key material.
 
@@ -128,9 +138,11 @@ For a VM egress smoke after rebuilding the appliance with the current
   --guest-http-smoke-url http://93.184.216.34/
 ```
 
-The guest will run one `wget` after configuring `eth0`, write the guest-side
-result to `.sandbox/docker-vm/run/guest-http-smoke.log`, and the vmnet gateway
-should log the intercepted request in `.sandbox/docker-vm/run/vmnet-events.log`.
+The frontend writes the URL to `guest-config/launch.json`. The guest reads that
+config after mounting `agentvm-config`, runs one `wget` after configuring
+`eth0`, writes the guest-side result to
+`.sandbox/docker-vm/run/guest-http-smoke.log`, and the vmnet gateway should log
+the intercepted request in `.sandbox/docker-vm/run/vmnet-events.log`.
 
 The launcher is intentionally Rust-only for the stream path: it does not add a
 QEMU `user` netdev or `hostfwd` fallback.

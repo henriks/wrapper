@@ -9,6 +9,9 @@ use smoltcp::time::Instant;
 
 use crate::guest_tcp::GuestTcpConnectError;
 use crate::network_policy::{HostListener, HostListenerPurpose};
+use crate::stream_buffer::{
+    extend_pending_buffer, read_nonblocking_chunk, write_pending_best_effort, NonblockingRead,
+};
 use crate::vmnet_gateway::VmnetGateway;
 
 pub const DEFAULT_HOST_INGRESS_FIRST_LOCAL_PORT: u16 = 40_000;
@@ -323,9 +326,9 @@ where
                             HostRead::Payload(host_bytes) => {
                                 let bytes = host_bytes.len();
                                 host_read_bytes += bytes;
-                                if pending_buffer_limit_exceeded(
-                                    session.pending_guest_write.len(),
-                                    bytes,
+                                if let Err(limit) = extend_pending_buffer(
+                                    &mut session.pending_guest_write,
+                                    &host_bytes,
                                     buffer_limits.pending_guest_write,
                                 ) {
                                     let guest_frames =
@@ -334,14 +337,13 @@ where
                                         handle: active.handle,
                                         guest_port,
                                         buffer: HostIngressBufferKind::PendingGuestWrite,
-                                        limit: buffer_limits.pending_guest_write,
-                                        attempted: session.pending_guest_write.len() + bytes,
+                                        limit: limit.limit,
+                                        attempted: limit.attempted,
                                         guest_frames,
                                     });
                                     closed.push(active.handle);
                                     break;
                                 }
-                                session.pending_guest_write.extend_from_slice(&host_bytes);
                                 match send_pending_guest_write(
                                     gateway,
                                     active.handle,
@@ -411,9 +413,9 @@ where
 
             match gateway.recv_tcp_session(active.handle) {
                 Ok(guest_bytes) if !guest_bytes.is_empty() => {
-                    if pending_buffer_limit_exceeded(
-                        session.pending_host_write.len(),
-                        guest_bytes.len(),
+                    if let Err(limit) = extend_pending_buffer(
+                        &mut session.pending_host_write,
+                        &guest_bytes,
                         buffer_limits.pending_host_write,
                     ) {
                         let guest_frames = gateway.close_tcp_session(active.handle, now);
@@ -421,15 +423,14 @@ where
                             handle: active.handle,
                             guest_port,
                             buffer: HostIngressBufferKind::PendingHostWrite,
-                            limit: buffer_limits.pending_host_write,
-                            attempted: session.pending_host_write.len() + guest_bytes.len(),
+                            limit: limit.limit,
+                            attempted: limit.attempted,
                             guest_frames,
                         });
                         closed.push(active.handle);
                         continue;
                     }
-                    session.pending_host_write.extend_from_slice(&guest_bytes);
-                    match write_all_best_effort(
+                    match write_pending_best_effort(
                         &mut session.connection,
                         &mut session.pending_host_write,
                         pump_limits.host_write_bytes_per_session,
@@ -467,7 +468,7 @@ where
                 }
                 Ok(_) => {
                     if readiness.writable(active.handle) && !session.pending_host_write.is_empty() {
-                        match write_all_best_effort(
+                        match write_pending_best_effort(
                             &mut session.connection,
                             &mut session.pending_host_write,
                             pump_limits.host_write_bytes_per_session,
@@ -753,10 +754,6 @@ pub enum HostIngressEvent {
     },
 }
 
-fn pending_buffer_limit_exceeded(current: usize, incoming: usize, limit: usize) -> bool {
-    current.saturating_add(incoming) > limit
-}
-
 fn guest_closed_state(state: tcp::State) -> bool {
     matches!(
         state,
@@ -790,40 +787,12 @@ fn send_pending_guest_write(
 }
 
 fn read_available(connection: &mut impl Read, max_bytes: usize) -> HostRead {
-    if max_bytes == 0 {
-        return HostRead::WouldBlock;
+    match read_nonblocking_chunk(connection, max_bytes) {
+        Ok(NonblockingRead::Payload(buffer)) => HostRead::Payload(buffer),
+        Ok(NonblockingRead::Closed) => HostRead::Closed,
+        Ok(NonblockingRead::WouldBlock) => HostRead::WouldBlock,
+        Err(error) => HostRead::Failed(error),
     }
-    let mut buffer = vec![0; max_bytes.min(64 * 1024)];
-    match connection.read(&mut buffer) {
-        Ok(0) => HostRead::Closed,
-        Ok(count) => {
-            buffer.truncate(count);
-            HostRead::Payload(buffer)
-        }
-        Err(error) if error.kind() == ErrorKind::WouldBlock => HostRead::WouldBlock,
-        Err(error) => HostRead::Failed(error.to_string()),
-    }
-}
-
-fn write_all_best_effort(
-    connection: &mut impl Write,
-    bytes: &mut Vec<u8>,
-    max_bytes: usize,
-) -> Result<usize, String> {
-    let mut written = 0;
-    while !bytes.is_empty() && written < max_bytes {
-        let writable = (max_bytes - written).min(bytes.len());
-        match connection.write(&bytes[..writable]) {
-            Ok(0) => break,
-            Ok(count) => {
-                written += count;
-                bytes.drain(..count);
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(written)
 }
 
 fn push_host_write_limit_if_reached(

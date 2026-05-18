@@ -42,7 +42,6 @@ selected Alpine branch, and installs only the packages needed for the guest:
 - `e2fsprogs`
 - `iproute2`
 - `util-linux`
-- `bubblewrap`
 - `bash`
 - `nodejs`
 - `npm`
@@ -78,14 +77,14 @@ automating the lookup against Alpine's official package indexes.
 The guest boots with an immutable lower rootfs and project-local persistent root
 state disk. `agentvm-init` assembles the writable root overlay and then:
 
-- mounts the Rust composed-fs workspace/config shares at the original absolute
-  project path and keeps `/workspace` as a compatibility alias
+- mounts the Rust composed-fs workspace/config shares at the configured original
+  absolute project path
 - configures the guest NIC for the Rust userspace vmnet gateway
 - starts `dockerd`
-- starts `docker/guest-socket-bridge.py` to forward a guest TCP port to
-  `/var/run/docker.sock`
-- starts `docker/guest-payload-server.py` so the host frontend can launch the
-  requested payload inside the guest
+- starts `/usr/local/libexec/agentvm-guest-service docker-bridge` to forward a
+  guest TCP port to `/var/run/docker.sock`
+- starts `/usr/local/libexec/agentvm-guest-service` so the host frontend can
+  launch the requested payload inside the guest
 
 Persistent guest state, including Docker's `/var/lib/docker`, lives on the
 sparse root overlay state disk. The appliance rootfs remains the immutable lower

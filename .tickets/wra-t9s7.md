@@ -2,7 +2,7 @@
 id: wra-t9s7
 status: open
 deps: []
-links: [wra-ylt9]
+links: [wra-ylt9, wra-fpy2]
 created: 2026-05-16T15:50:48Z
 type: task
 priority: 2
@@ -31,3 +31,9 @@ Validation:
 - Run documentation drift checks and required validation docs tests.
 - Link this ticket to wra-ylt9.
 
+
+## Notes
+
+**2026-05-18T10:38:12Z**
+
+Follow-up cleanup epic wra-emj5 links wra-fpy2 for broader stale-doc pruning. Keep this ticket focused on SQLite validation scope, but when editing docs avoid carrying old implementation-history language into active runtime contracts.

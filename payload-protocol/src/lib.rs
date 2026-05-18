@@ -1,9 +1,9 @@
 //! Shared AgentVM payload frame protocol definitions and codecs.
 //!
-//! The protocol is currently implemented by `docker/guest-payload-server.py`,
-//! `vm-frontend/src/payload_client.rs`, and the future Rust guest service.  Keep
-//! framing, size limits, and fragmentation behavior here so Tokio read/write
-//! integrations can share the same tested compatibility semantics.
+//! The protocol is implemented by the Rust guest service and
+//! `vm-frontend/src/payload_client.rs`. Keep framing, size limits, and
+//! fragmentation behavior here so Tokio read/write integrations share the same
+//! tested semantics.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;

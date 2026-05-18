@@ -2,7 +2,7 @@
 id: wra-vl1o
 status: open
 deps: [wra-i3t9]
-links: [wra-rh21, wra-g13g]
+links: [wra-rh21, wra-g13g, wra-g34z]
 created: 2026-05-16T15:50:47Z
 type: bug
 priority: 2
@@ -40,3 +40,7 @@ wra-g13g has implemented part of this linked behavior in the TLS MITM owner path
 **2026-05-16T21:46:56Z**
 
 Review after closing wra-i3t9 and wra-g13g: the main active TLS MITM fatal paths now emit guest close/reset frames (no-SNI guest TLS and invalid upstream TLS have regressions), and upstream connect failure closure is no longer a blocker. Keep this ticket open for the remaining edge sweep and the requested live bad-upstream HTTPS regression before declaring the TLS failure surface fully closed.
+
+**2026-05-18T10:38:19Z**
+
+Follow-up cleanup epic wra-emj5 links wra-g34z. Fatal TLS MITM session closure should reuse the consolidated vmnet/proxy buffer and event path where possible; do not add a separate TLS-only session cleanup adapter if the shared TCP proxy path can own closure.

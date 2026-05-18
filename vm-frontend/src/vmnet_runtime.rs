@@ -35,9 +35,7 @@ use crate::vmnet_service_io::{
     VmnetAsyncTcpConnectWorkerHandle, VmnetServiceCompletion, VmnetServiceIoLimitError,
     VmnetServiceIoLimits, VmnetServiceOwner, VmnetServiceToken,
 };
-use crate::vmnet_stream::{
-    FrameRead, PcapWriter, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError,
-};
+use crate::vmnet_stream::{PcapWriter, QemuFrameIo, VmnetStreamEndpoint, VmnetStreamError};
 use crate::GuestNetwork;
 
 pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,16 +91,6 @@ pub struct VmnetProxyPump {
 pub struct VmnetHostIngressPump {
     pub guest_frames_written: usize,
     pub events: Vec<HostIngressEvent>,
-}
-
-#[derive(Debug, Default)]
-pub struct VmnetRuntimeTick {
-    pub eof: bool,
-    pub guest_frame_read: bool,
-    pub guest_frames_written: usize,
-    pub captured_frames: usize,
-    pub gateway_events: Vec<VmnetGatewayEvent>,
-    pub proxy_events: Vec<TcpProxyEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,7 +163,8 @@ impl<'a> VmnetCore<'a> {
     }
 }
 
-pub fn run_qemu_stream_until_eof<T, C, F>(
+#[cfg(test)]
+fn run_qemu_stream_until_eof<T, C, F>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
@@ -204,60 +193,7 @@ where
     Ok(stats)
 }
 
-pub fn run_qemu_stream_tick<T, C>(
-    frame_io: &mut QemuFrameIo<T>,
-    core: &mut VmnetCore<'_>,
-    proxy: &mut TcpProxyBridge<C>,
-    now: Instant,
-    mut pcap: Option<&mut PcapWriter>,
-) -> Result<VmnetRuntimeTick, VmnetRuntimeError>
-where
-    T: Read + Write,
-    C: TcpUpstreamConnector,
-    C::Connection: Read + Write,
-{
-    let mut tick = VmnetRuntimeTick::default();
-    match frame_io.try_read_frame()? {
-        FrameRead::Frame(frame) => {
-            tick.guest_frame_read = true;
-            capture_frame(pcap.as_deref_mut(), &frame)?;
-            tick.captured_frames += usize::from(pcap.is_some());
-            let result = core.handle_guest_frame(frame, now);
-            if let Some(event) = gateway_event_from_outcome(&result.outcome) {
-                tick.gateway_events.push(event);
-            }
-            let mut stats = VmnetRuntimeStats::default();
-            let captured = write_guest_frames(
-                frame_io,
-                &result.guest_frames,
-                &mut stats,
-                pcap.as_deref_mut(),
-            )?;
-            tick.guest_frames_written += stats.guest_frames_written;
-            tick.captured_frames += captured;
-        }
-        FrameRead::WouldBlock => {}
-        FrameRead::Eof => tick.eof = true,
-    }
-
-    let pump = pump_proxy_once(frame_io, core, proxy, now, pcap.as_deref_mut())?;
-    tick.guest_frames_written += pump.guest_frames_written;
-    tick.captured_frames += pump.guest_frames_written;
-    tick.proxy_events = pump.events;
-    Ok(tick)
-}
-
-pub fn serve_vmnet_gateway(
-    config: VmnetRuntimeConfig,
-) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("agentvm-vmnet-runtime")
-        .build()?;
-    runtime.block_on(serve_vmnet_gateway_async(config))
-}
-
-async fn serve_vmnet_gateway_async(
+pub async fn serve_vmnet_gateway_async(
     config: VmnetRuntimeConfig,
 ) -> Result<VmnetRuntimeStats, VmnetRuntimeError> {
     serve_vmnet_gateway_async_owner(config).await
@@ -275,6 +211,11 @@ async fn serve_vmnet_gateway_async_owner(
         default_egress_action = ?config.policy.egress.default_action,
     );
     let _span_guard = span.enter();
+    let host_listeners = HostIngressListenerSet::bind(&config.policy.host_listeners)?;
+    info!(
+        host_listener_count = config.policy.host_listeners.len(),
+        "vmnet host listeners bound"
+    );
     info!("binding vmnet gateway socket");
     let endpoint = VmnetStreamEndpoint::bind(&config.socket_path)?;
     let mut frame_io = endpoint.accept_one_tokio().await?;
@@ -307,11 +248,6 @@ async fn serve_vmnet_gateway_async_owner(
         VmnetServiceOwner::<TcpProxyPendingConnect, std::net::TcpStream>::new(
             config.service_io_limits,
         )?;
-    let host_listeners = HostIngressListenerSet::bind(&config.policy.host_listeners)?;
-    info!(
-        host_listener_count = config.policy.host_listeners.len(),
-        "vmnet host listeners bound"
-    );
     let mut stats = VmnetRuntimeStats::default();
     let mut event_log = open_event_log(config.event_log_path.as_deref())?;
     let mut pcap = open_pcap_capture(&config)?;
@@ -535,10 +471,17 @@ async fn serve_vmnet_gateway_async_owner(
         stats.gateway_events.extend(gateway_events);
         stats.proxy_events.extend(proxy_pump.events);
         stats.host_ingress_events.extend(host_events);
+        let reap = core.gateway_mut().reap_closed_tcp_sessions();
+        if reap.listener_sessions > 0 || reap.host_connections > 0 {
+            debug!(
+                listener_sessions = reap.listener_sessions,
+                host_connections = reap.host_connections,
+                "reaped closed guest TCP sessions"
+            );
+        }
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 enum VmnetDnsServiceFrame {
     Immediate(GuestFrameResult),
@@ -546,7 +489,7 @@ enum VmnetDnsServiceFrame {
     QueueFull(GuestFrameResult),
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn handle_guest_frame_with_dns_service<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
@@ -570,7 +513,6 @@ fn handle_guest_frame_with_dns_service<C>(
     }
 }
 
-#[allow(dead_code)]
 fn handle_guest_frame_with_async_dns_worker<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
@@ -595,7 +537,6 @@ fn handle_guest_frame_with_async_dns_worker<C>(
     }
 }
 
-#[allow(dead_code)]
 fn apply_dns_service_completion<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
@@ -610,14 +551,14 @@ fn apply_dns_service_completion<C>(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct VmnetDnsServiceDrain {
     guest_results: Vec<GuestFrameResult>,
     disconnected: bool,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn drain_async_dns_worker_completions<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
@@ -643,7 +584,7 @@ fn drain_async_dns_worker_completions<C>(
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn fail_pending_dns_service_queries<C>(
     core: &mut VmnetCore<'_>,
     service: &mut VmnetServiceOwner<VmnetPendingDnsQuery, C>,
@@ -657,7 +598,6 @@ fn fail_pending_dns_service_queries<C>(
         .collect()
 }
 
-#[allow(dead_code)]
 fn submit_tcp_connects_to_async_worker<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
@@ -696,7 +636,6 @@ where
     events
 }
 
-#[allow(dead_code)]
 fn apply_tcp_connect_service_completion<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
@@ -724,14 +663,14 @@ where
     events
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct VmnetTcpConnectServiceDrain {
     events: Vec<TcpProxyEvent>,
     disconnected: bool,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn drain_async_tcp_connect_worker_completions<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
@@ -762,7 +701,7 @@ where
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn fail_pending_tcp_connects<T>(
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<T>,
@@ -785,7 +724,6 @@ where
     events
 }
 
-#[allow(dead_code)]
 fn dns_frame_result_to_guest(result: DnsFrameResult) -> GuestFrameResult {
     GuestFrameResult {
         outcome: GuestFrameOutcome::DnsQuery { log: result.log },
@@ -844,7 +782,6 @@ fn open_host_ingress_session<C>(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmnetAsyncFdInterest {
     readable: bool,
@@ -862,7 +799,6 @@ impl VmnetAsyncFdInterest {
     };
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VmnetAsyncFdRegistration {
     source: VmnetEventSource,
@@ -870,7 +806,6 @@ struct VmnetAsyncFdRegistration {
     interest: VmnetAsyncFdInterest,
 }
 
-#[allow(dead_code)]
 fn snapshot_async_fd_registrations(
     host_listeners: &HostIngressListenerSet,
     host_ingress: &HostIngressBridge<std::net::TcpStream>,
@@ -919,7 +854,7 @@ fn snapshot_async_fd_registrations(
     registrations
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn choose_async_fd_registration(
     registrations: &[VmnetAsyncFdRegistration],
     cursor: &mut usize,
@@ -941,7 +876,7 @@ fn choose_async_fd_registration(
     Some(registrations[index])
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn async_fd_registration_poll_ready(registration: VmnetAsyncFdRegistration) -> bool {
     let mut events = 0;
     if registration.interest.readable {
@@ -960,7 +895,6 @@ fn async_fd_registration_poll_ready(registration: VmnetAsyncFdRegistration) -> b
     result > 0 && poll_fd.revents != 0
 }
 
-#[allow(dead_code)]
 async fn wait_async_fd_registrations(
     registrations: &[VmnetAsyncFdRegistration],
     cursor: &mut usize,
@@ -1010,7 +944,8 @@ async fn wait_async_fd_registrations(
     Ok(Some((source, readable, writable)))
 }
 
-pub fn pump_proxy_once<T, C>(
+#[cfg(test)]
+fn pump_proxy_once<T, C>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
@@ -1025,7 +960,8 @@ where
     pump_proxy_ready(frame_io, core, proxy, now, TcpProxyReadiness::all(), pcap)
 }
 
-pub fn pump_proxy_ready<T, C>(
+#[cfg(test)]
+fn pump_proxy_ready<T, C>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
     proxy: &mut TcpProxyBridge<C>,
@@ -1053,7 +989,6 @@ where
     Ok(pump)
 }
 
-#[allow(dead_code)]
 async fn pump_proxy_ready_async<T, C>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
@@ -1083,6 +1018,7 @@ where
     Ok(pump)
 }
 
+#[cfg(test)]
 fn write_proxy_event_guest_frames<T>(
     frame_io: &mut QemuFrameIo<T>,
     events: &[TcpProxyEvent],
@@ -1109,7 +1045,6 @@ where
     Ok(())
 }
 
-#[allow(dead_code)]
 async fn write_proxy_event_guest_frames_async<T>(
     frame_io: &mut QemuFrameIo<T>,
     events: &[TcpProxyEvent],
@@ -1136,67 +1071,6 @@ where
     Ok(())
 }
 
-pub fn pump_host_ingress_once<T>(
-    frame_io: &mut QemuFrameIo<T>,
-    core: &mut VmnetCore<'_>,
-    bridge: &mut HostIngressBridge<std::net::TcpStream>,
-    listeners: &HostIngressListenerSet,
-    now: Instant,
-    mut pcap: Option<&mut PcapWriter>,
-) -> Result<VmnetHostIngressPump, VmnetRuntimeError>
-where
-    T: Read + Write,
-{
-    let mut pump = VmnetHostIngressPump::default();
-    for accepted in listeners.accept_pending() {
-        let accepted = accepted?;
-        let (guest_frames, event) = open_host_ingress_session(core, bridge, accepted, now);
-        for frame in &guest_frames {
-            capture_frame(pcap.as_deref_mut(), frame)?;
-            frame_io.write_frame(frame)?;
-            pump.guest_frames_written += 1;
-        }
-        pump.events.push(event);
-    }
-    let ready = pump_host_ingress_ready(
-        frame_io,
-        core,
-        bridge,
-        now,
-        HostIngressReadiness::all(),
-        pcap,
-    )?;
-    pump.guest_frames_written += ready.guest_frames_written;
-    pump.events.extend(ready.events);
-    Ok(pump)
-}
-
-pub fn pump_host_ingress_ready<T>(
-    frame_io: &mut QemuFrameIo<T>,
-    core: &mut VmnetCore<'_>,
-    bridge: &mut HostIngressBridge<std::net::TcpStream>,
-    now: Instant,
-    readiness: HostIngressReadiness,
-    mut pcap: Option<&mut PcapWriter>,
-) -> Result<VmnetHostIngressPump, VmnetRuntimeError>
-where
-    T: Read + Write,
-{
-    let mut pump = VmnetHostIngressPump::default();
-    for event in bridge.process_gateway_with_readiness(core.gateway_mut(), now, readiness) {
-        write_host_ingress_event_guest_frames(
-            frame_io,
-            std::slice::from_ref(&event),
-            &mut pump,
-            pcap.as_deref_mut(),
-        )?;
-        pump.events.push(event);
-    }
-
-    Ok(pump)
-}
-
-#[allow(dead_code)]
 async fn pump_host_ingress_ready_async<T>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
@@ -1223,31 +1097,6 @@ where
     Ok(pump)
 }
 
-fn write_host_ingress_event_guest_frames<T>(
-    frame_io: &mut QemuFrameIo<T>,
-    events: &[HostIngressEvent],
-    pump: &mut VmnetHostIngressPump,
-    mut pcap: Option<&mut PcapWriter>,
-) -> Result<(), VmnetRuntimeError>
-where
-    T: Read + Write,
-{
-    for event in events {
-        if let HostIngressEvent::HostPayload { guest_frames, .. }
-        | HostIngressEvent::HostClosed { guest_frames, .. }
-        | HostIngressEvent::BufferLimitExceeded { guest_frames, .. } = event
-        {
-            for frame in guest_frames {
-                capture_frame(pcap.as_deref_mut(), frame)?;
-                frame_io.write_frame(frame)?;
-                pump.guest_frames_written += 1;
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
 async fn write_host_ingress_event_guest_frames_async<T>(
     frame_io: &mut QemuFrameIo<T>,
     events: &[HostIngressEvent],
@@ -1743,6 +1592,7 @@ fn format_proxy_event(event: &TcpProxyEvent) -> String {
     }
 }
 
+#[cfg(test)]
 fn write_guest_frames<T>(
     frame_io: &mut QemuFrameIo<T>,
     frames: &[Vec<u8>],
@@ -1762,14 +1612,14 @@ where
     Ok(captured)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug)]
 enum VmnetAsyncQemuFrameStep {
     Frame(GuestFrameResult),
     Eof,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn handle_next_async_qemu_frame<T>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
@@ -1786,7 +1636,6 @@ where
     }
 }
 
-#[allow(dead_code)]
 async fn write_guest_frames_async<T>(
     frame_io: &mut QemuFrameIo<T>,
     frames: &[Vec<u8>],
@@ -1806,7 +1655,7 @@ where
     Ok(captured)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug)]
 enum VmnetAsyncQemuDnsEvent<C> {
     QemuFrame(Vec<u8>),
@@ -1815,7 +1664,7 @@ enum VmnetAsyncQemuDnsEvent<C> {
     DnsDisconnected,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn next_async_qemu_or_dns_event<T, C>(
     frame_io: &mut QemuFrameIo<T>,
     dns_worker: &mut VmnetAsyncDnsWorkerHandle<C>,
@@ -1839,16 +1688,16 @@ where
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug)]
 enum VmnetAsyncQemuTcpEvent<C> {
-    QemuFrame(Vec<u8>),
+    QemuFrame,
     QemuEof,
     TcpCompletion(VmnetServiceCompletion<C>),
     TcpDisconnected,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn next_async_qemu_or_tcp_event<T, C>(
     frame_io: &mut QemuFrameIo<T>,
     tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<C>,
@@ -1859,7 +1708,7 @@ where
     tokio::select! {
         frame = frame_io.read_frame_async() => {
             match frame? {
-                Some(frame) => Ok(VmnetAsyncQemuTcpEvent::QemuFrame(frame)),
+                Some(_frame) => Ok(VmnetAsyncQemuTcpEvent::QemuFrame),
                 None => Ok(VmnetAsyncQemuTcpEvent::QemuEof),
             }
         }
@@ -1872,7 +1721,6 @@ where
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 enum VmnetAsyncServiceCompletionEvent<DnsC, TcpC> {
     DnsCompletion(VmnetServiceCompletion<DnsC>),
@@ -1881,7 +1729,6 @@ enum VmnetAsyncServiceCompletionEvent<DnsC, TcpC> {
     TcpDisconnected,
 }
 
-#[allow(dead_code)]
 async fn next_async_service_completion<DnsC, TcpC>(
     dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
     tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<TcpC>,
@@ -1902,7 +1749,6 @@ async fn next_async_service_completion<DnsC, TcpC>(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug)]
 enum VmnetAsyncOwnerEvent<DnsC, TcpC> {
     QemuFrame(Vec<u8>),
@@ -1916,102 +1762,6 @@ enum VmnetAsyncOwnerEvent<DnsC, TcpC> {
     },
 }
 
-#[allow(dead_code)]
-async fn wait_async_fd_registration(
-    registration: VmnetAsyncFdRegistration,
-) -> Result<(VmnetEventSource, bool, bool), VmnetRuntimeError> {
-    let async_fd = AsyncFd::new(BorrowedRawFd {
-        fd: registration.fd,
-    })?;
-    match (
-        registration.interest.readable,
-        registration.interest.writable,
-    ) {
-        (true, true) => {
-            tokio::select! {
-                ready = async_fd.readable() => {
-                    let mut ready = ready?;
-                    ready.clear_ready();
-                    Ok((registration.source, true, false))
-                }
-                ready = async_fd.writable() => {
-                    let mut ready = ready?;
-                    ready.clear_ready();
-                    Ok((registration.source, false, true))
-                }
-            }
-        }
-        (true, false) => {
-            let mut ready = async_fd.readable().await?;
-            ready.clear_ready();
-            Ok((registration.source, true, false))
-        }
-        (false, true) => {
-            let mut ready = async_fd.writable().await?;
-            ready.clear_ready();
-            Ok((registration.source, false, true))
-        }
-        (false, false) => unreachable!("empty fd interest is not registered"),
-    }
-}
-
-#[allow(dead_code)]
-async fn next_async_owner_event<T, DnsC, TcpC>(
-    frame_io: &mut QemuFrameIo<T>,
-    dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
-    tcp_worker: &mut VmnetAsyncTcpConnectWorkerHandle<TcpC>,
-    delay: Option<Duration>,
-    fd_readiness: Option<VmnetAsyncFdRegistration>,
-) -> Result<VmnetAsyncOwnerEvent<DnsC, TcpC>, VmnetRuntimeError>
-where
-    T: AsyncRead + Unpin,
-{
-    let read_frame = async {
-        match frame_io.read_frame_async().await? {
-            Some(frame) => Ok(VmnetAsyncOwnerEvent::QemuFrame(frame)),
-            None => Ok(VmnetAsyncOwnerEvent::QemuEof),
-        }
-    };
-    let service_completion = next_async_service_completion(dns_worker, tcp_worker);
-    match (delay, fd_readiness) {
-        (Some(delay), Some(registration)) => {
-            tokio::select! {
-                event = read_frame => event,
-                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
-                _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
-                ready = wait_async_fd_registration(registration) => {
-                    let (source, readable, writable) = ready?;
-                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
-                }
-            }
-        }
-        (Some(delay), None) => {
-            tokio::select! {
-                event = read_frame => event,
-                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
-                _ = tokio::time::sleep(delay) => Ok(VmnetAsyncOwnerEvent::Timer),
-            }
-        }
-        (None, Some(registration)) => {
-            tokio::select! {
-                event = read_frame => event,
-                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
-                ready = wait_async_fd_registration(registration) => {
-                    let (source, readable, writable) = ready?;
-                    Ok(VmnetAsyncOwnerEvent::FdReady { source, readable, writable })
-                }
-            }
-        }
-        (None, None) => {
-            tokio::select! {
-                event = read_frame => event,
-                event = service_completion => Ok(VmnetAsyncOwnerEvent::Service(event)),
-            }
-        }
-    }
-}
-
-#[allow(dead_code)]
 async fn next_async_owner_event_with_fd_snapshot<T, DnsC, TcpC>(
     frame_io: &mut QemuFrameIo<T>,
     dns_worker: &mut VmnetAsyncDnsWorkerHandle<DnsC>,
@@ -2077,7 +1827,6 @@ where
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct VmnetAsyncServiceCompletionApply {
     guest_frames_written: usize,
@@ -2088,7 +1837,6 @@ struct VmnetAsyncServiceCompletionApply {
     tcp_disconnected: bool,
 }
 
-#[allow(dead_code)]
 async fn apply_async_service_completion_event<T, DnsC, C>(
     frame_io: &mut QemuFrameIo<T>,
     core: &mut VmnetCore<'_>,
@@ -2155,47 +1903,6 @@ where
     Ok(applied)
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VmnetAsyncQemuTimerEvent {
-    QemuFrame(Vec<u8>),
-    QemuEof,
-    Timer,
-}
-
-#[allow(dead_code)]
-async fn next_async_qemu_or_timer_event<T>(
-    frame_io: &mut QemuFrameIo<T>,
-    delay: Option<Duration>,
-) -> Result<VmnetAsyncQemuTimerEvent, VmnetRuntimeError>
-where
-    T: AsyncRead + Unpin,
-{
-    let read_frame = async {
-        match frame_io.read_frame_async().await? {
-            Some(frame) => Ok(VmnetAsyncQemuTimerEvent::QemuFrame(frame)),
-            None => Ok(VmnetAsyncQemuTimerEvent::QemuEof),
-        }
-    };
-    if let Some(delay) = delay {
-        tokio::select! {
-            event = read_frame => event,
-            _ = tokio::time::sleep(delay) => Ok(VmnetAsyncQemuTimerEvent::Timer),
-        }
-    } else {
-        read_frame.await
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum VmnetAsyncFdReadyEvent {
-    QemuFrame(Vec<u8>),
-    QemuEof,
-    FdReadable(VmnetEventSource),
-}
-
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct BorrowedRawFd {
     fd: RawFd,
@@ -2204,31 +1911,6 @@ struct BorrowedRawFd {
 impl AsRawFd for BorrowedRawFd {
     fn as_raw_fd(&self) -> RawFd {
         self.fd
-    }
-}
-
-#[allow(dead_code)]
-async fn next_async_qemu_or_fd_readable<T>(
-    frame_io: &mut QemuFrameIo<T>,
-    source: VmnetEventSource,
-    fd: RawFd,
-) -> Result<VmnetAsyncFdReadyEvent, VmnetRuntimeError>
-where
-    T: AsyncRead + Unpin,
-{
-    let async_fd = AsyncFd::new(BorrowedRawFd { fd })?;
-    tokio::select! {
-        frame = frame_io.read_frame_async() => {
-            match frame? {
-                Some(frame) => Ok(VmnetAsyncFdReadyEvent::QemuFrame(frame)),
-                None => Ok(VmnetAsyncFdReadyEvent::QemuEof),
-            }
-        }
-        ready = async_fd.readable() => {
-            let mut ready = ready?;
-            ready.clear_ready();
-            Ok(VmnetAsyncFdReadyEvent::FdReadable(source))
-        }
     }
 }
 
@@ -2331,7 +2013,10 @@ mod tests {
     async fn async_qemu_frame_harness_handles_guest_frame_and_writes_response() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut core = VmnetCore::new(gateway);
@@ -2519,7 +2204,10 @@ mod tests {
     async fn async_select_harness_receives_tcp_completion_without_wakeup_fd() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -2677,14 +2365,16 @@ mod tests {
         );
         assert!(matches!(frame, VmnetDnsServiceFrame::Queued { .. }));
 
+        let mut fd_cursor = 0;
         let event = tokio::time::timeout(
             Duration::from_secs(1),
-            next_async_owner_event(
+            next_async_owner_event_with_fd_snapshot(
                 &mut runtime_io,
                 &mut dns_worker,
                 &mut tcp_worker,
                 Some(Duration::from_secs(30)),
-                None,
+                &[],
+                &mut fd_cursor,
             ),
         )
         .await
@@ -2720,14 +2410,16 @@ mod tests {
         )
         .expect("async tcp worker");
 
+        let mut fd_cursor = 0;
         let event = tokio::time::timeout(
             Duration::from_secs(1),
-            next_async_owner_event(
+            next_async_owner_event_with_fd_snapshot(
                 &mut runtime_io,
                 &mut dns_worker,
                 &mut tcp_worker,
                 Some(Duration::from_millis(1)),
-                None,
+                &[],
+                &mut fd_cursor,
             ),
         )
         .await
@@ -2978,18 +2670,21 @@ mod tests {
         )
         .expect("async tcp worker");
 
+        let mut fd_cursor = 0;
+        let registrations = [VmnetAsyncFdRegistration {
+            source: VmnetEventSource::HostListener(0),
+            fd: listener_fd,
+            interest: VmnetAsyncFdInterest::READABLE,
+        }];
         let event = tokio::time::timeout(
             Duration::from_secs(1),
-            next_async_owner_event(
+            next_async_owner_event_with_fd_snapshot(
                 &mut runtime_io,
                 &mut dns_worker,
                 &mut tcp_worker,
                 Some(Duration::from_secs(30)),
-                Some(VmnetAsyncFdRegistration {
-                    source: VmnetEventSource::HostListener(0),
-                    fd: listener_fd,
-                    interest: VmnetAsyncFdInterest::READABLE,
-                }),
+                &registrations,
+                &mut fd_cursor,
             ),
         )
         .await
@@ -3041,18 +2736,21 @@ mod tests {
         std::io::Write::write_all(&mut host_writer, b"host-ready")
             .expect("write host readiness byte");
 
+        let mut fd_cursor = 0;
+        let host_registrations = [VmnetAsyncFdRegistration {
+            source: VmnetEventSource::HostSession(handle),
+            fd: host_reader.as_raw_fd(),
+            interest: VmnetAsyncFdInterest::READABLE,
+        }];
         let event = tokio::time::timeout(
             Duration::from_secs(1),
-            next_async_owner_event(
+            next_async_owner_event_with_fd_snapshot(
                 &mut runtime_io,
                 &mut dns_worker,
                 &mut tcp_worker,
                 Some(Duration::from_secs(30)),
-                Some(VmnetAsyncFdRegistration {
-                    source: VmnetEventSource::HostSession(handle),
-                    fd: host_reader.as_raw_fd(),
-                    interest: VmnetAsyncFdInterest::READABLE,
-                }),
+                &host_registrations,
+                &mut fd_cursor,
             ),
         )
         .await
@@ -3077,18 +2775,20 @@ mod tests {
             .expect("upstream reader nonblocking");
         std::io::Write::write_all(&mut upstream_writer, b"upstream-ready")
             .expect("write upstream readiness byte");
+        let upstream_registrations = [VmnetAsyncFdRegistration {
+            source: VmnetEventSource::UpstreamSession(handle),
+            fd: upstream_reader.as_raw_fd(),
+            interest: VmnetAsyncFdInterest::READABLE,
+        }];
         let event = tokio::time::timeout(
             Duration::from_secs(1),
-            next_async_owner_event(
+            next_async_owner_event_with_fd_snapshot(
                 &mut runtime_io,
                 &mut dns_worker,
                 &mut tcp_worker,
                 Some(Duration::from_secs(30)),
-                Some(VmnetAsyncFdRegistration {
-                    source: VmnetEventSource::UpstreamSession(handle),
-                    fd: upstream_reader.as_raw_fd(),
-                    interest: VmnetAsyncFdInterest::READABLE,
-                }),
+                &upstream_registrations,
+                &mut fd_cursor,
             ),
         )
         .await
@@ -3196,7 +2896,10 @@ mod tests {
     async fn async_service_completion_select_receives_tcp_without_wakeup_fd() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3258,145 +2961,6 @@ mod tests {
         assert_eq!(proxy.session_handles(), vec![active.handle]);
         dns_worker.shutdown().await.expect("dns worker shutdown");
         tcp_worker.shutdown().await.expect("tcp worker shutdown");
-    }
-
-    #[tokio::test]
-    async fn async_select_harness_receives_timer_without_poller() {
-        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
-        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
-
-        let event = tokio::time::timeout(
-            Duration::from_secs(1),
-            next_async_qemu_or_timer_event(&mut runtime_io, Some(Duration::from_millis(1))),
-        )
-        .await
-        .expect("select timeout")
-        .expect("select event");
-
-        assert_eq!(event, VmnetAsyncQemuTimerEvent::Timer);
-    }
-
-    #[tokio::test]
-    async fn async_select_harness_prefers_ready_qemu_frame_over_later_timer() {
-        let (mut guest_stream, runtime_stream) = tokio::io::duplex(4096);
-        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
-        let frame = test_support::tcp_syn_frame(PUBLIC_IP, 80);
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(&(frame.len() as u32).to_be_bytes());
-        encoded.extend_from_slice(&frame);
-        tokio::io::AsyncWriteExt::write_all(&mut guest_stream, &encoded)
-            .await
-            .expect("write qemu frame");
-
-        let event = tokio::time::timeout(
-            Duration::from_secs(1),
-            next_async_qemu_or_timer_event(&mut runtime_io, Some(Duration::from_secs(30))),
-        )
-        .await
-        .expect("select timeout")
-        .expect("select event");
-
-        assert_eq!(event, VmnetAsyncQemuTimerEvent::QemuFrame(frame));
-    }
-
-    #[tokio::test]
-    async fn async_fd_harness_reports_host_listener_accept_readiness_without_poller() {
-        let listeners = HostIngressListenerSet::bind(&[HostListener {
-            host_addr: "127.0.0.1".to_string(),
-            host_port: 0,
-            guest_port: 8080,
-            purpose: HostListenerPurpose::PublishedTcp,
-        }])
-        .expect("bind host listener");
-        let addr = listeners
-            .local_addrs()
-            .expect("listener local addr")
-            .into_iter()
-            .next()
-            .expect("listener addr");
-        let listener_fd = listeners
-            .listener_fds()
-            .into_iter()
-            .next()
-            .expect("listener fd");
-        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
-        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
-        let connect = tokio::spawn(async move {
-            tokio::net::TcpStream::connect(addr)
-                .await
-                .expect("connect to host listener")
-        });
-
-        let event = tokio::time::timeout(
-            Duration::from_secs(1),
-            next_async_qemu_or_fd_readable(
-                &mut runtime_io,
-                VmnetEventSource::HostListener(0),
-                listener_fd,
-            ),
-        )
-        .await
-        .expect("listener readiness timeout")
-        .expect("listener readiness event");
-
-        assert_eq!(
-            event,
-            VmnetAsyncFdReadyEvent::FdReadable(VmnetEventSource::HostListener(0))
-        );
-        let batch = listeners.accept_ready_limited(0, 1);
-        assert_eq!(batch.accepted.len(), 1);
-        let accepted = batch
-            .accepted
-            .into_iter()
-            .next()
-            .expect("accepted")
-            .expect("accepted connection");
-        assert_eq!(accepted.guest_port, 8080);
-        assert_eq!(accepted.purpose, HostListenerPurpose::PublishedTcp);
-        drop(accepted);
-        connect.await.expect("connect task");
-    }
-
-    #[tokio::test]
-    async fn async_fd_harness_reports_host_session_readiness_without_poller() {
-        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().expect("stream pair");
-        writer.set_nonblocking(true).expect("writer nonblocking");
-        reader.set_nonblocking(true).expect("reader nonblocking");
-        std::io::Write::write_all(&mut writer, b"host-ready").expect("write readiness byte");
-        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
-        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
-        let source = VmnetEventSource::HostSession(smoltcp::iface::SocketHandle::default());
-
-        let event = tokio::time::timeout(
-            Duration::from_secs(1),
-            next_async_qemu_or_fd_readable(&mut runtime_io, source, reader.as_raw_fd()),
-        )
-        .await
-        .expect("fd readiness timeout")
-        .expect("fd readiness event");
-
-        assert_eq!(event, VmnetAsyncFdReadyEvent::FdReadable(source));
-    }
-
-    #[tokio::test]
-    async fn async_fd_harness_reports_upstream_session_readiness_without_poller() {
-        let (mut writer, reader) = std::os::unix::net::UnixStream::pair().expect("stream pair");
-        writer.set_nonblocking(true).expect("writer nonblocking");
-        reader.set_nonblocking(true).expect("reader nonblocking");
-        std::io::Write::write_all(&mut writer, b"upstream-ready").expect("write readiness byte");
-        let (_guest_stream, runtime_stream) = tokio::io::duplex(4096);
-        let mut runtime_io = QemuFrameIo::new(runtime_stream, DEFAULT_MAX_FRAME_LEN);
-        let source = VmnetEventSource::UpstreamSession(smoltcp::iface::SocketHandle::default());
-
-        let event = tokio::time::timeout(
-            Duration::from_secs(1),
-            next_async_qemu_or_fd_readable(&mut runtime_io, source, reader.as_raw_fd()),
-        )
-        .await
-        .expect("fd readiness timeout")
-        .expect("fd readiness event");
-
-        assert_eq!(event, VmnetAsyncFdReadyEvent::FdReadable(source));
     }
 
     #[test]
@@ -3553,7 +3117,10 @@ mod tests {
     fn tcp_connect_completion_success_is_applied_on_owner() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3616,7 +3183,10 @@ mod tests {
     fn tcp_connect_completion_failure_closes_guest_on_owner() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3676,7 +3246,10 @@ mod tests {
     async fn async_tcp_connect_worker_submission_marks_pending_and_skips_sync_connect() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3721,7 +3294,10 @@ mod tests {
     async fn slow_async_tcp_connect_worker_does_not_block_unrelated_tcp_syn() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3813,7 +3389,10 @@ mod tests {
     async fn async_tcp_connect_worker_runtime_helper_applies_owner_side_success() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3925,7 +3504,10 @@ mod tests {
     fn tcp_worker_disconnect_fails_pending_connects_closed_on_owner() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -3985,7 +3567,10 @@ mod tests {
     fn stream_runtime_pumps_gateway_and_http_proxy_until_eof() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut core = VmnetCore::new(gateway);
@@ -4028,7 +3613,10 @@ mod tests {
     fn proxy_pump_can_deliver_delayed_upstream_response_without_guest_frame() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut core = VmnetCore::new(gateway);

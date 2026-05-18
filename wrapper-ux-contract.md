@@ -26,24 +26,28 @@ The wrapper is built around these user jobs:
 
 ## Project State
 
-All durable project state lives under `.sandbox/`.
+AgentVM-owned sandbox state lives under `.sandbox/`; setup-tool installation declarations live in the project-root `mise.toml` so normal mise discovery works. Optional guest-mirrored service logs use `.vmlogs/` only when `--mirror-guest-logs` is passed.
 
 ```text
+mise.toml
 .sandbox/
   config.json
-  home/
   docker-vm/
+.vmlogs/        # optional, only with --mirror-guest-logs
 ```
 
 `.sandbox/config.json` is the durable source of truth for configurable sandbox
 behavior: default command, setup recipe, tool state, network mode, network
 allowlists, auth sharing, extra shares, and published guest ports. Its full file
 format is documented in `vm-frontend/config-json.md`. Normal launch flags are
-one-run overrides and do not persist.
+one-run overrides and do not persist. The guest workspace hides `.sandbox/` so
+implementation state is not exposed inside the VM. Guest service log mirroring is
+off by default; `--mirror-guest-logs` enables guest writes under project
+`.vmlogs/` for debugging.
 
 The TUI may write `config.json` only after an explicit user action such as
-accepting setup or saving edits. A configured project must not ask setup
-questions again just because `agentvm` was restarted.
+saving edits. A configured project must not ask setup questions again just
+because `agentvm` was restarted.
 
 ## First Run
 
@@ -57,15 +61,16 @@ agentvm --setup-tool pi
 `--setup-tool codex` is a convenience operation: it writes a Codex-oriented
 `config.json` with default command `codex --dangerously-bypass-approvals-and-sandbox`,
 explicit writable `~/.codex` share configuration with project-local shadow
-backing for volatile children, and writes `.sandbox/mise.toml` declaring the
-Codex npm tool.
+backing for volatile children, and writes project-root `mise.toml` declaring
+the Codex npm tool.
 
 `--setup-tool pi` likewise writes a Pi-oriented `config.json` with default
 command `pi`, explicit writable `~/.pi` share configuration, and writes
-`.sandbox/mise.toml` declaring `@mariozechner/pi-coding-agent`.
+project-root `mise.toml` declaring `@mariozechner/pi-coding-agent`.
 
-Interactive setup can be offered by the TUI when no config exists. Non-TTY mode
-must fail with an actionable message rather than prompting.
+If no config or command override exists, `agentvm` launches `bash` without
+persisting config. Known agent setup remains opt-in through `--setup-tool` or
+explicit config editing.
 
 ## Normal Launch
 
@@ -77,6 +82,7 @@ agentvm
 
 The wrapper reads `.sandbox/config.json`, starts the project VM, applies the
 configured network/auth/share policy, and runs the configured default command.
+If no config exists and no command override was supplied, it starts `bash`.
 
 `agentvm-frontend wrap` remains a compatibility path for development, but help
 and user docs should prefer `agentvm`.
@@ -154,8 +160,9 @@ additional shares, published ports, and reset/reinitialize choices.
 agentvm --reset
 ```
 
-Reset removes `.sandbox/`, including `config.json`, guest home, Docker state,
-runtime logs, and tool state. It must refuse while a project VM lock is held.
+Reset removes `.sandbox/`, including `config.json`, Docker state, runtime logs,
+and project-local share shadows. It does not remove project-root `mise.toml`.
+It must refuse while a project VM lock is held.
 
 ## Unresolved Decisions
 

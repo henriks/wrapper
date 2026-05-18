@@ -3,6 +3,7 @@ set -eu
 
 if [ "${AGENTVM_GUEST_INIT_SOURCE_ONLY:-0}" = "1" ] && [ ! -f /etc/agentvm.env ]; then
   DOCKER_TCP_PORT=1075
+  DOCKER_STORAGE_DRIVER=vfs
   PAYLOAD_TCP_PORT=1076
   VIRTIOFS_TAG=workspace
   CONFIG_VIRTIOFS_TAG=agentvm-config
@@ -14,18 +15,19 @@ fi
 
 ROOT_OVERLAY_LOWER_DEVICE=${ROOT_OVERLAY_LOWER_DEVICE:-/dev/vda}
 ROOT_OVERLAY_STATE_DEVICE=${ROOT_OVERLAY_STATE_DEVICE:-/dev/vdb}
+DOCKER_STORAGE_DRIVER=${DOCKER_STORAGE_DRIVER:-vfs}
 
 readonly DOCKER_TCP_PORT
+readonly DOCKER_STORAGE_DRIVER
 readonly PAYLOAD_TCP_PORT
 readonly VIRTIOFS_TAG
 readonly CONFIG_VIRTIOFS_TAG
 readonly ROOT_OVERLAY_LOWER_DEVICE
 readonly ROOT_OVERLAY_STATE_DEVICE
 readonly GUEST_DOCKERD_LOG=/run/dockerd.log
-readonly GUEST_SOCKET_BRIDGE_LOG=/run/socket-bridge.log
+readonly GUEST_DOCKER_BRIDGE_LOG=/run/docker-bridge.log
 readonly GUEST_PAYLOAD_SERVER_LOG=/run/payload-server.log
-readonly GUEST_PAYLOAD_SERVER_PATH=/usr/local/libexec/agentvm-payload-server
-readonly GUEST_RUST_SERVICE_PATH=/usr/local/libexec/agentvm-guest-service
+readonly GUEST_SERVICE_PATH=/usr/local/libexec/agentvm-guest-service
 readonly DOCKER_SOCK=/var/run/docker.sock
 
 log() {
@@ -81,17 +83,64 @@ setup_root_overlay() {
     chroot /run/agentvm-newroot /usr/local/sbin/agentvm-init
 }
 
-get_cmdline_value() {
-  key="$1"
-  for arg in $(cat /proc/cmdline); do
-    case "${arg}" in
-      "${key}"=*)
-        printf '%s\n' "${arg#${key}=}"
-        return 0
-        ;;
-    esac
-  done
-  return 1
+load_launch_config() {
+  launch_config=${AGENTVM_LAUNCH_CONFIG:-/run/agentvm-config/launch.json}
+  [ -f "${launch_config}" ] || {
+    log "error: missing launch config ${launch_config}"
+    return 1
+  }
+  launch_env=$(python3 - "${launch_config}" <<'PY'
+import json
+import shlex
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    config = json.load(f)
+
+if config.get("schema_version") != 1:
+    raise SystemExit(f"unsupported launch config schema_version: {config.get('schema_version')!r}")
+
+network = config.get("network")
+if not isinstance(network, dict):
+    raise SystemExit("launch config network must be an object")
+
+def required_str(mapping, key):
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value:
+        raise SystemExit(f"launch config {key} must be a non-empty string")
+    return value
+
+def optional_str(mapping, key):
+    value = mapping.get(key)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise SystemExit(f"launch config {key} must be a string")
+    return value
+
+def emit(name, value):
+    print(f"{name}={shlex.quote(str(value))}")
+
+project_path = required_str(config, "project_path")
+prefix_len = network.get("prefix_len")
+if not isinstance(prefix_len, int):
+    raise SystemExit("launch config prefix_len must be an integer")
+
+emit("PROJECT_PATH", project_path)
+emit("GUEST_IP", required_str(network, "guest_ip"))
+emit("GATEWAY_IP", required_str(network, "gateway_ip"))
+emit("PREFIX_LEN", prefix_len)
+emit("DNS_IP", required_str(network, "dns_ip"))
+emit("GUEST_MAC", required_str(network, "guest_mac"))
+emit("HTTP_SMOKE_URL", optional_str(config, "http_smoke_url"))
+emit("GUEST_LOG_DIR", optional_str(config, "guest_log_dir"))
+PY
+) || {
+    log "error: failed to parse launch config ${launch_config}"
+    return 1
+  }
+  eval "${launch_env}"
 }
 
 find_iface_by_mac() {
@@ -113,6 +162,25 @@ load_kernel_module() {
   else
     log "warning: failed to load kernel module ${module}"
   fi
+}
+
+disable_ipv6_for() {
+  target="$1"
+  path="/proc/sys/net/ipv6/conf/${target}/disable_ipv6"
+  if [ -w "${path}" ]; then
+    if printf '1\n' >"${path}"; then
+      log "disabled IPv6 for ${target}"
+    else
+      log "warning: failed to disable IPv6 for ${target}"
+    fi
+  elif [ -e "${path}" ]; then
+    log "warning: IPv6 disable knob is not writable for ${target}"
+  fi
+}
+
+disable_guest_ipv6_defaults() {
+  disable_ipv6_for all
+  disable_ipv6_for default
 }
 
 install_mitm_ca() {
@@ -295,29 +363,12 @@ wait_for_docker_ready() {
 }
 
 payload_server_command() {
-  service="${1:-python}"
-  case "${service}" in
-    ""|python)
-      printf '%s\n' "python3 -u ${GUEST_PAYLOAD_SERVER_PATH}"
-      ;;
-    rust)
-      if [ ! -x "${GUEST_RUST_SERVICE_PATH}" ]; then
-        log "error: rust payload service requested but ${GUEST_RUST_SERVICE_PATH} is not executable"
-        return 1
-      fi
-      printf '%s\n' "${GUEST_RUST_SERVICE_PATH}"
-      ;;
-    *)
-      log "error: unsupported payload service '${service}'"
-      return 1
-      ;;
-  esac
+  printf '%s\n' "${GUEST_SERVICE_PATH}"
 }
 
 start_payload_server() {
-  service="${1:-python}"
-  command_prefix=$(payload_server_command "${service}") || return 1
-  log "starting ${service:-python} payload server"
+  command_prefix=$(payload_server_command) || return 1
+  log "starting rust payload server"
   # shellcheck disable=SC2086
   ${command_prefix} \
     --tcp-host 0.0.0.0 \
@@ -355,26 +406,7 @@ main() {
 trap teardown INT TERM HUP
 setup_root_overlay
 
-PROJECT_PATH=$(get_cmdline_value agentvm_project || true)
-GUEST_IP=$(get_cmdline_value agentvm_guest_ip || true)
-GATEWAY_IP=$(get_cmdline_value agentvm_gateway_ip || true)
-PREFIX_LEN=$(get_cmdline_value agentvm_prefix_len || true)
-DNS_IP=$(get_cmdline_value agentvm_dns || true)
-GUEST_MAC=$(get_cmdline_value agentvm_guest_mac || true)
-HTTP_SMOKE_URL=$(get_cmdline_value agentvm_http_smoke_url || true)
-PAYLOAD_SERVICE=$(get_cmdline_value agentvm_payload_service || true)
-if [ -z "${PROJECT_PATH}" ]; then
-  PROJECT_PATH=/workspace
-fi
-case "${PROJECT_PATH}" in
-  /*) ;;
-  *)
-    log "warning: invalid project path '${PROJECT_PATH}', falling back to /workspace"
-    PROJECT_PATH=/workspace
-    ;;
-esac
-
-mkdir -p /proc /sys /dev /dev/pts /run /tmp /home /workspace /var/lib/docker /var/log /sys/fs/cgroup
+mkdir -p /proc /sys /dev /dev/pts /run /tmp /home /var/lib/docker /var/log /sys/fs/cgroup
 mount -t proc proc /proc || true
 mount -t sysfs sysfs /sys || true
 mount -t devtmpfs devtmpfs /dev || true
@@ -385,27 +417,37 @@ mount -t tmpfs tmpfs /run
 mount -t tmpfs tmpfs /tmp
 mkdir -p /run/agentvm-config /run/agentvm-share-mnts
 mount -t virtiofs "${CONFIG_VIRTIOFS_TAG}" /run/agentvm-config
+load_launch_config
 
 case "${PROJECT_PATH}" in
-  /home/*|/tmp/*|/workspace)
+  /home/*|/tmp/*)
     ;;
   *)
-    log "warning: unsupported guest project path '${PROJECT_PATH}', falling back to /workspace"
-    PROJECT_PATH=/workspace
+    log "error: unsupported guest project path '${PROJECT_PATH}'; project path must be under /home or /tmp"
+    exit 1
     ;;
 esac
 
-HOST_RUN_DIR=${PROJECT_PATH}/.sandbox/docker-vm/run
-HOST_DOCKERD_LOG=${HOST_RUN_DIR}/guest-dockerd.log
-HOST_SOCKET_BRIDGE_LOG=${HOST_RUN_DIR}/guest-socket-bridge.log
-HOST_PAYLOAD_SERVER_LOG=${HOST_RUN_DIR}/guest-payload-server.log
-readonly \
-  PROJECT_PATH \
-  PAYLOAD_SERVICE \
-  HOST_RUN_DIR \
-  HOST_DOCKERD_LOG \
-  HOST_SOCKET_BRIDGE_LOG \
-  HOST_PAYLOAD_SERVER_LOG
+GUEST_LOG_DIR=${GUEST_LOG_DIR:-}
+if [ -n "${GUEST_LOG_DIR}" ]; then
+  case "${GUEST_LOG_DIR}" in
+    /home/*|/tmp/*)
+      ;;
+    *)
+      log "error: unsupported guest log dir '${GUEST_LOG_DIR}'; guest log dir must be under /home or /tmp"
+      exit 1
+      ;;
+  esac
+fi
+readonly PROJECT_PATH GUEST_LOG_DIR
+
+HTTP_SMOKE_LOG=/run/guest-http-smoke.log
+if [ -n "${GUEST_LOG_DIR}" ]; then
+  HOST_RUN_DIR=${GUEST_LOG_DIR}
+  HOST_DOCKERD_LOG=${HOST_RUN_DIR}/guest-dockerd.log
+  HOST_DOCKER_BRIDGE_LOG=${HOST_RUN_DIR}/guest-docker-bridge.log
+  HOST_PAYLOAD_SERVER_LOG=${HOST_RUN_DIR}/guest-payload-server.log
+fi
 
 [ -f /run/agentvm-config/composed-binds.json ] || {
   log "error: missing composed bind manifest"
@@ -413,22 +455,25 @@ readonly \
 }
 mount_composed_export
 install_mitm_ca
-if [ "${PROJECT_PATH}" != "/workspace" ]; then
-  mount --bind "${PROJECT_PATH}" /workspace
+if [ -n "${GUEST_LOG_DIR}" ]; then
+  mkdir -p "${HOST_RUN_DIR}"
+  touch "${HOST_DOCKERD_LOG}" "${HOST_DOCKER_BRIDGE_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
+  mirror_log_to_workspace "${GUEST_DOCKERD_LOG}" "${HOST_DOCKERD_LOG}"
+  mirror_log_to_workspace "${GUEST_DOCKER_BRIDGE_LOG}" "${HOST_DOCKER_BRIDGE_LOG}"
+  mirror_log_to_workspace "${GUEST_PAYLOAD_SERVER_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
+  HTTP_SMOKE_LOG=${HOST_RUN_DIR}/guest-http-smoke.log
+  log "mirroring guest service logs to ${HOST_RUN_DIR}"
 fi
-mkdir -p "${HOST_RUN_DIR}"
-touch "${HOST_DOCKERD_LOG}" "${HOST_SOCKET_BRIDGE_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
-mirror_log_to_workspace "${GUEST_DOCKERD_LOG}" "${HOST_DOCKERD_LOG}"
-mirror_log_to_workspace "${GUEST_SOCKET_BRIDGE_LOG}" "${HOST_SOCKET_BRIDGE_LOG}"
-mirror_log_to_workspace "${GUEST_PAYLOAD_SERVER_LOG}" "${HOST_PAYLOAD_SERVER_LOG}"
 
 modprobe overlay || true
 load_kernel_module virtio_net
+disable_guest_ipv6_defaults
 ip link set lo up || true
 
 if [ -n "${GUEST_IP}" ] && [ -n "${GATEWAY_IP}" ] && [ -n "${PREFIX_LEN}" ] && [ -n "${GUEST_MAC}" ]; then
   IFACE=$(find_iface_by_mac "${GUEST_MAC}" || true)
   if [ -n "${IFACE}" ]; then
+    disable_ipv6_for "${IFACE}"
     ip link set "${IFACE}" up
     ip addr add "${GUEST_IP}/${PREFIX_LEN}" dev "${IFACE}" || true
     ip route replace default via "${GATEWAY_IP}" dev "${IFACE}" || true
@@ -444,7 +489,7 @@ fi
 if [ -n "${HTTP_SMOKE_URL}" ]; then
   log "running HTTP smoke request to ${HTTP_SMOKE_URL}"
   if wget -S -O /run/agentvm-http-smoke.out "${HTTP_SMOKE_URL}" \
-      >"${HOST_RUN_DIR}/guest-http-smoke.log" 2>&1; then
+      >"${HTTP_SMOKE_LOG}" 2>&1; then
     log "HTTP smoke request completed"
   else
     log "warning: HTTP smoke request failed"
@@ -456,6 +501,7 @@ dockerd \
   --host=unix://${DOCKER_SOCK} \
   --data-root=/var/lib/docker \
   --exec-root=/run/docker \
+  --storage-driver="${DOCKER_STORAGE_DRIVER}" \
   >"${GUEST_DOCKERD_LOG}" 2>&1 &
 DOCKERD_PID=$!
 
@@ -465,15 +511,15 @@ if ! wait_for_docker_ready "${DOCKER_SOCK}" "${DOCKERD_PID}"; then
   exit 1
 fi
 
-log "starting socket bridge"
-python3 -u /usr/local/libexec/agentvm-socket-bridge \
+log "starting Docker bridge"
+"${GUEST_SERVICE_PATH}" docker-bridge \
   --tcp-host 0.0.0.0 \
   --tcp-port "${DOCKER_TCP_PORT}" \
   --docker-sock "${DOCKER_SOCK}" \
-  >"${GUEST_SOCKET_BRIDGE_LOG}" 2>&1 &
+  >"${GUEST_DOCKER_BRIDGE_LOG}" 2>&1 &
 BRIDGE_PID=$!
 
-if ! start_payload_server "${PAYLOAD_SERVICE:-python}"; then
+if ! start_payload_server; then
   teardown
   exit 1
 fi
@@ -481,7 +527,7 @@ fi
 wait_for_critical_exit
 log "critical service exited"
 dump_log_if_present "${GUEST_DOCKERD_LOG}" dockerd.log
-dump_log_if_present "${GUEST_SOCKET_BRIDGE_LOG}" socket-bridge.log
+dump_log_if_present "${GUEST_DOCKER_BRIDGE_LOG}" docker-bridge.log
 dump_log_if_present "${GUEST_PAYLOAD_SERVER_LOG}" payload-server.log
 teardown
 

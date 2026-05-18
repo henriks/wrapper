@@ -1,6 +1,8 @@
 
 .sandbox/
 .agentvm-self-test-sqlite/
+/.ralph/
+/.codex
 __pycache__/
 composed-fs/target/
 vm-frontend/target/

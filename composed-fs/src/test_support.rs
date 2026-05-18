@@ -1,18 +1,17 @@
-#![allow(dead_code)]
-
 use std::fs;
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 use tempfile::TempDir;
-use virtiofsd::filesystem::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter, ROOT_ID};
+use virtiofsd::filesystem::{Context, Entry, FileSystem, ZeroCopyReader, ZeroCopyWriter};
 use virtiofsd::oslib::{ReadvFlags, WritevFlags};
 use virtiofsd::soft_idmap::{GuestGid, GuestUid};
 
+use crate::manifest::AccessMode;
 use crate::{
-    AccessMode, ComposedFs, FilterSpec, Manifest, MetadataPolicy, MetadataSpec, MountKind,
-    MountSpec, Namespace, SourceClass, SyntheticSpec, DEFAULT_TAG, SCHEMA_VERSION,
+    ComposedFs, FilterSpec, Manifest, MetadataPolicy, MetadataSpec, MountKind, MountSpec,
+    SourceClass, SyntheticSpec, DEFAULT_TAG, SCHEMA_VERSION,
 };
 
 pub(crate) struct TestDir {
@@ -28,6 +27,7 @@ impl TestDir {
         Self { dir }
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         self.dir.path()
     }
@@ -37,6 +37,7 @@ impl TestDir {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct GuestShareFixture {
     pub(crate) root: TestDir,
     pub(crate) workspace: PathBuf,
@@ -44,6 +45,7 @@ pub(crate) struct GuestShareFixture {
     pub(crate) config: PathBuf,
 }
 
+#[cfg(test)]
 impl GuestShareFixture {
     pub(crate) fn new(name: &str) -> Self {
         let root = TestDir::new(name);
@@ -91,7 +93,7 @@ impl GuestShareFixture {
     }
 
     pub(crate) fn filesystem(&self) -> ComposedFs {
-        let namespace = Namespace::from_manifest(&self.manifest()).expect("build namespace");
+        let namespace = crate::Namespace::from_manifest(&self.manifest()).expect("build namespace");
         ComposedFs::new(namespace)
     }
 }
@@ -108,7 +110,7 @@ pub(crate) fn manifest_with_mounts(mounts: Vec<MountSpec>) -> Manifest {
     Manifest {
         schema_version: SCHEMA_VERSION,
         export_tag: Some(DEFAULT_TAG.to_string()),
-        created_by: Some("test".to_string()),
+        created_by: Some("shared-test".to_string()),
         mounts,
         synthetic: Some(SyntheticSpec {
             uid: 0,
@@ -144,36 +146,14 @@ pub(crate) fn dir_mount(
     }
 }
 
-pub(crate) fn file_mount(
-    id: &str,
-    guest_path: &str,
-    host_path: &Path,
-    access: AccessMode,
-    source_class: SourceClass,
-) -> MountSpec {
-    MountSpec {
-        id: id.to_string(),
-        guest_path: guest_path.to_string(),
-        host_path: host_path.display().to_string(),
-        kind: MountKind::File,
-        access,
-        source_class,
-        required: true,
-        bind: true,
-        metadata: MetadataSpec {
-            uid_gid: MetadataPolicy::Host,
-            permissions: MetadataPolicy::Host,
-        },
-    }
-}
-
 pub(crate) fn lookup(fs: &ComposedFs, parent: u64, name: &str) -> io::Result<Entry> {
     let name = std::ffi::CString::new(name).expect("test name");
     fs.lookup(ctx(), parent, name.as_c_str())
 }
 
+#[cfg(test)]
 pub(crate) fn lookup_root(fs: &ComposedFs, name: &str) -> io::Result<Entry> {
-    lookup(fs, ROOT_ID, name)
+    lookup(fs, virtiofsd::filesystem::ROOT_ID, name)
 }
 
 pub(crate) struct VecReader {

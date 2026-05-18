@@ -130,7 +130,7 @@ qemu-system-x86_64 \
   -smp 2 \
   -kernel /home/hsaksela/ai/wrapper/docker/out/vmlinuz \
   -initrd /home/hsaksela/ai/wrapper/docker/out/initrd.img \
-  -append "console=ttyS0,115200n8 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet agentvm_project=/home/hsaksela/ai/wrapper agentvm_guest_ip=10.0.2.15 agentvm_gateway_ip=10.0.2.2 agentvm_prefix_len=24 agentvm_dns=10.0.2.3 agentvm_guest_mac=02:fc:12:34:56:78" \
+  -append "console=ttyS0,115200n8 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet" \
   -drive if=none,file=/home/hsaksela/ai/wrapper/docker/out/rootfs.raw,format=raw,readonly=on,id=rootfs \
   -device virtio-blk-device,drive=rootfs \
   -drive if=none,file=/tmp/agentvm-microvm/docker-data.raw,format=raw,id=dockerdata \

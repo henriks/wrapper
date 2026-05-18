@@ -1,6 +1,6 @@
 ---
 id: wra-rleu
-status: open
+status: closed
 deps: [wra-qdte]
 links: []
 created: 2026-05-16T15:50:47Z
@@ -30,3 +30,17 @@ Validation:
 - Extend existing parent-symlink-replacement tests to cover readlink and access, not just open.
 - Include fallback-mode coverage if the traversal fallback ticket changes helper behavior.
 
+
+## Notes
+
+**2026-05-18T09:32:39Z**
+
+Prerequisite wra-qdte is closed. Host traversal now requires openat2 and fails closed with EOPNOTSUPP on ENOSYS/EINVAL rather than falling back to openat; rleu can route readlink/access through confined parent resolution without preserving the old weak fallback.
+
+**2026-05-18T09:34:49Z**
+
+Iteration 39: started now that wra-qdte removed the weak openat fallback. Implementation target is the smallest consolidation: route readlink/access through existing confined parent resolver (open_beneath_with_mode via with_parent_dir) instead of adding a separate traversal path.
+
+**2026-05-18T09:38:00Z**
+
+Implemented confined parent resolution for readlink/access. readlink_beneath now opens the parent via with_parent_dir/open_beneath_with_mode before readlinkat on the leaf; access_beneath does the same for non-root paths and keeps explicit root access handling. Added parent-symlink replacement regressions for cached readlink and access. Validation passed: targeted readlink/access tests, cargo test --manifest-path composed-fs/Cargo.toml --offline -- --nocapture, and ./vm-frontend/validate.sh required (/tmp/pi-bash-970b7b9667685e04.log).

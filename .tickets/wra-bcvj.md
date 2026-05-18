@@ -1,6 +1,6 @@
 ---
 id: wra-bcvj
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-16T15:50:47Z
@@ -33,3 +33,9 @@ Validation:
 - Unlock through one path and verify host and guest conflict behavior.
 - Extend lock fuzz/property operations to include multiple handles per inode.
 
+
+## Notes
+
+**2026-05-18T09:25:59Z**
+
+Implemented lock owner sharing by keying bridged POSIX locks by underlying host file identity (dev/ino) plus guest owner instead of per-handle. Added regression for same guest owner across two handles and extended the lock proptest to exercise operations through multiple handles. Validation passed: cargo test --manifest-path composed-fs/Cargo.toml --offline -- --nocapture; ./vm-frontend/validate.sh required (/tmp/pi-bash-de557005de254a02.log).

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -11,6 +11,9 @@ use smoltcp::wire::IpAddress;
 
 use crate::guest_tcp::GuestTcpSession;
 use crate::network_policy::VmnetPolicy;
+use crate::stream_buffer::{
+    append_and_write_pending_best_effort, extend_pending_buffer, write_pending_best_effort,
+};
 use crate::tcp_gateway::{
     evaluate_tcp_destination, parse_http_request, HttpParseError, HttpRequestSummary, TcpAction,
     TcpConnectError, TcpDecision, TcpDestination, TcpUpstreamConnector,
@@ -482,13 +485,18 @@ where
         if session.decision.action == TcpAction::InterceptHttp
             || session.decision.action == TcpAction::InterceptHttps
         {
-            record_http_request(
+            if !record_http_request(
                 handle,
                 &session.destination,
                 &mut session.http_buffer,
                 &payload,
+                session.buffer_limits.http_request_bytes,
+                gateway,
+                now,
                 events,
-            );
+            ) {
+                return;
+            }
         }
 
         if payload.is_empty() {
@@ -576,7 +584,6 @@ pub(crate) struct TcpProxyPendingConnect {
 }
 
 impl TcpProxyPendingConnect {
-    #[allow(dead_code)]
     pub(crate) fn service_command(&self, token: VmnetServiceToken) -> VmnetServiceCommand {
         VmnetServiceCommand::TcpConnect(VmnetTcpConnectCommand {
             token,
@@ -601,12 +608,14 @@ struct UpstreamSession<T> {
 
 const DEFAULT_TCP_PROXY_BUFFER_LIMIT: usize = 1024 * 1024;
 const DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT: usize = 8 * 1024 * 1024;
+const DEFAULT_TCP_PROXY_HTTP_REQUEST_BUFFER_LIMIT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpProxyBufferLimits {
     pub pending_upstream_bytes: usize,
     pub pending_upstream_plaintext: usize,
     pub pending_guest_bytes: usize,
+    pub http_request_bytes: usize,
 }
 
 impl TcpProxyBufferLimits {
@@ -615,6 +624,7 @@ impl TcpProxyBufferLimits {
             pending_upstream_bytes: DEFAULT_TCP_PROXY_BUFFER_LIMIT,
             pending_upstream_plaintext,
             pending_guest_bytes: DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT,
+            http_request_bytes: DEFAULT_TCP_PROXY_HTTP_REQUEST_BUFFER_LIMIT,
         }
     }
 
@@ -626,6 +636,7 @@ impl TcpProxyBufferLimits {
             pending_upstream_bytes,
             pending_upstream_plaintext,
             pending_guest_bytes: DEFAULT_TCP_PROXY_PENDING_GUEST_BUFFER_LIMIT,
+            http_request_bytes: DEFAULT_TCP_PROXY_HTTP_REQUEST_BUFFER_LIMIT,
         }
     }
 
@@ -634,10 +645,25 @@ impl TcpProxyBufferLimits {
         pending_upstream_plaintext: usize,
         pending_guest_bytes: usize,
     ) -> Self {
+        Self::with_http_request_bytes(
+            pending_upstream_bytes,
+            pending_upstream_plaintext,
+            pending_guest_bytes,
+            DEFAULT_TCP_PROXY_HTTP_REQUEST_BUFFER_LIMIT,
+        )
+    }
+
+    pub const fn with_http_request_bytes(
+        pending_upstream_bytes: usize,
+        pending_upstream_plaintext: usize,
+        pending_guest_bytes: usize,
+        http_request_bytes: usize,
+    ) -> Self {
         Self {
             pending_upstream_bytes,
             pending_upstream_plaintext,
             pending_guest_bytes,
+            http_request_bytes,
         }
     }
 }
@@ -657,6 +683,7 @@ pub enum TcpProxyBufferKind {
     PendingUpstreamBytes,
     PendingUpstreamPlaintext,
     PendingGuestBytes,
+    HttpRequestBytes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -744,20 +771,19 @@ fn buffer_pending_upstream_bytes<T>(
     events: &mut Vec<TcpProxyEvent>,
 ) -> bool {
     let limit = session.buffer_limits.pending_upstream_bytes;
-    let attempted = session.pending_upstream_bytes.len() + bytes.len();
-    if attempted > limit {
+    if let Err(exceeded) = extend_pending_buffer(&mut session.pending_upstream_bytes, bytes, limit)
+    {
         push_buffer_limit_exceeded(
             handle,
             gateway,
             now,
             TcpProxyBufferKind::PendingUpstreamBytes,
-            limit,
-            attempted,
+            exceeded.limit,
+            exceeded.attempted,
             events,
         );
         return false;
     }
-    session.pending_upstream_bytes.extend_from_slice(bytes);
     true
 }
 
@@ -783,7 +809,7 @@ fn write_pending_upstream_bytes_best_effort<T: Write>(
         );
         return None;
     }
-    match write_buffered_best_effort(
+    match append_and_write_pending_best_effort(
         &mut session.connection,
         &mut session.pending_upstream_bytes,
         bytes,
@@ -805,20 +831,20 @@ fn buffer_pending_upstream_plaintext<T>(
     events: &mut Vec<TcpProxyEvent>,
 ) -> bool {
     let limit = session.buffer_limits.pending_upstream_plaintext;
-    let attempted = session.pending_upstream_plaintext.len() + bytes.len();
-    if attempted > limit {
+    if let Err(exceeded) =
+        extend_pending_buffer(&mut session.pending_upstream_plaintext, bytes, limit)
+    {
         push_buffer_limit_exceeded(
             handle,
             gateway,
             now,
             TcpProxyBufferKind::PendingUpstreamPlaintext,
-            limit,
-            attempted,
+            exceeded.limit,
+            exceeded.attempted,
             events,
         );
         return false;
     }
-    session.pending_upstream_plaintext.extend_from_slice(bytes);
     true
 }
 
@@ -863,20 +889,18 @@ fn queue_pending_guest_bytes<T>(
     events: &mut Vec<TcpProxyEvent>,
 ) -> bool {
     let limit = session.buffer_limits.pending_guest_bytes;
-    let attempted = session.pending_guest_bytes.len() + bytes.len();
-    if attempted > limit {
+    if let Err(exceeded) = extend_pending_buffer(&mut session.pending_guest_bytes, bytes, limit) {
         push_buffer_limit_exceeded(
             handle,
             gateway,
             now,
             TcpProxyBufferKind::PendingGuestBytes,
-            limit,
-            attempted,
+            exceeded.limit,
+            exceeded.attempted,
             events,
         );
         return false;
     }
-    session.pending_guest_bytes.extend_from_slice(bytes);
     true
 }
 
@@ -1100,10 +1124,10 @@ fn flush_pending_upstream_bytes<T: Write>(
     if session.pending_upstream_bytes.is_empty() {
         return;
     }
-    match write_buffered_best_effort(
+    match write_pending_best_effort(
         &mut session.connection,
         &mut session.pending_upstream_bytes,
-        &[],
+        usize::MAX,
     ) {
         Ok(bytes) if bytes > 0 && session.decision.action == TcpAction::InterceptHttps => {
             events.push(TcpProxyEvent::TlsUpstreamPayload { handle, bytes });
@@ -1210,10 +1234,26 @@ fn record_http_request(
     destination: &TcpDestination,
     http_buffer: &mut Vec<u8>,
     payload: &[u8],
+    limit: usize,
+    gateway: &mut VmnetGateway<'_>,
+    now: Instant,
     events: &mut Vec<TcpProxyEvent>,
-) {
+) -> bool {
     if payload.is_empty() {
-        return;
+        return true;
+    }
+    let attempted = http_buffer.len() + payload.len();
+    if attempted > limit {
+        push_buffer_limit_exceeded(
+            handle,
+            gateway,
+            now,
+            TcpProxyBufferKind::HttpRequestBytes,
+            limit,
+            attempted,
+            events,
+        );
+        return false;
     }
     http_buffer.extend_from_slice(payload);
     match parse_http_request(http_buffer) {
@@ -1227,6 +1267,7 @@ fn record_http_request(
             events.push(TcpProxyEvent::HttpRequestMalformed { handle })
         }
     }
+    true
 }
 
 fn destination_from_session(session: &GuestTcpSession) -> Option<TcpDestination> {
@@ -1236,27 +1277,6 @@ fn destination_from_session(session: &GuestTcpSession) -> Option<TcpDestination>
         port: session.local.port,
         domain: None,
     })
-}
-
-fn write_buffered_best_effort(
-    connection: &mut impl Write,
-    pending: &mut Vec<u8>,
-    bytes: &[u8],
-) -> Result<usize, String> {
-    pending.extend_from_slice(bytes);
-    let mut written = 0;
-    while !pending.is_empty() {
-        match connection.write(pending) {
-            Ok(0) => break,
-            Ok(count) => {
-                written += count;
-                pending.drain(..count);
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(written)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1329,6 +1349,7 @@ mod tests {
         EthernetAddress, EthernetFrame, EthernetProtocol, EthernetRepr, IpAddress, IpProtocol,
         Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber,
     };
+    use std::io::ErrorKind;
     use std::sync::Arc;
 
     const GUEST_MAC: EthernetAddress = EthernetAddress([0x02, 0xfc, 0x12, 0x34, 0x56, 0x78]);
@@ -1341,7 +1362,10 @@ mod tests {
     fn bridges_http_request_to_upstream_and_response_to_guest() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FakeConnector {
@@ -1422,7 +1446,10 @@ mod tests {
     fn upstream_readiness_drains_response_until_would_block() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n\r\n".to_vec();
@@ -1466,7 +1493,10 @@ mod tests {
     fn retains_guest_payload_when_tcp_send_buffer_is_full() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 131072\r\n\r\n".to_vec();
@@ -1498,7 +1528,10 @@ mod tests {
     fn readiness_buffers_guest_payload_until_upstream_socket_is_writable() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FakeConnector {
@@ -1555,7 +1588,10 @@ mod tests {
     fn fragmented_http_headers_are_buffered_until_complete() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FakeConnector {
@@ -1604,10 +1640,71 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_http_header_limit_fails_closed_before_buffering_unbounded() {
+        let network = GuestNetwork::default();
+        let mut policy = VmnetPolicy::default_sandbox(network.clone());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
+        let mut gateway =
+            VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
+        let mut bridge = TcpProxyBridge::new(FakeConnector {
+            response: Vec::new(),
+            write_would_block_count: 0,
+        })
+        .with_buffer_limits(TcpProxyBufferLimits::with_http_request_bytes(
+            1024, 1024, 1024, 16,
+        ));
+
+        let server_ack = establish_tcp_session(&mut gateway, 80);
+        let payload = b"GET /oversized HTTP/1.1\r\nHost: example";
+        gateway.handle_guest_frame(
+            tcp_frame(
+                80,
+                TcpControl::Psh,
+                TcpSeqNumber(101),
+                Some(server_ack),
+                payload,
+            ),
+            Instant::from_millis(4),
+        );
+        let events = bridge.process_gateway(&mut gateway, Instant::from_millis(5));
+
+        let limit_event = events
+            .iter()
+            .find(|event| matches!(event, TcpProxyEvent::BufferLimitExceeded { .. }))
+            .expect("buffer limit event");
+        let TcpProxyEvent::BufferLimitExceeded {
+            buffer,
+            limit,
+            attempted,
+            guest_frames,
+            ..
+        } = limit_event
+        else {
+            unreachable!();
+        };
+        assert_eq!(*buffer, TcpProxyBufferKind::HttpRequestBytes);
+        assert_eq!(*limit, 16);
+        assert!(*attempted > *limit);
+        assert!(!guest_frames.is_empty());
+        let session = bridge
+            .sessions
+            .values()
+            .next()
+            .expect("proxy session still exists until close is reaped");
+        assert!(session.http_buffer.is_empty());
+    }
+
+    #[test]
     fn guest_close_removes_proxy_session_and_interest() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FakeConnector {
@@ -1631,7 +1728,10 @@ mod tests {
     fn connect_can_be_planned_without_calling_connector() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let bridge = TcpProxyBridge::new(PanicConnector);
         let destination = TcpDestination {
             ip: Ipv4Addr::from(PUBLIC_IP.octets()),
@@ -1659,7 +1759,10 @@ mod tests {
     fn upstream_connect_failure_is_reported_without_creating_session() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FailingConnector);
@@ -1693,7 +1796,10 @@ mod tests {
     fn upstream_eof_closes_guest_session_and_removes_proxy_session() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(EofConnector);
@@ -1711,7 +1817,10 @@ mod tests {
     fn upstream_read_error_closes_guest_session_and_removes_proxy_session() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(ReadErrorConnector);
@@ -1729,7 +1838,10 @@ mod tests {
     fn upstream_write_backpressure_retains_and_flushes_guest_payload() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         let mut bridge = TcpProxyBridge::new(FakeConnector {
@@ -1880,7 +1992,7 @@ mod tests {
         ) {
             let network = GuestNetwork::default();
             let mut policy = VmnetPolicy::default_sandbox(network.clone());
-            policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+            policy.egress.allow_ip_or_cidr(PUBLIC_IP).expect("test allow ip");
             let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
                 .expect("gateway");
             establish_tcp_session(&mut gateway, 80);
@@ -1944,7 +2056,10 @@ mod tests {
     fn pending_guest_bytes_limit_does_not_reject_direct_guest_send() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -1985,7 +2100,10 @@ mod tests {
     fn pending_guest_bytes_limit_fails_closed_before_buffering() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
         establish_tcp_session(&mut gateway, 80);
@@ -2673,7 +2791,10 @@ mod tests {
     fn configured_https_gateway(ca: &TestCa) -> (VmnetGateway<'static>, TcpSeqNumber) {
         let network = Box::leak(Box::new(GuestNetwork::default()));
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         policy.tls_mitm.ca_cert_path = Some(ca.cert_path.clone());
         policy.tls_mitm.ca_key_path = Some(ca.key_path.clone());
         policy.tls_mitm.generate_per_host_certs = true;

@@ -48,7 +48,7 @@ All fields except `schema_version` have defaults when omitted.
 
 Required integer. Must be `3` for the current written format.
 
-There is no setup-tool selector or installation metadata in the durable config. `agentvm --setup-tool codex|pi` is a convenience operation: it writes normal durable defaults and shares here, and writes tool installation declarations to `.sandbox/mise.toml`. Launches that find `.sandbox/mise.toml` run `mise install` against that file before the payload and execute the payload under `mise exec`, so shells launched through the wrapper can run the declared tools normally.
+There is no setup-tool selector or installation metadata in the durable config. `agentvm --setup-tool codex|pi` is a convenience operation: it writes normal durable defaults and shares here, and writes tool installation declarations to the project-root `mise.toml`. Launches that find `mise.toml` execute the payload under `mise exec` from the project directory; `mise exec` installs missing tools as needed and makes them available to shells launched through the wrapper.
 
 ### `default_command`
 
@@ -68,7 +68,7 @@ Object with:
 - `mode`: one of `"public"`, `"none"`, or `"allowlist"`.
 - `allowed_domains`: domain allowlist entries used when mode is `"allowlist"`.
 - `allowed_hosts`: host/domain allowlist entries, currently translated like `allowed_domains`.
-- `allowed_ips`: IP or CIDR allowlist entries.
+- `allowed_ips`: IPv4 address or IPv4 CIDR allowlist entries. Values are parsed once at launch/config boundary; invalid entries fail launch with an `invalid --allow-ip` diagnostic.
 
 `"public"` allows public internet egress while still denying protected/private ranges by policy. `"none"` denies guest egress. CLI network flags override this section for one launch.
 

@@ -1,26 +1,21 @@
 use std::fs::{self, File};
 use std::future::Future;
 use std::io;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use agentvm_composed_fs::serve_vhost_user_fs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::{Child as TokioChild, Command as TokioCommand};
 use tokio::sync::watch;
-use tracing::{debug, error, info, info_span, warn};
-use wait_timeout::ChildExt;
+use tracing::{debug, info, warn};
 
 use crate::docker_proxy::{
-    run_docker_unix_proxy_async, start_docker_unix_proxy, DockerUnixProxyConfig,
-    DockerUnixProxyLimits,
+    run_docker_unix_proxy_async, DockerUnixProxyConfig, DockerUnixProxyLimits,
 };
 use crate::network_policy::{HostListenerPurpose, VmnetPolicy};
 use crate::runtime_manifest::{
@@ -33,7 +28,7 @@ use crate::supervisor::{
 use crate::supervisor_control::{
     bind_control_socket, control_socket_path, serve_control_listener_until_shutdown,
 };
-use crate::vmnet_runtime::serve_vmnet_gateway;
+use crate::vmnet_runtime::serve_vmnet_gateway_async;
 use crate::{
     FrontendConfig, GuestNetwork, ManagedTask, ProcessSpec, RuntimePaths, ToolPaths, VmArtifacts,
     VmShape,
@@ -114,6 +109,7 @@ impl ArtifactManifest {
             },
             network: computed_guest_network(repo_root),
             guest_http_smoke_url: None,
+            guest_log_dir: None,
             upstream_mappings: Vec::new(),
         })
     }
@@ -143,42 +139,28 @@ pub fn prepare_frontend_launch_with_policy(
     })
 }
 
-pub fn run_frontend_until_qemu_exit(
-    config: FrontendConfig,
-    mounts: Vec<RuntimeMount>,
-) -> Result<QemuExit, LaunchError> {
-    let policy = VmnetPolicy::default_sandbox(config.network.clone());
-    run_frontend_until_qemu_exit_with_policy(config, mounts, policy)
-}
-
-pub fn run_frontend_until_qemu_exit_with_policy(
-    config: FrontendConfig,
-    mounts: Vec<RuntimeMount>,
-    policy: VmnetPolicy,
-) -> Result<QemuExit, LaunchError> {
-    run_frontend_until_qemu_exit_with_policy_and_timeout(config, mounts, policy, None)
-}
-
-pub fn run_frontend_until_qemu_exit_with_policy_and_timeout(
-    config: FrontendConfig,
-    mounts: Vec<RuntimeMount>,
-    policy: VmnetPolicy,
-    qemu_timeout: Option<Duration>,
-) -> Result<QemuExit, LaunchError> {
-    info!(
-        run_dir = %config.runtime.run_dir.display(),
-        qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
-        "running frontend until qemu exits"
-    );
-    let running = start_frontend_with_policy(config, mounts, policy)?;
-    running.wait(qemu_timeout)
-}
-
 pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
     config: FrontendConfig,
     mounts: Vec<RuntimeMount>,
     policy: VmnetPolicy,
     qemu_timeout: Option<Duration>,
+) -> Result<QemuExit, LaunchError> {
+    run_frontend_until_qemu_exit_with_policy_and_timeout_reserving_host_ports_async(
+        config,
+        mounts,
+        policy,
+        qemu_timeout,
+        Vec::new(),
+    )
+    .await
+}
+
+pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_reserving_host_ports_async(
+    config: FrontendConfig,
+    mounts: Vec<RuntimeMount>,
+    policy: VmnetPolicy,
+    qemu_timeout: Option<Duration>,
+    reserved_host_ports: Vec<TcpListener>,
 ) -> Result<QemuExit, LaunchError> {
     info!(
         run_dir = %config.runtime.run_dir.display(),
@@ -200,11 +182,9 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
     remove_stale_socket(&control_socket_path(&config.runtime))?;
 
     let docker_tcp_port = docker_listener_tcp_port(&policy);
-    let mut supervisor_plan = config.supervisor_plan();
-    if docker_tcp_port.is_some() {
-        supervisor_plan.docker_proxy = Some(ManagedTask::DockerProxy);
-    }
-    let supervisor = Arc::new(LaunchSupervisor::new(supervisor_plan));
+    let supervisor = Arc::new(LaunchSupervisor::new(supervisor_plan_with_policy(
+        &config, &policy,
+    )));
     let control_socket = control_socket_path(&config.runtime);
     let control_listener =
         bind_control_socket(&control_socket).map_err(supervisor_control_error)?;
@@ -242,13 +222,15 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
     let vmnet_controller = required_task_controller(&supervisor, SupervisorTaskName::VmnetGateway)?;
     let mut vmnet_config = config.vmnet_gateway_config();
     vmnet_config.policy = policy.clone();
+    drop(reserved_host_ports);
     services.push(
-        spawn_supervised_blocking_service_until_ready(
+        spawn_supervised_async_service_until_ready(
             &config.runtime.vmnet_sock,
             SOCKET_WAIT_TIMEOUT,
             &vmnet_controller,
-            move || {
-                serve_vmnet_gateway(vmnet_config)
+            move |_shutdown| async move {
+                serve_vmnet_gateway_async(vmnet_config)
+                    .await
                     .map(|_| ())
                     .map_err(|error| format!("{error:?}"))
             },
@@ -288,15 +270,15 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
         _ => unreachable!("supervisor qemu task must be a child process"),
     };
     let qemu_controller = required_task_controller(&supervisor, SupervisorTaskName::Qemu)?;
-    let qemu_result = run_supervised_qemu_process_with_services_and_shutdown_async(
-        &config,
-        &policy,
-        &process,
+    let qemu_result = run_supervised_qemu_lifecycle_async(SupervisedQemuLifecycle {
+        config: &config,
+        policy: &policy,
+        process: &process,
         qemu_timeout,
-        &qemu_controller,
+        controller: &qemu_controller,
         services,
-        Some(supervisor.subscribe_shutdown()),
-    )
+        shutdown_rx: Some(supervisor.subscribe_shutdown()),
+    })
     .await;
     if !supervisor.shutdown_requested() {
         supervisor.request_shutdown("launch completed");
@@ -308,267 +290,24 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
     qemu_result
 }
 
-pub struct RunningFrontend {
-    config: FrontendConfig,
-    policy: VmnetPolicy,
-    child: std::process::Child,
-    shutting_down: Arc<AtomicBool>,
-    finished: bool,
-}
-
-impl RunningFrontend {
-    pub fn qemu_pid(&self) -> u32 {
-        self.child.id()
+fn supervisor_plan_with_policy(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+) -> crate::SupervisorPlan {
+    let mut plan = config.supervisor_plan();
+    if let ManagedTask::VmnetGateway(vmnet) = &mut plan.vmnet {
+        vmnet.policy = policy.clone();
     }
-
-    pub fn wait(mut self, qemu_timeout: Option<Duration>) -> Result<QemuExit, LaunchError> {
-        info!(
-            qemu_pid = self.child.id(),
-            qemu_timeout_seconds = qemu_timeout.map(|timeout| timeout.as_secs()),
-            "waiting for qemu"
-        );
-        let qemu_exit = wait_for_qemu(&mut self.child, qemu_timeout)?;
-        self.finish(qemu_exit)
+    if docker_listener_tcp_port(policy).is_some() {
+        plan.docker_proxy = Some(ManagedTask::DockerProxy);
     }
-
-    pub fn terminate(mut self) -> Result<QemuExit, LaunchError> {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        info!(qemu_pid = self.child.id(), "terminating frontend");
-        if self.child.try_wait()?.is_none() {
-            self.child.kill()?;
-        }
-        let status = self.child.wait()?;
-        self.finish(QemuExit {
-            status,
-            timed_out: false,
-        })
-    }
-
-    fn finish(mut self, qemu_exit: QemuExit) -> Result<QemuExit, LaunchError> {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        let state_status = if qemu_exit.timed_out {
-            "timed_out"
-        } else {
-            "exited"
-        };
-        let qemu_status = qemu_exit.status.to_string();
-        info!(
-            qemu_status = %qemu_exit.status,
-            timed_out = qemu_exit.timed_out,
-            launch_state = state_status,
-            "frontend finished"
-        );
-        write_launch_state(
-            &self.config,
-            state_status,
-            None,
-            Some(&qemu_status),
-            Some(&self.policy),
-        )?;
-        self.finished = true;
-        Ok(qemu_exit)
-    }
-}
-
-impl Drop for RunningFrontend {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        self.shutting_down.store(true, Ordering::SeqCst);
-        let status = match self.child.try_wait() {
-            Ok(Some(status)) => Some(status.to_string()),
-            Ok(None) => {
-                let _ = self.child.kill();
-                self.child.wait().ok().map(|status| status.to_string())
-            }
-            Err(error) => Some(format!("cleanup status unavailable: {error}")),
-        };
-        warn!(
-            qemu_status = status.as_deref(),
-            "dropping unfinished frontend; wrote terminated launch state"
-        );
-        let _ = write_launch_state(
-            &self.config,
-            "terminated",
-            None,
-            status.as_deref(),
-            Some(&self.policy),
-        );
-    }
-}
-
-pub fn start_frontend_with_policy(
-    config: FrontendConfig,
-    mounts: Vec<RuntimeMount>,
-    policy: VmnetPolicy,
-) -> Result<RunningFrontend, LaunchError> {
-    let span = info_span!(
-        "frontend.launch",
-        run_dir = %config.runtime.run_dir.display(),
-        state_disk = %config.runtime.state_disk.display(),
-        vmnet_socket = %config.runtime.vmnet_sock.display(),
-    );
-    let _span_guard = span.enter();
-    info!(mount_count = mounts.len(), "starting frontend services");
-    ensure_state_disk(&config.runtime.state_disk)?;
-    validate_launch_inputs(&config)?;
-    write_launch_state(&config, "starting", None, None, Some(&policy))?;
-    prepare_frontend_launch_with_policy(&config, &mounts, &policy)?;
-    remove_stale_socket(&config.runtime.composed_fs_sock)?;
-    remove_stale_socket(&config.runtime.config_fs_sock)?;
-    remove_stale_socket(&config.runtime.vmnet_sock)?;
-    remove_stale_socket(&config.runtime.docker_sock)?;
-    remove_stale_socket(&config.runtime.vmnet_event_log)?;
-
-    let shutting_down = Arc::new(AtomicBool::new(false));
-
-    let composed_config = config.composed_fs_server();
-    let composed_shutting_down = shutting_down.clone();
-    thread::Builder::new()
-        .name("agentvm-composed-fs".to_string())
-        .spawn(move || {
-            if let Err(error) = serve_vhost_user_fs(composed_config) {
-                if composed_shutting_down.load(Ordering::SeqCst) {
-                    return;
-                }
-                error!(service = "composed-fs", %error, "service failed");
-            }
-        })
-        .map_err(LaunchError::Io)?;
-    wait_for_path(&config.runtime.composed_fs_sock, SOCKET_WAIT_TIMEOUT)?;
-    info!(
-        service = "composed-fs",
-        socket = %config.runtime.composed_fs_sock.display(),
-        "service ready"
-    );
-
-    let config_fs_config = config.config_fs_server();
-    let config_fs_shutting_down = shutting_down.clone();
-    thread::Builder::new()
-        .name("agentvm-config-fs".to_string())
-        .spawn(move || {
-            if let Err(error) = serve_vhost_user_fs(config_fs_config) {
-                if config_fs_shutting_down.load(Ordering::SeqCst) {
-                    return;
-                }
-                error!(service = "config-fs", %error, "service failed");
-            }
-        })
-        .map_err(LaunchError::Io)?;
-    wait_for_path(&config.runtime.config_fs_sock, SOCKET_WAIT_TIMEOUT)?;
-    info!(
-        service = "config-fs",
-        socket = %config.runtime.config_fs_sock.display(),
-        "service ready"
-    );
-
-    let mut vmnet_config = config.vmnet_gateway_config();
-    vmnet_config.policy = policy.clone();
-    let vmnet_shutting_down = shutting_down.clone();
-    thread::Builder::new()
-        .name("agentvm-vmnet".to_string())
-        .spawn(move || {
-            if let Err(error) = serve_vmnet_gateway(vmnet_config) {
-                if vmnet_shutting_down.load(Ordering::SeqCst) {
-                    return;
-                }
-                error!(service = "vmnet-gateway", ?error, "service failed");
-            }
-        })
-        .map_err(LaunchError::Io)?;
-    wait_for_path(&config.runtime.vmnet_sock, SOCKET_WAIT_TIMEOUT)?;
-    info!(
-        service = "vmnet-gateway",
-        socket = %config.runtime.vmnet_sock.display(),
-        "service ready"
-    );
-
-    if let Some(docker_tcp_port) = docker_listener_tcp_port(&policy) {
-        start_docker_unix_proxy(DockerUnixProxyConfig {
-            socket_path: config.runtime.docker_sock.clone(),
-            tcp_host: std::net::Ipv4Addr::LOCALHOST,
-            tcp_port: docker_tcp_port,
-        })?;
-        wait_for_path(&config.runtime.docker_sock, SOCKET_WAIT_TIMEOUT)?;
-        info!(
-            service = "docker-unix-proxy",
-            socket = %config.runtime.docker_sock.display(),
-            tcp_port = docker_tcp_port,
-            "service ready"
-        );
-    }
-
-    let process = match config.supervisor_plan().qemu {
-        crate::ManagedTask::ChildProcess(process) => process,
-        _ => unreachable!("supervisor qemu task must be a child process"),
-    };
-    let qemu_log = File::create(&process.stdout_log)?;
-    debug!(
-        program = %process.program.display(),
-        arg_count = process.args.len(),
-        stdout_log = %process.stdout_log.display(),
-        "spawning qemu"
-    );
-    let child = Command::new(&process.program)
-        .args(&process.args)
-        .stdout(Stdio::from(qemu_log.try_clone()?))
-        .stderr(Stdio::from(qemu_log))
-        .spawn()?;
-    info!(qemu_pid = child.id(), "qemu started");
-    write_launch_state(&config, "running", Some(child.id()), None, Some(&policy))?;
-    Ok(RunningFrontend {
-        config,
-        policy,
-        child,
-        shutting_down,
-        finished: false,
-    })
+    plan
 }
 
 #[derive(Debug)]
 pub struct QemuExit {
     pub status: ExitStatus,
     pub timed_out: bool,
-}
-
-fn wait_for_qemu(
-    child: &mut std::process::Child,
-    qemu_timeout: Option<Duration>,
-) -> Result<QemuExit, LaunchError> {
-    let Some(timeout) = qemu_timeout else {
-        return child
-            .wait()
-            .map(|status| QemuExit {
-                status,
-                timed_out: false,
-            })
-            .map_err(LaunchError::Io);
-    };
-
-    match child.wait_timeout(timeout).map_err(LaunchError::Io)? {
-        Some(status) => {
-            info!(%status, "qemu exited");
-            Ok(QemuExit {
-                status,
-                timed_out: false,
-            })
-        }
-        None => {
-            warn!(
-                timeout_seconds = timeout.as_secs(),
-                "qemu timed out; killing process"
-            );
-            child.kill().map_err(LaunchError::Io)?;
-            child
-                .wait()
-                .map(|status| QemuExit {
-                    status,
-                    timed_out: true,
-                })
-                .map_err(LaunchError::Io)
-        }
-    }
 }
 
 pub async fn run_qemu_process_async(
@@ -579,90 +318,28 @@ pub async fn run_qemu_process_async(
     wait_for_qemu_async(&mut child, qemu_timeout).await
 }
 
-pub async fn run_supervised_qemu_process_async(
-    process: &ProcessSpec,
+struct SupervisedQemuLifecycle<'a> {
+    config: &'a FrontendConfig,
+    policy: &'a VmnetPolicy,
+    process: &'a ProcessSpec,
     qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
-) -> Result<QemuExit, LaunchError> {
-    if controller.name() != SupervisorTaskName::Qemu {
-        return Err(qemu_controller_mismatch(controller));
-    }
-    controller
-        .mark_starting()
-        .map_err(supervisor_launch_error)?;
-    let mut child = match spawn_qemu_process_async(process).await {
-        Ok(child) => child,
-        Err(error) => {
-            let _ = controller.mark_failed(error.to_string());
-            return Err(error);
-        }
-    };
-    controller.mark_ready().map_err(supervisor_launch_error)?;
-    finish_supervised_qemu_wait(&mut child, qemu_timeout, controller).await
-}
-
-pub async fn run_supervised_qemu_process_with_state_async(
-    config: &FrontendConfig,
-    policy: &VmnetPolicy,
-    process: &ProcessSpec,
-    qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
-) -> Result<QemuExit, LaunchError> {
-    let mut child =
-        spawn_supervised_qemu_process_with_state_async(config, policy, process, controller).await?;
-    let exit = finish_supervised_qemu_wait(&mut child, qemu_timeout, controller).await?;
-    write_qemu_exit_state(config, policy, &exit)?;
-    Ok(exit)
-}
-
-pub async fn run_supervised_qemu_process_with_service_async(
-    config: &FrontendConfig,
-    policy: &VmnetPolicy,
-    process: &ProcessSpec,
-    qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
-    service: SupervisedBlockingService,
-) -> Result<QemuExit, LaunchError> {
-    run_supervised_qemu_process_with_services_async(
-        config,
-        policy,
-        process,
-        qemu_timeout,
-        controller,
-        vec![service],
-    )
-    .await
-}
-
-pub async fn run_supervised_qemu_process_with_services_async(
-    config: &FrontendConfig,
-    policy: &VmnetPolicy,
-    process: &ProcessSpec,
-    qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
+    controller: &'a SupervisorTaskController,
     services: Vec<SupervisedBlockingService>,
+    shutdown_rx: Option<watch::Receiver<SupervisorShutdown>>,
+}
+
+async fn run_supervised_qemu_lifecycle_async(
+    lifecycle: SupervisedQemuLifecycle<'_>,
 ) -> Result<QemuExit, LaunchError> {
-    run_supervised_qemu_process_with_services_and_shutdown_async(
+    let SupervisedQemuLifecycle {
         config,
         policy,
         process,
         qemu_timeout,
         controller,
         services,
-        None,
-    )
-    .await
-}
-
-pub async fn run_supervised_qemu_process_with_services_and_shutdown_async(
-    config: &FrontendConfig,
-    policy: &VmnetPolicy,
-    process: &ProcessSpec,
-    qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
-    services: Vec<SupervisedBlockingService>,
-    shutdown_rx: Option<watch::Receiver<SupervisorShutdown>>,
-) -> Result<QemuExit, LaunchError> {
+        shutdown_rx,
+    } = lifecycle;
     let mut child =
         spawn_supervised_qemu_process_with_state_async(config, policy, process, controller).await?;
     let completion = wait_for_qemu_or_service_failure(
@@ -709,23 +386,6 @@ async fn spawn_supervised_qemu_process_with_state_async(
     write_launch_state(config, "running", child.id(), None, Some(policy))?;
     controller.mark_ready().map_err(supervisor_launch_error)?;
     Ok(child)
-}
-
-async fn finish_supervised_qemu_wait(
-    child: &mut TokioChild,
-    qemu_timeout: Option<Duration>,
-    controller: &SupervisorTaskController,
-) -> Result<QemuExit, LaunchError> {
-    match wait_for_qemu_async(child, qemu_timeout).await {
-        Ok(exit) => {
-            publish_supervised_qemu_exit(controller, &exit)?;
-            Ok(exit)
-        }
-        Err(error) => {
-            let _ = controller.mark_failed(error.to_string());
-            Err(error)
-        }
-    }
 }
 
 enum SupervisedQemuCompletion {
@@ -1081,6 +741,12 @@ fn required_task_controller(
 }
 
 fn validate_launch_inputs(config: &FrontendConfig) -> Result<(), LaunchError> {
+    if config.tools.qemu_system_x86_64.is_absolute() && !config.tools.qemu_system_x86_64.exists() {
+        return Err(LaunchError::Artifact(format!(
+            "QEMU binary is missing: {}",
+            config.tools.qemu_system_x86_64.display()
+        )));
+    }
     if !config.runtime.state_disk.exists() {
         return Err(LaunchError::Artifact(format!(
             "VM state disk is missing: {}",
@@ -1156,7 +822,7 @@ fn write_launch_state(
         qemu_status,
         egress_default_action: policy.map(|policy| format!("{:?}", policy.egress.default_action)),
         egress_reason: policy.map(|policy| format!("{:?}", policy.egress.reason)),
-        allow_ip_count: policy.map_or(0, |policy| policy.egress.allow_ips.len()),
+        allow_ip_count: policy.map_or(0, |policy| policy.egress.allow_ip_ranges.len()),
         allow_domain_count: policy.map_or(0, |policy| policy.egress.allow_domains.len()),
         vmnet_socket: config.runtime.vmnet_sock.display().to_string(),
         composed_fs_socket: config.runtime.composed_fs_sock.display().to_string(),
@@ -1183,17 +849,6 @@ fn write_launch_state(
         [bytes.as_slice(), b"\n"].concat(),
     )?;
     Ok(())
-}
-
-pub fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), LaunchError> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
-        if path.exists() {
-            return Ok(());
-        }
-        thread::sleep(SOCKET_WAIT_STEP);
-    }
-    Err(path_wait_timeout(path))
 }
 
 pub async fn wait_for_path_async(path: &Path, timeout: Duration) -> Result<(), LaunchError> {
@@ -1462,6 +1117,27 @@ mod tests {
             self.dir.path()
         }
     }
+
+    fn qemu_lifecycle<'a>(
+        config: &'a FrontendConfig,
+        policy: &'a VmnetPolicy,
+        process: &'a ProcessSpec,
+        qemu_timeout: Option<Duration>,
+        controller: &'a SupervisorTaskController,
+        services: Vec<SupervisedBlockingService>,
+    ) -> SupervisedQemuLifecycle<'a> {
+        SupervisedQemuLifecycle {
+            config,
+            policy,
+            process,
+            qemu_timeout,
+            controller,
+            services,
+            shutdown_rx: None,
+        }
+    }
+
+    use crate::network_policy::HostListener;
     use crate::runtime_manifest::workspace_mounts;
     use crate::test_support::FrontendFixture;
 
@@ -1489,6 +1165,23 @@ mod tests {
                 .join("composed-binds.json")
         );
         assert_eq!(config.guest_http_smoke_url, None);
+    }
+
+    #[test]
+    fn supervisor_plan_with_policy_carries_effective_vmnet_policy() {
+        let fixture = FrontendFixture::new("supervisor-plan-policy");
+        let config = fixture.frontend_config().expect("config");
+        let mut policy = VmnetPolicy::default_sandbox(config.network.clone());
+        policy
+            .host_listeners
+            .push(HostListener::payload_control(12076, 1076));
+
+        let plan = supervisor_plan_with_policy(&config, &policy);
+
+        let ManagedTask::VmnetGateway(vmnet) = plan.vmnet else {
+            panic!("expected vmnet gateway task");
+        };
+        assert_eq!(vmnet.policy, policy);
     }
 
     #[test]
@@ -1530,114 +1223,6 @@ mod tests {
         assert!(!joined.contains("hostfwd="));
     }
 
-    #[test]
-    fn drop_running_frontend_kills_child_and_records_cleanup_state() {
-        let config = minimal_frontend_config("drop-cleanup");
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("while true; do sleep 1; done")
-            .spawn()
-            .expect("spawn fake qemu");
-        let pid = child.id();
-        let shutting_down = Arc::new(AtomicBool::new(false));
-
-        drop(RunningFrontend {
-            config: config.clone(),
-            policy,
-            child,
-            shutting_down: shutting_down.clone(),
-            finished: false,
-        });
-
-        assert!(shutting_down.load(Ordering::SeqCst));
-        assert_process_exited(pid);
-        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
-        assert!(state.contains("\"status\": \"terminated\""), "{state}");
-    }
-
-    #[test]
-    fn waited_running_frontend_is_not_overwritten_by_drop_cleanup() {
-        let config = minimal_frontend_config("wait-finished");
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("exit 7")
-            .spawn()
-            .expect("spawn fake qemu");
-        let running = RunningFrontend {
-            config: config.clone(),
-            policy,
-            child,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            finished: false,
-        };
-
-        let exit = running.wait(None).expect("wait fake qemu");
-
-        assert!(!exit.status.success());
-        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
-        assert!(state.contains("\"status\": \"exited\""), "{state}");
-        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
-    }
-
-    #[test]
-    fn explicit_terminate_marks_finished_and_reaps_child() {
-        let config = minimal_frontend_config("explicit-terminate");
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("while true; do sleep 1; done")
-            .spawn()
-            .expect("spawn fake qemu");
-        let pid = child.id();
-        let shutting_down = Arc::new(AtomicBool::new(false));
-        let running = RunningFrontend {
-            config: config.clone(),
-            policy,
-            child,
-            shutting_down: shutting_down.clone(),
-            finished: false,
-        };
-
-        let _ = running.terminate().expect("terminate fake qemu");
-
-        assert!(shutting_down.load(Ordering::SeqCst));
-        assert_process_exited(pid);
-        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
-        assert!(state.contains("\"status\": \"exited\""), "{state}");
-        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
-    }
-
-    #[test]
-    fn wait_timeout_kills_child_and_records_timed_out_state() {
-        let config = minimal_frontend_config("wait-timeout");
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg("while true; do sleep 1; done")
-            .spawn()
-            .expect("spawn fake qemu");
-        let pid = child.id();
-        let running = RunningFrontend {
-            config: config.clone(),
-            policy,
-            child,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            finished: false,
-        };
-
-        let exit = running
-            .wait(Some(Duration::from_millis(1)))
-            .expect("timeout fake qemu");
-
-        assert!(exit.timed_out);
-        assert_process_exited(pid);
-        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
-        assert!(state.contains("\"status\": \"timed_out\""), "{state}");
-        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
-    }
-
     #[tokio::test]
     async fn async_qemu_process_exits_with_status() {
         let root = unique_temp_dir();
@@ -1676,6 +1261,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_async_qemu_marks_finished_on_exit() {
         let config = minimal_frontend_config("supervised-qemu-exit");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
         let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
         let controller = supervisor
             .task_controller(SupervisorTaskName::Qemu)
@@ -1686,9 +1272,16 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-supervised.log"),
         };
 
-        let exit = run_supervised_qemu_process_async(&process, None, &controller)
-            .await
-            .expect("supervised qemu exit");
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
+            &config,
+            &policy,
+            &process,
+            None,
+            &controller,
+            Vec::new(),
+        ))
+        .await
+        .expect("supervised qemu exit");
 
         assert!(exit.status.success());
         assert_eq!(
@@ -1700,6 +1293,7 @@ mod tests {
     #[tokio::test]
     async fn supervised_async_qemu_marks_failed_on_timeout() {
         let config = minimal_frontend_config("supervised-qemu-timeout");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
         let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
         let controller = supervisor
             .task_controller(SupervisorTaskName::Qemu)
@@ -1710,11 +1304,14 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-supervised.log"),
         };
 
-        let exit = run_supervised_qemu_process_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
+            &config,
+            &policy,
             &process,
             Some(Duration::from_millis(20)),
             &controller,
-        )
+            Vec::new(),
+        ))
         .await
         .expect("supervised qemu timeout");
 
@@ -1741,13 +1338,14 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-supervised-state.log"),
         };
 
-        let exit = run_supervised_qemu_process_with_state_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             None,
             &controller,
-        )
+            Vec::new(),
+        ))
         .await
         .expect("supervised qemu state exit");
 
@@ -1775,13 +1373,14 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-supervised-state.log"),
         };
 
-        let exit = run_supervised_qemu_process_with_state_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_millis(20)),
             &controller,
-        )
+            Vec::new(),
+        ))
         .await
         .expect("supervised qemu state timeout");
 
@@ -1812,17 +1411,18 @@ mod tests {
         };
         supervisor.request_shutdown("control socket shutdown");
 
-        let exit = run_supervised_qemu_process_with_services_and_shutdown_async(
+        let mut lifecycle = qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_secs(10)),
             &controller,
             Vec::new(),
-            Some(shutdown_rx),
-        )
-        .await
-        .expect("supervised qemu shutdown");
+        );
+        lifecycle.shutdown_rx = Some(shutdown_rx);
+        let exit = run_supervised_qemu_lifecycle_async(lifecycle)
+            .await
+            .expect("supervised qemu shutdown");
 
         assert!(!exit.timed_out);
         assert!(!exit.status.success());
@@ -1835,46 +1435,6 @@ mod tests {
                 reason: "control socket shutdown".to_string()
             })
         );
-    }
-
-    #[test]
-    fn repeated_runner_after_drop_cleanup_can_update_state() {
-        let config = minimal_frontend_config("repeat-after-drop");
-        let policy = VmnetPolicy::default_sandbox(config.network.clone());
-        let first = Command::new("sh")
-            .arg("-c")
-            .arg("while true; do sleep 1; done")
-            .spawn()
-            .expect("spawn first fake qemu");
-        let first_pid = first.id();
-        drop(RunningFrontend {
-            config: config.clone(),
-            policy: policy.clone(),
-            child: first,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            finished: false,
-        });
-        assert_process_exited(first_pid);
-
-        let second = Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .expect("spawn second fake qemu");
-        let running = RunningFrontend {
-            config: config.clone(),
-            policy,
-            child: second,
-            shutting_down: Arc::new(AtomicBool::new(false)),
-            finished: false,
-        };
-
-        let exit = running.wait(None).expect("wait second fake qemu");
-
-        assert!(exit.status.success());
-        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
-        assert!(state.contains("\"status\": \"exited\""), "{state}");
-        assert!(!state.contains("\"status\": \"terminated\""), "{state}");
     }
 
     #[tokio::test]
@@ -2023,14 +1583,14 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-service-failure.log"),
         };
 
-        let error = run_supervised_qemu_process_with_service_async(
+        let error = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_secs(10)),
             &qemu_controller,
-            service,
-        )
+            vec![service],
+        ))
         .await
         .expect_err("service failure stops qemu");
 
@@ -2092,14 +1652,14 @@ mod tests {
             stdout_log: config.runtime.run_dir.join("qemu-services-failure.log"),
         };
 
-        let error = run_supervised_qemu_process_with_services_async(
+        let error = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_secs(10)),
             &qemu_controller,
             vec![config_service, vmnet_service],
-        )
+        ))
         .await
         .expect_err("first service failure stops qemu");
 
@@ -2154,14 +1714,14 @@ mod tests {
                 .join("qemu-exit-cancels-services.log"),
         };
 
-        let exit = run_supervised_qemu_process_with_services_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_secs(10)),
             &qemu_controller,
             vec![service],
-        )
+        ))
         .await
         .expect("qemu exits");
 
@@ -2212,14 +1772,14 @@ mod tests {
                 .join("qemu-exit-cancels-async-service.log"),
         };
 
-        let exit = run_supervised_qemu_process_with_services_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_secs(10)),
             &qemu_controller,
             vec![service],
-        )
+        ))
         .await
         .expect("qemu exits");
 
@@ -2273,14 +1833,14 @@ mod tests {
                 .join("qemu-timeout-cancels-services.log"),
         };
 
-        let exit = run_supervised_qemu_process_with_services_async(
+        let exit = run_supervised_qemu_lifecycle_async(qemu_lifecycle(
             &config,
             &policy,
             &process,
             Some(Duration::from_millis(20)),
             &qemu_controller,
             vec![service],
-        )
+        ))
         .await
         .expect("qemu times out");
 
@@ -2411,27 +1971,6 @@ mod tests {
             &root_path,
         )
         .expect("config")
-    }
-
-    fn assert_process_exited(pid: u32) {
-        for _ in 0..50 {
-            if !process_exists(pid) {
-                return;
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        panic!("process {pid} is still running");
-    }
-
-    fn process_exists(pid: u32) -> bool {
-        Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
     }
 
     fn unique_temp_dir() -> TestTempDir {

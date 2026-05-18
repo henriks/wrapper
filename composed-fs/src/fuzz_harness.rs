@@ -1,6 +1,10 @@
 use super::*;
-use std::os::unix::fs::{FileExt, PermissionsExt};
-use virtiofsd::oslib::{ReadvFlags, WritevFlags};
+use crate::manifest::AccessMode;
+use crate::test_support::{
+    ctx, dir_mount, lookup, manifest_with_mounts, TestDir, VecReader, VecWriter,
+};
+use std::os::unix::fs::PermissionsExt;
+use virtiofsd::filesystem::ROOT_ID;
 
 const OP_LIMIT: usize = 96;
 const LOCK_OP_LIMIT: usize = 160;
@@ -42,10 +46,10 @@ pub fn run_fs_operation_bytes(data: &[u8]) {
 
     let mut input = Input::new(data);
     let test_dir = TestDir::new("fuzz-fs-ops");
-    let root = test_dir.path.join("root");
-    let oracle = test_dir.path.join("oracle");
-    let readonly = test_dir.path.join("readonly");
-    let outside = test_dir.path.join("outside-secret.txt");
+    let root = test_dir.join("root");
+    let oracle = test_dir.join("oracle");
+    let readonly = test_dir.join("readonly");
+    let outside = test_dir.join("outside-secret.txt");
     fs::create_dir(&root).expect("create root");
     fs::create_dir(&oracle).expect("create oracle");
     fs::create_dir(&readonly).expect("create readonly");
@@ -53,8 +57,20 @@ pub fn run_fs_operation_bytes(data: &[u8]) {
     fs::write(readonly.join("ro.txt"), b"readonly").expect("readonly file");
 
     let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![
-        dir_mount("workspace", "/workspace", &root, AccessMode::Rw),
-        dir_mount("readonly", "/readonly", &readonly, AccessMode::Ro),
+        dir_mount(
+            "workspace",
+            "/workspace",
+            &root,
+            AccessMode::Rw,
+            SourceClass::Workspace,
+        ),
+        dir_mount(
+            "readonly",
+            "/readonly",
+            &readonly,
+            AccessMode::Ro,
+            SourceClass::UserRo,
+        ),
     ]))
     .expect("build namespace");
     let fs = ComposedFs::new(namespace);
@@ -250,7 +266,7 @@ pub fn run_lock_operation_bytes(data: &[u8]) {
 
     let mut input = Input::new(data);
     let test_dir = TestDir::new("fuzz-lock-ops");
-    let root = test_dir.path.join("root");
+    let root = test_dir.join("root");
     fs::create_dir(&root).expect("create root");
     fs::write(root.join("state.sqlite"), b"sqlite-lock-probe").expect("write file");
     let namespace = Namespace::from_manifest(&manifest_with_mounts(vec![dir_mount(
@@ -258,6 +274,7 @@ pub fn run_lock_operation_bytes(data: &[u8]) {
         "/workspace",
         &root,
         AccessMode::Rw,
+        SourceClass::Workspace,
     )]))
     .expect("build namespace");
     let fs = ComposedFs::new(namespace);
@@ -426,69 +443,6 @@ impl<'a> Input<'a> {
             _ => LockKind::Unlock,
         }
     }
-}
-
-struct TestDir {
-    _dir: tempfile::TempDir,
-    path: PathBuf,
-}
-
-impl TestDir {
-    fn new(name: &str) -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("agentvm-composed-fs-{name}-"))
-            .tempdir()
-            .expect("create fuzz dir");
-        let path = dir.path().to_path_buf();
-        Self { _dir: dir, path }
-    }
-}
-
-fn ctx() -> Context {
-    Context {
-        uid: GuestUid::from(0),
-        gid: GuestGid::from(0),
-        pid: 0,
-    }
-}
-
-fn manifest_with_mounts(mounts: Vec<MountSpec>) -> Manifest {
-    Manifest {
-        schema_version: SCHEMA_VERSION,
-        export_tag: Some(DEFAULT_TAG.to_string()),
-        created_by: Some("fuzz".to_string()),
-        mounts,
-        synthetic: Some(SyntheticSpec {
-            uid: 0,
-            gid: 0,
-            dir_mode: "0555".to_string(),
-        }),
-        protected_guest_paths: vec![],
-        shadow_root: None,
-        filters: Vec::new(),
-    }
-}
-
-fn dir_mount(id: &str, guest_path: &str, host_path: &Path, access: AccessMode) -> MountSpec {
-    MountSpec {
-        id: id.to_string(),
-        guest_path: guest_path.to_string(),
-        host_path: host_path.display().to_string(),
-        kind: MountKind::Dir,
-        access,
-        source_class: SourceClass::Workspace,
-        required: true,
-        bind: true,
-        metadata: MetadataSpec {
-            uid_gid: MetadataPolicy::Host,
-            permissions: MetadataPolicy::Host,
-        },
-    }
-}
-
-fn lookup(fs: &ComposedFs, parent: u64, name: &str) -> io::Result<Entry> {
-    let name = CString::new(name).expect("fuzz name");
-    fs.lookup(ctx(), parent, name.as_c_str())
 }
 
 fn raw_error<T>(result: io::Result<T>, label: &str) -> Option<i32> {
@@ -755,44 +709,6 @@ fn dir_names(mut iter: VecDirIter) -> Vec<String> {
         names.push(entry.name.to_str().expect("utf8").to_string());
     }
     names
-}
-
-struct VecReader {
-    data: Vec<u8>,
-}
-
-impl ZeroCopyReader for VecReader {
-    fn write_to_file_at(
-        &mut self,
-        file: &File,
-        count: usize,
-        offset: u64,
-        _flags: Option<WritevFlags>,
-    ) -> io::Result<usize> {
-        let count = count.min(self.data.len());
-        file.write_at(&self.data[..count], offset)
-    }
-}
-
-#[derive(Default)]
-struct VecWriter {
-    data: Vec<u8>,
-}
-
-impl ZeroCopyWriter for VecWriter {
-    fn read_from_file_at(
-        &mut self,
-        file: &File,
-        count: usize,
-        offset: u64,
-        _flags: Option<ReadvFlags>,
-    ) -> io::Result<usize> {
-        let start = self.data.len();
-        self.data.resize(start + count, 0);
-        let read = file.read_at(&mut self.data[start..], offset)?;
-        self.data.truncate(start + read);
-        Ok(read)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

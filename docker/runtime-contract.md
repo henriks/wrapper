@@ -130,7 +130,7 @@ Layout:
       console.log
       vmnet-events.log
       guest-dockerd.log
-      guest-socket-bridge.log
+      guest-docker-bridge.log
       guest-payload-server.log
       guest-config.sock
       composed-fs-manifest.json
@@ -142,7 +142,10 @@ Rules:
 
 - `.sandbox/docker-vm/state.raw` is the persistent sparse ext4 disk backing the
   guest root overlay. Normal guest writes, including `$HOME`, `/usr/local`,
-  package caches, and `/var/lib/docker`, persist there.
+  package caches, and `/var/lib/docker`, persist there. Docker is pinned to the
+  guest appliance's configured storage driver (`vfs` by default) because the
+  Docker data root lives on the AgentVM root overlay rather than a native
+  overlayfs upperdir.
 - `.sandbox/config.json` is the durable project sandbox configuration for setup
   recipe, default command, network mode/allowlists, auth sharing, extra shares,
   and published ports. Its schema and compatibility rules are documented in
@@ -158,7 +161,8 @@ The VM-only contract assumes a deliberately small set of host inputs:
 - project workspace
   - shared via `virtio-fs`
   - mounted inside the guest at the original absolute project path
-  - optionally also available at `/workspace` as a compatibility alias
+  - unsupported guest project paths fail closed during guest init instead of
+    being remapped to an alias
 - guest home
   - `$HOME` is the host user's natural home path inside the VM
   - it lives on the persistent root overlay unless an explicit configured share
@@ -228,7 +232,9 @@ Required sequence:
    - persistent root overlay state disk
    - `virtio-fs` workspace sharing
    - QEMU stream networking
-   - the guest control path needed to launch the payload
+   - the guest control path needed to launch the payload, exposed on a
+     per-launch ephemeral loopback host port unless the operator explicitly
+     supplied a payload listener
    - any requested localhost port forwards
 9. Wait for guest init and `dockerd` readiness.
 10. Launch the requested payload inside the guest.
@@ -291,7 +297,8 @@ v1 allows at most one active VM-backed sandbox per project.
 
 - the lock is held for the full lifetime of the owning wrapper process
 - a second launch for the same project must fail fast
-- different projects remain isolated by separate `.sandbox/` trees
+- different projects remain isolated by separate `.sandbox/` trees and must not
+  share a fixed implicit payload-control host port
 
 `--reset` behavior:
 

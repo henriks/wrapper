@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use agentvm_frontend::payload_client::{
-    run_diagnostic_tcp, terminal_size, DiagnosticRequest, PayloadClientError,
+    run_diagnostic_tcp_async, terminal_size, DiagnosticRequest, PayloadClientError,
 };
 use clap::{Arg, ArgAction, Command as ClapCommand};
 
@@ -13,6 +13,8 @@ pub(crate) type PayloadCliResult<T> = Result<T, PayloadCliError>;
 pub(crate) enum PayloadCliError {
     #[error("{message}")]
     Clap { message: String },
+    #[error("--port is required")]
+    MissingPort,
     #[error("invalid --port")]
     InvalidPort,
     #[error("invalid --rows")]
@@ -80,9 +82,9 @@ pub(crate) fn payload_client_config_from_args(
             .unwrap_or_else(|| "127.0.0.1".to_string()),
         port: matches
             .get_one::<String>("port")
-            .map(|value| value.parse().map_err(|_| PayloadCliError::InvalidPort))
-            .transpose()?
-            .unwrap_or(12076),
+            .ok_or(PayloadCliError::MissingPort)?
+            .parse()
+            .map_err(|_| PayloadCliError::InvalidPort)?,
         ping: matches.get_flag("ping"),
         script: matches.get_one::<String>("script").cloned(),
         cwd: matches
@@ -191,10 +193,10 @@ pub(crate) fn payload_exit_status(exit_code: i32) -> i32 {
     }
 }
 
-pub(crate) fn flush_guest_filesystems(addr: std::net::SocketAddr) -> PayloadCliResult<()> {
+pub(crate) async fn flush_guest_filesystems(addr: std::net::SocketAddr) -> PayloadCliResult<()> {
     let request = guest_sync_diagnostic_request();
     let mut output = Vec::new();
-    match run_diagnostic_tcp(addr, &request, &mut output) {
+    match run_diagnostic_tcp_async(addr, &request, &mut output).await {
         Ok(0) => Ok(()),
         Ok(exit_code) => Err(PayloadCliError::GuestSyncDiagnosticFailed {
             exit_code,

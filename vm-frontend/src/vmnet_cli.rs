@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use agentvm_frontend::network_policy::{EgressAction, EgressReason, HostListener, VmnetPolicy};
+use agentvm_frontend::network_policy::{
+    EgressAction, EgressReason, HostListener, Ipv4RangeParseError, VmnetPolicy,
+};
 use agentvm_frontend::vmnet_runtime::VmnetRuntimeConfig;
 use agentvm_frontend::GuestNetwork;
 use clap::{Arg, ArgAction, Command as ClapCommand};
@@ -17,6 +19,8 @@ pub(crate) enum VmnetCliError {
     MissingSocket,
     #[error("{message}")]
     InvalidNoNetPolicy { message: String },
+    #[error("invalid --allow-ip: {source}")]
+    InvalidAllowIpRange { source: Ipv4RangeParseError },
 }
 
 impl From<VmnetCliError> for String {
@@ -85,7 +89,8 @@ pub(crate) fn vmnet_gateway_config_from_args(
         message: error.to_string(),
     })?;
     let mut policy = VmnetPolicy::default_sandbox(network.clone());
-    policy.egress.allow_ips = allow_ips;
+    policy.egress.allow_ip_ranges = agentvm_frontend::network_policy::parse_ipv4_ranges(&allow_ips)
+        .map_err(|source| VmnetCliError::InvalidAllowIpRange { source })?;
     policy.egress.allow_domains = allow_domains;
     if allow_public {
         policy.egress.default_action = EgressAction::AllowPublicInternet;

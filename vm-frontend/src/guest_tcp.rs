@@ -188,6 +188,48 @@ impl GuestTcpCore {
         self.sockets.get_mut::<tcp::Socket>(handle).close();
     }
 
+    pub fn reap_closed_sessions(&mut self) -> GuestTcpReap {
+        let listener_handles = self.closed_handles(self.listeners.iter().map(|slot| slot.handle));
+        let host_connection_handles =
+            self.closed_handles(self.host_connections.iter().map(|slot| slot.handle));
+        self.listeners
+            .retain(|slot| !listener_handles.contains(&slot.handle));
+        self.host_connections
+            .retain(|slot| !host_connection_handles.contains(&slot.handle));
+        for handle in listener_handles
+            .iter()
+            .chain(host_connection_handles.iter())
+            .copied()
+        {
+            let _ = self.sockets.remove(handle);
+        }
+        GuestTcpReap {
+            listener_sessions: listener_handles.len(),
+            host_connections: host_connection_handles.len(),
+        }
+    }
+
+    fn closed_handles(&self, handles: impl Iterator<Item = SocketHandle>) -> Vec<SocketHandle> {
+        handles
+            .filter(|handle| self.sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Closed)
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn listener_slot_count(&self) -> usize {
+        self.listeners.len()
+    }
+
+    #[cfg(test)]
+    fn host_connection_slot_count(&self) -> usize {
+        self.host_connections.len()
+    }
+
+    #[cfg(test)]
+    fn socket_count(&self) -> usize {
+        self.sockets.iter().count()
+    }
+
     pub fn any_ip_enabled(&self) -> bool {
         self.interface.any_ip()
     }
@@ -195,6 +237,12 @@ impl GuestTcpCore {
     pub fn ip_addrs(&self) -> &[IpCidr] {
         self.interface.ip_addrs()
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GuestTcpReap {
+    pub listener_sessions: usize,
+    pub host_connections: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +461,109 @@ mod tests {
     }
 
     #[test]
+    fn reaps_closed_listener_socket_and_slot() {
+        let (mut core, _device, http) = core();
+        assert_eq!(core.listener_slot_count(), 1);
+        assert_eq!(core.socket_count(), 1);
+
+        core.close_session(http);
+        let reap = core.reap_closed_sessions();
+
+        assert_eq!(
+            reap,
+            GuestTcpReap {
+                listener_sessions: 1,
+                host_connections: 0,
+            }
+        );
+        assert_eq!(core.listener_slot_count(), 0);
+        assert_eq!(core.socket_count(), 0);
+        assert_eq!(core.reap_closed_sessions(), GuestTcpReap::default());
+    }
+
+    #[test]
+    fn reaps_closed_host_connection_socket_and_slot() {
+        let network = GuestNetwork::default();
+        let mut device = QueuedEthernetDevice::new(1514);
+        let mut core = GuestTcpCore::new(
+            &network,
+            DEFAULT_GATEWAY_MAC,
+            Instant::from_millis(0),
+            &mut device,
+        )
+        .expect("core");
+        let handle = core
+            .connect_to_guest(&network, 1075, 40000, Instant::from_millis(1), &mut device)
+            .expect("connect");
+        assert_eq!(core.host_connection_slot_count(), 1);
+        assert_eq!(core.socket_count(), 1);
+
+        core.close_session(handle);
+        let reap = core.reap_closed_sessions();
+
+        assert_eq!(
+            reap,
+            GuestTcpReap {
+                listener_sessions: 0,
+                host_connections: 1,
+            }
+        );
+        assert_eq!(core.host_connection_slot_count(), 0);
+        assert_eq!(core.socket_count(), 0);
+    }
+
+    #[test]
+    fn reaping_bounds_listener_slots_under_churn() {
+        let network = GuestNetwork::default();
+        let mut device = QueuedEthernetDevice::new(1514);
+        let mut core = GuestTcpCore::new(
+            &network,
+            DEFAULT_GATEWAY_MAC,
+            Instant::from_millis(0),
+            &mut device,
+        )
+        .expect("core");
+
+        for _ in 0..512 {
+            let handle = core.listen_tcp(80).expect("listen");
+            core.close_session(handle);
+            assert_eq!(core.reap_closed_sessions().listener_sessions, 1);
+            assert_eq!(core.listener_slot_count(), 0);
+            assert_eq!(core.socket_count(), 0);
+        }
+    }
+
+    #[test]
+    fn reaping_bounds_host_connection_slots_under_churn() {
+        let network = GuestNetwork::default();
+        let mut device = QueuedEthernetDevice::new(1514);
+        let mut core = GuestTcpCore::new(
+            &network,
+            DEFAULT_GATEWAY_MAC,
+            Instant::from_millis(0),
+            &mut device,
+        )
+        .expect("core");
+
+        for offset in 0..512 {
+            let handle = core
+                .connect_to_guest(
+                    &network,
+                    1075,
+                    40000 + offset,
+                    Instant::from_millis(i64::from(offset) + 1),
+                    &mut device,
+                )
+                .expect("connect");
+            drain_tx(&mut device);
+            core.close_session(handle);
+            assert_eq!(core.reap_closed_sessions().host_connections, 1);
+            assert_eq!(core.host_connection_slot_count(), 0);
+            assert_eq!(core.socket_count(), 0);
+        }
+    }
+
+    #[test]
     fn reuses_open_listener_and_replenishes_after_accept() {
         let (mut core, mut device, http) = core();
 
@@ -461,7 +612,10 @@ mod tests {
     fn evaluates_syn_policy_before_smoltcp_accepts_connection() {
         let mut policy =
             crate::network_policy::VmnetPolicy::default_sandbox(GuestNetwork::default());
-        policy.egress.allow_ips.push("93.184.216.34".to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr("93.184.216.34")
+            .expect("test allow ip");
 
         let (_destination, decision) = evaluate_tcp_syn_frame(
             &policy,

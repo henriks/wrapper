@@ -1,8 +1,8 @@
 ---
 id: wra-xcvq
-status: open
+status: closed
 deps: []
-links: [wra-zqci, wra-jkeg, wra-n0fe, wra-yl7i, wra-7t63]
+links: [wra-zqci, wra-jkeg, wra-n0fe, wra-yl7i, wra-7t63, wra-9m5h]
 created: 2026-05-17T10:18:23Z
 type: epic
 priority: 1
@@ -71,3 +71,35 @@ Iteration 59 near-loop-end status: all option-1 children except wra-662v are clo
 **2026-05-17T21:39:01Z**
 
 Iteration 60 final loop status: Ralph loop reached its configured maximum with epic still honestly blocked, not complete. All option-1 host/orchestration children except wra-662v are closed/live-validated. wra-662v remains in_progress because current acceptance requires Rust opt-in appliance usability and docker/out/artifact-manifest.json remains Python-default unless rebuilt with AGENTVM_PAYLOAD_SERVICE=rust. Required external next step: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh, inspect manifest for agentvm_payload_service=rust, then run live-payload, live-docker, and required. Alternative: explicitly narrow wra-662v as implementation-only and leave opt-in appliance live proof to wra-y335.
+
+**2026-05-18T04:36:39Z**
+
+After user ran the Rust opt-in rebuild, manifest correctly included agentvm_payload_service=rust, but live-payload failed: guest-init selected the Rust server and then logged /usr/local/libexec/agentvm-guest-service: not found. The rootfs contains the binary; host inspection showed the binary used in the rebuild was the GNU/glibc target/debug/agentvm-guest-service requiring /lib64/ld-linux-x86-64.so.2, which Alpine/musl lacks. Built a musl static-pie binary at target/x86_64-unknown-linux-musl/debug/agentvm-guest-service. User should rerun the opt-in rebuild with that musl binary, then rerun live validation.
+
+**2026-05-18T05:39:28Z**
+
+Created broader cleanup epic wra-9m5h. Option 1 remains useful for the Tokio-boundary architecture, but cleanup tickets should be preferred when the choice is between adding an adapter and deleting or merging an old path. Relevant folded work includes wra-8xsb for composed-fs structure and wra-oio0 for deleting the old sync launch path.
+
+**2026-05-18T06:33:46Z**
+
+Epic completion validation: all option-1 implementation children are closed or explicitly split as follow-up (wra-7t63 is linked post-option-1, not a child blocker). Final blocker wra-662v is now closed after Rust opt-in appliance validation. Verified Rust appliance manifest/rootfs uses the musl static guest-service binary sha256 a6601c1000e833a0e1b18a0313246fbbb4427a926d7fb8a6ec0d50715b15ccb5 and kernel cmdline includes agentvm_payload_service=rust. Live-capable validation passed in this environment: ./vm-frontend/validate.sh live-payload, ./vm-frontend/validate.sh live-docker, and ./vm-frontend/validate.sh required. Option-1 target shape is implemented: Tokio at orchestration/byte-stream I/O boundaries, synchronous single-owner vmnet/protocol cores, and bounded-blocking composed-fs/vhost filesystem execution retained.
+
+**2026-05-18T07:23:11Z**
+
+Cleanup epic wra-9m5h iteration 11: follow-on cleanup preserved the option-1 boundary shape while deleting transitional/stringly internals: wrapper launch requests are typed, self-test moved to validation-only binary, network policy ranges are typed, and dynamic guest metadata now uses guest-config/launch.json instead of kernel cmdline append/parsing. Remaining sync launch deletion is still correctly gated by wra-7t63.
+
+**2026-05-18T07:35:44Z**
+
+Cleanup/prereq progress from wra-7t63: supervisor status now exposes a typed payload_control_endpoint derived from the effective supervisor-owned vmnet policy, and async launch now seeds LaunchSupervisor with that effective policy. This continues the option-1 direction of making UI/payload clients observe supervisor state through the control socket rather than owning launch-local state.
+
+**2026-05-18T07:41:02Z**
+
+wra-7t63 iteration 14 continued the option-1 control boundary migration: plain async payload launches now use supervisor-control endpoint discovery and request supervisor shutdown over the control socket, instead of owning RunningFrontend directly. Remaining sync ownership is concentrated in TUI payload viewport mode.
+
+**2026-05-18T07:45:42Z**
+
+wra-7t63 iteration 15 moved production wrapper/TUI payload launch onto the async supervisor-control path. TUI now attaches to the payload endpoint discovered from supervisor state and requests shutdown via control socket instead of directly owning RunningFrontend in production wrapper dispatch.
+
+**2026-05-18T09:17:09Z**
+
+Cleanup loop `wra-ynx7` completed the vmnet transitional-scaffolding deletion direction: production supervisor launch now calls the async vmnet boundary directly, stale vmnet `allow(dead_code)` islands are gone, and remaining sync frame-pump helpers are private `#[cfg(test)]` only. This supports the option-1 architecture goal of one owner-driven Tokio vmnet path without reintroducing generic ByteIo workers or nested runtime wrappers.

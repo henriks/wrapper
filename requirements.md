@@ -92,7 +92,7 @@ All mutable state is project-local under `.sandbox/`:
       qemu.log
       vmnet-events.log
       guest-dockerd.log
-      guest-socket-bridge.log
+      guest-docker-bridge.log
       guest-payload-server.log
       docker.sock
       virtiofs.sock
@@ -124,7 +124,8 @@ The guest mounts the composed export and binds the declared entries into place.
 Required/default guest shares:
 
 - The project workspace is mounted read-write at its original absolute path.
-- `/workspace` is a compatibility alias for the project path.
+- Unsupported guest project paths fail closed during guest init instead of being
+  remapped to an alias.
 - Guest `$HOME` is the host user's natural home path inside the VM and lives on
   the persistent root overlay unless a more specific configured share covers it.
 - Selected tool state is shared deliberately through explicit recipe/config

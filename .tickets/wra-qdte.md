@@ -1,6 +1,6 @@
 ---
 id: wra-qdte
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-05-16T15:50:47Z
@@ -32,3 +32,13 @@ Validation:
 - Test intermediate symlink escapes and concurrent parent replacement.
 - Update docs if the minimum kernel/support contract changes.
 
+
+## Notes
+
+**2026-05-18T09:28:15Z**
+
+Iteration 38: started as the next composed-fs correctness prerequisite for cleanup child wra-8xsb. Chosen approach is fail-closed on ENOSYS/EINVAL openat2 unavailability rather than keeping the weaker openat fallback, because cleanup direction favors deleting unsafe fallback behavior over adding a parallel resolver.
+
+**2026-05-18T09:32:39Z**
+
+Implemented fail-closed host traversal when openat2 is unavailable: ENOSYS/EINVAL from openat2 now returns EOPNOTSUPP instead of falling back to plain openat. Deleted the unsafe fallback behavior while preserving live create compatibility by masking FUSE file-type bits out of openat2 create mode. Added tests open_beneath_fails_closed_when_openat2_is_unavailable and open_beneath_masks_file_type_bits_from_create_mode; updated docker/composed-fs-core.md. Validation passed: cargo test --manifest-path composed-fs/Cargo.toml --offline -- --nocapture; ./vm-frontend/validate.sh required (/tmp/pi-bash-8bea82967fc804e6.log). First required attempt failed live-smoke because create mode included file-type bits and openat2 returned EINVAL after fallback deletion; fixed by masking mode to permission bits.

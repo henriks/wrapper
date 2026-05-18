@@ -20,10 +20,11 @@ top of the scaffold:
 - unsafe guest names such as `..` are rejected before host traversal
 
 The implementation uses `openat2` with `RESOLVE_IN_ROOT` and
-`RESOLVE_NO_MAGICLINKS` for host-relative traversal. If `openat2` is not
-available, it falls back to `openat` after strict component validation. That
-fallback is weaker against concurrent replacement of intermediate path
-components and should be revisited before treating older kernels as supported.
+`RESOLVE_NO_MAGICLINKS` for host-relative traversal. `openat2` support is
+required for composed-fs host-relative traversal; kernels or runtimes that
+return `ENOSYS`/`EINVAL` for `openat2` fail closed with `EOPNOTSUPP` rather than
+falling back to plain `openat`, because component-only validation cannot safely
+pin intermediate directories against symlink replacement.
 
 ## Current Boundaries
 

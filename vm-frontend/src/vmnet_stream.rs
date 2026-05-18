@@ -371,7 +371,10 @@ mod tests {
     use super::*;
     use crate::test_support::{ReadStep, ScriptedStream};
     use proptest::prelude::*;
+    use std::collections::VecDeque;
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     fn ethernet_frame() -> Vec<u8> {
@@ -478,6 +481,76 @@ mod tests {
             frame.len() as u32
         );
         assert_eq!(&bytes[4..], frame.as_slice());
+    }
+
+    #[tokio::test]
+    async fn async_write_frame_retries_partial_and_pending_writes() {
+        #[derive(Debug)]
+        enum WriteStep {
+            Bytes(usize),
+            Pending,
+        }
+
+        #[derive(Debug)]
+        struct ScriptedAsyncWriter {
+            steps: VecDeque<WriteStep>,
+            written: Vec<u8>,
+        }
+
+        impl tokio::io::AsyncWrite for ScriptedAsyncWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                match self.steps.pop_front() {
+                    Some(WriteStep::Bytes(max)) => {
+                        let count = max.min(buf.len()).max(1);
+                        self.written.extend_from_slice(&buf[..count]);
+                        Poll::Ready(Ok(count))
+                    }
+                    Some(WriteStep::Pending) => {
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                    None => {
+                        self.written.extend_from_slice(buf);
+                        Poll::Ready(Ok(buf.len()))
+                    }
+                }
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let frame = ethernet_frame();
+        let writer = ScriptedAsyncWriter {
+            steps: VecDeque::from([
+                WriteStep::Bytes(2),
+                WriteStep::Pending,
+                WriteStep::Bytes(2),
+                WriteStep::Bytes(3),
+                WriteStep::Pending,
+            ]),
+            written: Vec::new(),
+        };
+        let mut io = QemuFrameIo::new(writer, DEFAULT_MAX_FRAME_LEN);
+
+        io.write_frame_async(&frame)
+            .await
+            .expect("async write retries");
+        let written = io.into_inner().written;
+        assert_eq!(
+            u32::from_be_bytes(written[..4].try_into().unwrap()),
+            frame.len() as u32
+        );
+        assert_eq!(&written[4..], frame.as_slice());
     }
 
     #[tokio::test]

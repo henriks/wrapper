@@ -1,8 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::time::Duration;
 
-use ipnet::Ipv4Net;
-
 use crate::dns_proxy::domain_allowed;
 use crate::network_policy::{EgressAction, VmnetPolicy};
 
@@ -115,7 +113,7 @@ pub enum TcpConnectError {
 }
 
 pub fn evaluate_tcp_destination(policy: &VmnetPolicy, destination: &TcpDestination) -> TcpDecision {
-    if ip_in_ranges(destination.ip, &policy.egress.deny_ranges) {
+    if ip_in_ranges(destination.ip, &policy.egress.deny_ip_ranges) {
         return TcpDecision {
             action: TcpAction::Deny,
             reason: "destination is in a denied range".to_string(),
@@ -208,16 +206,11 @@ fn tcp_destination_allowed(policy: &VmnetPolicy, destination: &TcpDestination) -
     {
         return true;
     }
-    ip_in_ranges(destination.ip, &policy.egress.allow_ips)
+    ip_in_ranges(destination.ip, &policy.egress.allow_ip_ranges)
 }
 
-fn ip_in_ranges(ip: Ipv4Addr, ranges: &[String]) -> bool {
-    ranges.iter().any(|range| {
-        if let Ok(net) = range.parse::<Ipv4Net>() {
-            return net.contains(&ip);
-        }
-        range.parse::<Ipv4Addr>().is_ok_and(|single| single == ip)
-    })
+fn ip_in_ranges(ip: Ipv4Addr, ranges: &[crate::network_policy::Ipv4Range]) -> bool {
+    ranges.iter().any(|range| range.contains(ip))
 }
 
 #[cfg(test)]
@@ -249,14 +242,20 @@ mod tests {
     fn policy() -> VmnetPolicy {
         let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
         policy.egress.allow_domains.push("example.com".to_string());
-        policy.egress.allow_ips.push("93.184.216.34".to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr("93.184.216.34")
+            .expect("test allow ip");
         policy
     }
 
     #[test]
     fn blocks_private_ranges_before_allow_rules() {
         let mut policy = policy();
-        policy.egress.allow_ips.push("10.1.2.3".to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr("10.1.2.3")
+            .expect("test allow ip");
         let decision = evaluate_tcp_destination(
             &policy,
             &TcpDestination {
@@ -421,10 +420,16 @@ mod tests {
                 policy.egress.default_action = EgressAction::AllowPublicInternet;
             }
             if explicit_allow {
-                policy.egress.allow_ips.push(ip.to_string());
+                policy
+                    .egress
+                    .allow_ip_or_cidr(&ip.to_string())
+                    .expect("test allow ip");
             }
             if explicit_deny {
-                policy.egress.deny_ranges.push(format!("{ip}/32"));
+                policy.egress.deny_ip_ranges.push(
+                    crate::network_policy::Ipv4Range::parse(&format!("{ip}/32"))
+                        .expect("test deny ip"),
+                );
             }
             if mitm_configured {
                 policy.tls_mitm.ca_cert_path = Some(PathBuf::from("/tmp/generated-test-ca.pem"));
@@ -477,9 +482,15 @@ mod tests {
             let domain = format!("host-{domain_label}.example");
             let mut policy = VmnetPolicy::default_sandbox(GuestNetwork::default());
             policy.egress.default_action = EgressAction::AllowPublicInternet;
-            policy.egress.allow_ips.push(ip.to_string());
+            policy
+                .egress
+                .allow_ip_or_cidr(&ip.to_string())
+                .expect("test allow ip");
             policy.egress.allow_domains.push(domain.clone());
-            policy.egress.deny_ranges.push(format!("{ip}/32"));
+            policy.egress.deny_ip_ranges.push(
+                crate::network_policy::Ipv4Range::parse(&format!("{ip}/32"))
+                    .expect("test deny ip"),
+            );
             policy.tls_mitm.ca_cert_path = Some(PathBuf::from("/tmp/generated-test-ca.pem"));
             policy.tls_mitm.ca_key_path = Some(PathBuf::from("/tmp/generated-test-ca-key.pem"));
             policy.tls_mitm.generate_per_host_certs = true;
@@ -524,7 +535,7 @@ mod tests {
                 },
             );
 
-            if has_cert && has_key && generate_certs && !ip_in_ranges(ip, &policy.egress.deny_ranges) {
+            if has_cert && has_key && generate_certs && !ip_in_ranges(ip, &policy.egress.deny_ip_ranges) {
                 prop_assert_eq!(decision.action, TcpAction::InterceptHttps);
             } else {
                 prop_assert_eq!(decision.action, TcpAction::Deny);

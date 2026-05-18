@@ -27,7 +27,7 @@ Important existing files:
   - Implements the framed payload protocol and direct stdin/stdout forwarding.
   - Already supports payload input (`I`), output (`O`), resize (`W`), signals
     (`S`), exit (`X`), and failure (`F`).
-- `docker/guest-payload-server.py`
+- `guest-service/src/lib.rs`
   - Runs the payload under a guest PTY and applies rows/cols from the request.
 - `vm-frontend/src/runtime_manifest.rs`
   - Maps selected tool state into composed filesystem mounts.
@@ -53,9 +53,9 @@ The automatic non-TTY fallback is required so CI, shell pipelines, and scripted
 payload launches do not enter raw mode or require dialog interaction.
 
 The user-facing wrapper path is `agentvm`. `agentvm-frontend wrap` remains a
-development path. Tool setup comes from `--setup-tool` recipes, structured
-startup configuration, or the TUI initialization dialog; legacy
-`codex-wrap`/`copilot-wrap` executable-name inference remains unsupported.
+development path. Tool setup comes from `--setup-tool` recipes or structured
+config; legacy `codex-wrap`/`copilot-wrap` executable-name inference remains
+unsupported. Unconfigured launches use `bash` as the payload.
 
 ## Dependencies
 
@@ -87,7 +87,8 @@ Separate the implementation into four layers:
 2. Launch/session controller
    - Starts the VM with `start_frontend_with_policy`.
    - Waits for the payload listener.
-   - Builds the payload request from selected startup configuration.
+   - Builds the payload request from selected wrapper configuration or the
+     unconfigured `bash` default.
    - Terminates the running frontend after payload exit or wrapper cancellation.
    - Publishes status transitions to the TUI model.
 3. TUI model
@@ -131,8 +132,8 @@ Model focus explicitly:
 - `Guest`: default during an active payload session. Text input, paste, enter,
   tab, arrows, and normal control sequences are translated to bytes and sent as
   payload `I` frames.
-- `WrapperPrompt`: wrapper-owned prompt or startup dialog has focus. Normal
-  typed keys edit/select prompt state and must not be sent to the guest.
+- `WrapperPrompt`: wrapper-owned prompt has focus. Normal typed keys
+  edit/select prompt state and must not be sent to the guest.
 - `WrapperCommand`: reserved future mode for command palette/help/log views.
 - `Exiting`: payload exited or wrapper is shutting down; input is limited to
   acknowledgement/cleanup actions.
@@ -164,13 +165,13 @@ The first status bar should be one line. Candidate fields, in priority order:
 
 Status should come from controller state changes, not by tailing logs.
 
-## Startup Dialog And Config Editing
+## Default Entry Point And Config Editing
 
-The TUI startup dialog should produce structured sandbox configuration. CLI
-flags can pre-fill or bypass choices, but the dialog is the interactive source
-for missing startup decisions.
+When no `.sandbox/config.json`, setup tool, or command override supplies an
+entry point, the wrapper starts `bash` without writing config. Known agent setup
+is opt-in through `--setup-tool` or explicit config editing.
 
-Config editor and startup choices:
+Config editor choices:
 
 - Setup recipe: Codex, Pi, or custom command.
 - Project path when not supplied.
@@ -196,13 +197,13 @@ generation, not as executable-name inference from `codex-wrap`.
 4. Route keyboard input, resize, and signal/control events through the TUI.
 5. Add the status bar.
 6. Add wrapper prompt focus.
-7. Add the startup dialog and Codex mount configuration.
+7. Add explicit setup/config editing for Codex mount configuration.
 8. Keep documentation and tests aligned with explicit wrapper startup, not
    executable-name aliases.
 9. Add validation coverage and an interactive smoke workflow.
 
 This order keeps a working plain path available until the TUI replacement can
-start a configured sandbox without relying on executable names.
+start sandbox payloads without relying on executable names.
 
 ## Validation Plan
 
@@ -215,12 +216,13 @@ Fast offline tests should cover:
 - Key-event to guest-byte translation.
 - Focus routing: prompt input does not leak to the guest.
 - Status formatting/truncation.
-- Codex mount configuration generated from the startup choices.
+- Codex mount configuration generated from explicit setup/config choices.
 - `argv[0]` no longer selects tool/wrapper behavior.
 
 Manual live smoke should cover:
 
-1. Start an interactive sandbox and confirm the TUI appears by default.
+1. Start an interactive sandbox and confirm the TUI appears by default, running
+   `bash` for an unconfigured project.
 2. Configure Codex or Pi and verify tool state dirs are present as rw mounts in
    the generated composed-fs manifest.
 3. Type into the guest terminal and confirm guest output stays inside the frame.

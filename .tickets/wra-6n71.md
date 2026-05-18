@@ -2,7 +2,7 @@
 id: wra-6n71
 status: closed
 deps: [wra-09v9]
-links: []
+links: [wra-d0q5]
 created: 2026-05-17T10:20:02Z
 type: task
 priority: 2
@@ -40,3 +40,7 @@ Continuation-2 iteration 14: extracted vm-frontend/src/self_test_payload.rs from
 **2026-05-17T18:43:22Z**
 
 Continuation-2 iteration 15: moved the live validation entrypoint off the production agentvm argv0. `agentvm self-test` now returns `unknown command: self-test`; live validation uses `cargo run --manifest-path vm-frontend/Cargo.toml --offline --bin agentvm-frontend -- self-test ...` instead. Updated vm-frontend/validate.sh plus README/validation-workflow examples accordingly. This preserves live scenario behavior while keeping the user-facing production wrapper CLI from owning/exposing the self-test command. Required validation passed after the change: ./vm-frontend/validate.sh required. Focused coverage also passed: agentvm_argv0_does_not_expose_self_test_command, self_test::tests, docs drift, and rustfmt check.
+
+**2026-05-18T05:40:01Z**
+
+Follow-up cleanup ticket wra-d0q5 was created under wra-9m5h for remaining frontend self-test harness code still exposed through production binary plumbing. Keep this ticket closed; wra-d0q5 owns the remaining production-surface deletion.

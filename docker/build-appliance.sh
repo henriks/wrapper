@@ -10,12 +10,20 @@ readonly OUT_DIR="${SCRIPT_DIR}/out"
 readonly ROOTFS_IMAGE="${OUT_DIR}/rootfs.raw"
 readonly MANIFEST_PATH="${OUT_DIR}/artifact-manifest.json"
 readonly GUEST_INIT_PATH="${ROOTFS_DIR}/usr/local/sbin/agentvm-init"
-readonly GUEST_BRIDGE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-socket-bridge"
-readonly GUEST_PAYLOAD_SERVER_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-payload-server"
-readonly GUEST_RUST_SERVICE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-guest-service"
+readonly GUEST_SERVICE_PATH="${ROOTFS_DIR}/usr/local/libexec/agentvm-guest-service"
 readonly MINIROOTFS_TARBALL="${BUILD_DIR}/alpine-minirootfs.tar.gz"
-readonly OPTIONAL_GUEST_SERVICE_BIN="${AGENTVM_GUEST_SERVICE_BIN:-}"
-readonly PAYLOAD_SERVICE_IMPL="${AGENTVM_PAYLOAD_SERVICE:-python}"
+readonly GUEST_SERVICE_BIN="${AGENTVM_GUEST_SERVICE_BIN:-}"
+readonly REPO_ROOT="${SCRIPT_DIR}/.."
+
+GUEST_SERVICE_SOURCE_FILES=(
+  Cargo.toml
+  Cargo.lock
+  guest-service/Cargo.toml
+  guest-service/src/lib.rs
+  guest-service/src/main.rs
+  payload-protocol/Cargo.toml
+  payload-protocol/src/lib.rs
+)
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
@@ -38,34 +46,86 @@ require_commands() {
   fi
 }
 
-require_optional_guest_service_binary() {
-  case "${PAYLOAD_SERVICE_IMPL}" in
-    python|rust) ;;
+require_guest_service_binary() {
+  if [[ -z "${GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN is required" >&2
+    echo "hint: build with: cargo build --target x86_64-unknown-linux-musl --bin agentvm-guest-service" >&2
+    return 1
+  fi
+  if [[ ! -f "${GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN does not name a file: ${GUEST_SERVICE_BIN}" >&2
+    return 1
+  fi
+  if [[ ! -x "${GUEST_SERVICE_BIN}" ]]; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN must be executable: ${GUEST_SERVICE_BIN}" >&2
+    return 1
+  fi
+  require_guest_compatible_rust_service_binary "${GUEST_SERVICE_BIN}"
+  require_guest_service_binary_fresh "${GUEST_SERVICE_BIN}"
+}
+
+repo_relative_path() {
+  local path=$1
+  local relative
+  relative=$(realpath --relative-to="${REPO_ROOT}" "${path}")
+  case "${relative}" in
+    ../*|/*) return 1 ;;
+    *) printf '%s\n' "${relative}" ;;
+  esac
+}
+
+require_guest_service_binary_fresh() {
+  local binary=$1
+  local relative
+  if ! relative=$(repo_relative_path "${binary}"); then
+    return 0
+  fi
+
+  local source
+  local source_path
+  for source in "${GUEST_SERVICE_SOURCE_FILES[@]}"; do
+    source_path="${REPO_ROOT}/${source}"
+    if [[ ! -f "${source_path}" ]]; then
+      echo "error: missing guest-service source input: ${source}" >&2
+      return 1
+    fi
+    if [[ "${source_path}" -nt "${binary}" ]]; then
+      echo "error: AGENTVM_GUEST_SERVICE_BIN is stale relative to ${source}" >&2
+      echo "error: ${relative} is older than guest-service source inputs" >&2
+      echo "hint: rebuild with: cargo build --target x86_64-unknown-linux-musl --bin agentvm-guest-service" >&2
+      return 1
+    fi
+  done
+}
+
+require_guest_compatible_rust_service_binary() {
+  local binary=$1
+  if ! command -v readelf >/dev/null 2>&1; then
+    echo "error: readelf is required to validate AGENTVM_GUEST_SERVICE_BIN compatibility" >&2
+    return 1
+  fi
+  if ! readelf -h "${binary}" >/dev/null 2>&1; then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN must be an ELF binary for the Alpine/musl guest: ${binary}" >&2
+    echo "hint: build with: cargo build --target x86_64-unknown-linux-musl --bin agentvm-guest-service" >&2
+    return 1
+  fi
+  local interpreter
+  interpreter=$(readelf -l "${binary}" 2>/dev/null | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p' | head -n1)
+  case "${interpreter}" in
+    ""|/lib/ld-musl-*.so.*) ;;
     *)
-      echo "error: AGENTVM_PAYLOAD_SERVICE must be 'python' or 'rust': ${PAYLOAD_SERVICE_IMPL}" >&2
+      echo "error: AGENTVM_GUEST_SERVICE_BIN is not compatible with the Alpine/musl guest: ${binary}" >&2
+      echo "error: unsupported ELF interpreter: ${interpreter}" >&2
+      echo "hint: build with: cargo build --target x86_64-unknown-linux-musl --bin agentvm-guest-service" >&2
       return 1
       ;;
   esac
-  if [[ "${PAYLOAD_SERVICE_IMPL}" == "rust" && -z "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    echo "error: AGENTVM_PAYLOAD_SERVICE=rust requires AGENTVM_GUEST_SERVICE_BIN" >&2
-    return 1
-  fi
-  if [[ -z "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    return 0
-  fi
-  if [[ ! -f "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    echo "error: AGENTVM_GUEST_SERVICE_BIN does not name a file: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
-    return 1
-  fi
-  if [[ ! -x "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    echo "error: AGENTVM_GUEST_SERVICE_BIN must be executable: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
-    return 1
-  fi
 }
 
 require_version_pins() {
   local required=(
     DOCKER_TCP_PORT
+    DOCKER_STORAGE_DRIVER
     PAYLOAD_TCP_PORT
     CONFIG_VIRTIOFS_TAG
     DOCKER_ENGINE_VERSION
@@ -76,7 +136,6 @@ require_version_pins() {
     E2FSPROGS_VERSION
     IPROUTE2_VERSION
     UTIL_LINUX_VERSION
-    BUBBLEWRAP_VERSION
     BASH_VERSION
     NODEJS_VERSION
     NPM_VERSION
@@ -119,6 +178,16 @@ ${ALPINE_MIRROR}/${ALPINE_BRANCH}/community
 EOF
 }
 
+agentvm_env_contents() {
+  cat <<EOF
+DOCKER_TCP_PORT=${DOCKER_TCP_PORT}
+DOCKER_STORAGE_DRIVER=${DOCKER_STORAGE_DRIVER}
+PAYLOAD_TCP_PORT=${PAYLOAD_TCP_PORT}
+VIRTIOFS_TAG=${VIRTIOFS_TAG}
+CONFIG_VIRTIOFS_TAG=${CONFIG_VIRTIOFS_TAG}
+EOF
+}
+
 install_guest_assets() {
   install -d \
     "${ROOTFS_DIR}/etc" \
@@ -126,22 +195,12 @@ install_guest_assets() {
     "${ROOTFS_DIR}/usr/local/sbin" \
     "${ROOTFS_DIR}/usr/local/libexec"
   install -m 0755 "${SCRIPT_DIR}/guest-init.sh" "${GUEST_INIT_PATH}"
-  install -m 0755 "${SCRIPT_DIR}/guest-socket-bridge.py" "${GUEST_BRIDGE_PATH}"
-  install -m 0755 "${SCRIPT_DIR}/guest-payload-server.py" "${GUEST_PAYLOAD_SERVER_PATH}"
-  if [[ -n "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    install -m 0755 "${OPTIONAL_GUEST_SERVICE_BIN}" "${GUEST_RUST_SERVICE_PATH}"
-  fi
-  cat > "${ROOTFS_DIR}/etc/agentvm.env" <<EOF
-DOCKER_TCP_PORT=${DOCKER_TCP_PORT}
-PAYLOAD_TCP_PORT=${PAYLOAD_TCP_PORT}
-VIRTIOFS_TAG=${VIRTIOFS_TAG}
-CONFIG_VIRTIOFS_TAG=${CONFIG_VIRTIOFS_TAG}
-EOF
+  install -m 0755 "${GUEST_SERVICE_BIN}" "${GUEST_SERVICE_PATH}"
+  agentvm_env_contents > "${ROOTFS_DIR}/etc/agentvm.env"
   cat > "${ROOTFS_DIR}/etc/mkinitfs/mkinitfs.conf" <<'EOF'
 features="base virtio ext4"
 EOF
   install -d \
-    "${ROOTFS_DIR}/workspace" \
     "${ROOTFS_DIR}/var/lib/docker" \
     "${ROOTFS_DIR}/var/tmp" \
     "${ROOTFS_DIR}/run" \
@@ -181,7 +240,7 @@ EOF
   cp /etc/resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
 
   run_in_chroot "apk update"
-  run_in_chroot "apk add --no-cache docker-engine=${DOCKER_ENGINE_VERSION} docker-cli=${DOCKER_CLI_VERSION} linux-virt=${LINUX_VIRT_VERSION} mkinitfs=${MKINITFS_VERSION} python3=${PYTHON3_VERSION} e2fsprogs=${E2FSPROGS_VERSION} iproute2=${IPROUTE2_VERSION} util-linux=${UTIL_LINUX_VERSION} bubblewrap=${BUBBLEWRAP_VERSION} bash=${BASH_VERSION} nodejs=${NODEJS_VERSION} npm=${NPM_VERSION} ca-certificates"
+  run_in_chroot "apk add --no-cache docker-engine=${DOCKER_ENGINE_VERSION} docker-cli=${DOCKER_CLI_VERSION} linux-virt=${LINUX_VIRT_VERSION} mkinitfs=${MKINITFS_VERSION} python3=${PYTHON3_VERSION} e2fsprogs=${E2FSPROGS_VERSION} iproute2=${IPROUTE2_VERSION} util-linux=${UTIL_LINUX_VERSION} bash=${BASH_VERSION} nodejs=${NODEJS_VERSION} npm=${NPM_VERSION} ca-certificates"
   run_in_chroot "kernel_version=\$(basename /lib/modules/*) && mkinitfs -b / \"\${kernel_version}\""
   run_in_chroot "rm -rf /var/cache/apk/* /usr/share/man/* /usr/share/doc/* /usr/share/locale/*"
   rm -f "${ROOTFS_DIR}/etc/resolv.conf"
@@ -215,43 +274,40 @@ source_inputs_json() {
     appliance.env
     build-appliance.sh
     guest-init.sh
-    guest-payload-server.py
-    guest-socket-bridge.py
     refresh-pins.sh
   )
   local first=true
   local file
+  local path
   local hash
   for file in "${files[@]}"; do
-    hash=$(sha256sum "${SCRIPT_DIR}/${file}" | awk '{print $1}')
+    path="docker/${file}"
+    hash=$(sha256sum "${REPO_ROOT}/${path}" | awk '{print $1}')
     if [[ "${first}" == true ]]; then
       first=false
     else
       printf ',\n'
     fi
-    printf '    { "path": "docker/%s", "sha256": "%s" }' "${file}" "${hash}"
+    printf '    { "path": "%s", "sha256": "%s" }' "${path}" "${hash}"
   done
-  if [[ -n "${OPTIONAL_GUEST_SERVICE_BIN}" ]]; then
-    local optional_path
-    optional_path=$(realpath --relative-to="${SCRIPT_DIR}/.." "${OPTIONAL_GUEST_SERVICE_BIN}")
-    case "${optional_path}" in
-      ../*|/*)
-        echo "error: AGENTVM_GUEST_SERVICE_BIN must be inside the repository: ${OPTIONAL_GUEST_SERVICE_BIN}" >&2
-        exit 1
-        ;;
-    esac
-    hash=$(sha256sum "${OPTIONAL_GUEST_SERVICE_BIN}" | awk '{print $1}')
-    printf ',\n    { "path": "%s", "sha256": "%s" }' "${optional_path}" "${hash}"
+
+  for path in "${GUEST_SERVICE_SOURCE_FILES[@]}"; do
+    hash=$(sha256sum "${REPO_ROOT}/${path}" | awk '{print $1}')
+    printf ',\n    { "path": "%s", "sha256": "%s" }' "${path}" "${hash}"
+  done
+
+  local guest_service_path
+  if ! guest_service_path=$(repo_relative_path "${GUEST_SERVICE_BIN}"); then
+    echo "error: AGENTVM_GUEST_SERVICE_BIN must be inside the repository: ${GUEST_SERVICE_BIN}" >&2
+    exit 1
   fi
+  hash=$(sha256sum "${GUEST_SERVICE_BIN}" | awk '{print $1}')
+  printf ',\n    { "path": "%s", "sha256": "%s" }' "${guest_service_path}" "${hash}"
   printf '\n'
 }
 
 kernel_cmdline() {
-  local cmdline="console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
-  if [[ "${PAYLOAD_SERVICE_IMPL}" != "python" ]]; then
-    cmdline+=" agentvm_payload_service=${PAYLOAD_SERVICE_IMPL}"
-  fi
-  printf '%s\n' "${cmdline}"
+  printf '%s\n' "console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet"
 }
 
 write_manifest() {
@@ -276,8 +332,9 @@ $(source_inputs_json)  ],
   "guest": {
     "docker_socket": "/var/run/docker.sock",
     "docker_tcp_port": ${DOCKER_TCP_PORT},
+    "docker_storage_driver": "${DOCKER_STORAGE_DRIVER}",
     "payload_tcp_port": ${PAYLOAD_TCP_PORT},
-    "workspace_mount": "/workspace",
+    "project_mount": "configured project_path",
     "state_disk_role": "root-overlay"
   },
   "versions": {
@@ -290,7 +347,6 @@ $(source_inputs_json)  ],
     "e2fsprogs": "${E2FSPROGS_VERSION}",
     "iproute2": "${IPROUTE2_VERSION}",
     "util_linux": "${UTIL_LINUX_VERSION}",
-    "bubblewrap": "${BUBBLEWRAP_VERSION}",
     "bash": "${BASH_VERSION}",
     "nodejs": "${NODEJS_VERSION}",
     "npm": "${NPM_VERSION}",
@@ -305,7 +361,7 @@ main() {
   require_root
   require_commands
   require_version_pins
-  require_optional_guest_service_binary
+  require_guest_service_binary
   clean_dirs
   bootstrap_rootfs
   write_apk_repositories

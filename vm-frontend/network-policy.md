@@ -64,7 +64,7 @@ Protocol defaults:
 
 - ARP to the configured gateway is allowed.
 - IPv4 is the only network layer supported in v1.
-- IPv6 is denied and logged.
+- Guest init disables IPv6 for the VM network defaults and selected interface; any IPv6 frame that still reaches vmnet is denied and logged as defense in depth.
 - ICMP to the gateway may be allowed for guest diagnostics.
 - UDP is denied by default except DNS to the gateway DNS proxy.
 - UDP/443 is always denied to prevent QUIC bypass.

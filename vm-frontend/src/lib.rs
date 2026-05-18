@@ -18,6 +18,7 @@ pub mod launch;
 pub mod network_policy;
 pub mod payload_client;
 pub mod runtime_manifest;
+pub(crate) mod stream_buffer;
 pub mod supervisor;
 pub mod supervisor_control;
 pub mod tcp_gateway;
@@ -50,6 +51,7 @@ pub struct RuntimePaths {
     pub config_fs_manifest: PathBuf,
     pub guest_config_dir: PathBuf,
     pub composed_bind_manifest: PathBuf,
+    pub guest_launch_config: PathBuf,
     pub config_fs_sock: PathBuf,
     pub vmnet_sock: PathBuf,
     pub vmnet_event_log: PathBuf,
@@ -73,6 +75,7 @@ impl RuntimePaths {
             config_fs_manifest: run_dir.join("config-fs-manifest.json"),
             guest_config_dir: run_dir.join("guest-config"),
             composed_bind_manifest: run_dir.join("guest-config").join("composed-binds.json"),
+            guest_launch_config: run_dir.join("guest-config").join("launch.json"),
             config_fs_sock: run_dir.join("guest-config.sock"),
             vmnet_sock: run_dir.join("vmnet.sock"),
             vmnet_event_log: run_dir.join("vmnet-events.log"),
@@ -134,6 +137,7 @@ pub struct FrontendConfig {
     pub vm: VmShape,
     pub network: GuestNetwork,
     pub guest_http_smoke_url: Option<String>,
+    pub guest_log_dir: Option<String>,
     pub upstream_mappings: Vec<UpstreamMapping>,
 }
 
@@ -322,25 +326,7 @@ impl FrontendConfig {
     }
 
     fn kernel_cmdline(&self) -> String {
-        let mut cmdline = self.vm.kernel_cmdline.clone();
-        append_kernel_arg(
-            &mut cmdline,
-            "agentvm_project",
-            &self.project.display().to_string(),
-        );
-        append_kernel_arg(&mut cmdline, "agentvm_guest_ip", &self.network.guest_ip);
-        append_kernel_arg(&mut cmdline, "agentvm_gateway_ip", &self.network.gateway_ip);
-        append_kernel_arg(
-            &mut cmdline,
-            "agentvm_prefix_len",
-            &self.network.prefix_len.to_string(),
-        );
-        append_kernel_arg(&mut cmdline, "agentvm_dns", &self.network.dns_ip);
-        append_kernel_arg(&mut cmdline, "agentvm_guest_mac", &self.network.guest_mac);
-        if let Some(url) = &self.guest_http_smoke_url {
-            append_kernel_arg(&mut cmdline, "agentvm_http_smoke_url", url);
-        }
-        cmdline
+        self.vm.kernel_cmdline.clone()
     }
 
     fn stream_netdev_arg(&self) -> String {
@@ -385,15 +371,6 @@ pub struct ProcessSpec {
     pub stdout_log: PathBuf,
 }
 
-fn append_kernel_arg(cmdline: &mut String, key: &str, value: &str) {
-    if !cmdline.is_empty() {
-        cmdline.push(' ');
-    }
-    cmdline.push_str(key);
-    cmdline.push('=');
-    cmdline.push_str(value);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +395,7 @@ mod tests {
             },
             network: GuestNetwork::default(),
             guest_http_smoke_url: None,
+            guest_log_dir: None,
             upstream_mappings: Vec::new(),
         }
     }
@@ -461,14 +439,16 @@ mod tests {
     }
 
     #[test]
-    fn can_add_guest_http_smoke_url_to_kernel_cmdline() {
+    fn dynamic_metadata_is_not_added_to_kernel_cmdline() {
         let mut config = config();
         config.guest_http_smoke_url = Some("http://93.184.216.34/".to_string());
 
         let command = config.build_microvm_qemu_command();
         let joined = command.join(" ");
 
-        assert!(joined.contains("agentvm_http_smoke_url=http://93.184.216.34/"));
+        assert!(!joined.contains("agentvm_project="));
+        assert!(!joined.contains("agentvm_guest_ip="));
+        assert!(!joined.contains("agentvm_http_smoke_url="));
     }
 
     #[test]

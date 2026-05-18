@@ -30,3 +30,9 @@ Validation:
 - Offline tests for zero-length, wrong-size, and temp/partial state disks.
 - Live persistence test that corrupts/deletes state.raw and verifies deterministic rebuild or clear refusal.
 
+
+## Notes
+
+**2026-05-18T10:38:23Z**
+
+Follow-up cleanup scan under wra-emj5: keep this fix deletion-oriented. Replace the current exists-means-valid state disk behavior with temp-file formatting plus direct size/ext4 validation or deterministic rebuild/refusal. Avoid adding long-lived sidecar compatibility metadata unless direct validation is insufficient and the need is documented.

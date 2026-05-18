@@ -33,8 +33,8 @@ The first `/dev/kvm` check was sandbox-limited. The corrected host check was:
 crw-rw-rw- 1 root kvm 10, 232 May 13 09:47 /dev/kvm
 ```
 
-`wra-p7m4` covered the initial runtime implementation. `wra-pah4` is the
-remaining end-to-end validation gate for replacing the Python frontend path.
+`wra-p7m4` covered the initial runtime implementation. Current end-to-end
+validation runs through the Rust frontend and Rust vmnet runtime.
 
 ## Checks Run
 
@@ -71,7 +71,7 @@ Results:
   access `/dev/kvm`. The frontend started embedded composed-fs/config-fs and
   QEMU; `console.log` reached guest init lines for loading `virtio_net`,
   configuring `eth0` as `10.0.2.15/24 via 10.0.2.2`, and starting dockerd,
-  socket bridge, and payload server. QEMU was intentionally killed after 10
+  the Rust Docker bridge, and the Rust payload service. QEMU was intentionally killed after 10
   seconds by `--qemu-timeout-seconds`, so this is a launch/boot smoke, not the
   final HTTP egress smoke.
 - The Rust launcher writes `.sandbox/docker-vm/run/state.json`. A follow-up
@@ -86,10 +86,9 @@ Results:
   events. The bounded boot smoke created the file but it stayed empty because
   no guest HTTP request was triggered during the timed run.
 - `agentvm-frontend prepare --guest-http-smoke-url http://93.184.216.34/`
-  appends `agentvm_http_smoke_url=http://93.184.216.34/` to the generated
-  kernel command line. The current boot artifacts must be rebuilt from the
-  updated `docker/guest-init.sh` before this smoke hook can execute inside the
-  guest.
+  writes the smoke URL into `guest-config/launch.json`, which is exposed through
+  the `agentvm-config` virtiofs channel. The kernel command line remains limited
+  to boot-critical flags.
 - After the appliance rebuild, a local-upstream HTTP smoke passed through the
   Rust stream gateway. The guest requested `http://198.51.100.10/`, while
   `--local-http-smoke-upstream 198.51.100.10:80` mapped that destination to a
@@ -109,8 +108,8 @@ Results:
   sees `Connection refused`; `vmnet-events.log` records
   `tcp_denied_preaccept dst=198.51.100.10:80 action=Deny reason=destination denied by egress policy`.
 - Payload host ingress works through a frontend-owned listener. Launching with
-  `--no-net --host-payload-listener 12076:1076`, then sending the payload server
-  ping frame to `127.0.0.1:12076`, returns frame `K` with payload `ok`.
+  `--no-net --host-payload-listener 12076:1076`, then sending the payload
+  protocol ping frame to `127.0.0.1:12076`, returns frame `K` with payload `ok`.
   `vmnet-events.log` records `host_ingress_opened`,
   `host_ingress_host_payload`, `host_ingress_guest_payload`, and
   `host_ingress_guest_closed` for guest port `1076`.
@@ -118,10 +117,10 @@ Results:
   host listener. Launching with
   `--no-net --host-docker-listener 12375:1075`, then running
   `curl --unix-socket .sandbox/docker-vm/run/docker.sock http://docker/_ping`,
-  returns Docker `HTTP/1.1 200 OK` with body `OK`. The correct guest socket
-  bridge port is `1075`, not Docker's conventional `2375`.
+  returns Docker `HTTP/1.1 200 OK` with body `OK`. The Rust guest Docker bridge
+  port is `1075`, not Docker's conventional `2375`.
 - Published TCP ingress works through the same frontend path. Launching with
-  `--publish 12077:1076`, then sending the payload server ping frame to
+  `--publish 12077:1076`, then sending the payload protocol ping frame to
   `127.0.0.1:12077`, returns frame `K` with payload `ok`. The vmnet log records
   `purpose=PublishedTcp` events and the generated QEMU command still contains
   no `hostfwd`.

@@ -12,7 +12,7 @@ use crate::dns_proxy::{
     DnsUpstream, DnsUpstreamError, UdpDnsUpstream,
 };
 use crate::guest_tcp::{
-    evaluate_tcp_syn_frame, GuestTcpConnectError, GuestTcpCore, GuestTcpCoreError,
+    evaluate_tcp_syn_frame, GuestTcpConnectError, GuestTcpCore, GuestTcpCoreError, GuestTcpReap,
     GuestTcpSessionRef, QueuedEthernetDevice, DEFAULT_GATEWAY_MAC,
 };
 use crate::l2_gateway::{ipv4_checksum, L2Gateway, ParseAddressError};
@@ -26,7 +26,7 @@ pub struct VmnetGateway<'a> {
     l2: L2Gateway,
     tcp_core: GuestTcpCore,
     tcp_device: QueuedEthernetDevice,
-    dns_upstream: Box<dyn DnsUpstream>,
+    dns_upstream: Box<dyn DnsUpstream + Send + Sync>,
 }
 
 impl<'a> VmnetGateway<'a> {
@@ -42,7 +42,7 @@ impl<'a> VmnetGateway<'a> {
         policy: &'a VmnetPolicy,
         network: &GuestNetwork,
         now: Instant,
-        dns_upstream: Box<dyn DnsUpstream>,
+        dns_upstream: Box<dyn DnsUpstream + Send + Sync>,
     ) -> Result<Self, VmnetGatewayError> {
         let mut tcp_device = QueuedEthernetDevice::new(ethernet_mtu(policy));
         let tcp_core = GuestTcpCore::new(network, DEFAULT_GATEWAY_MAC, now, &mut tcp_device)
@@ -239,6 +239,10 @@ impl<'a> VmnetGateway<'a> {
         self.drain_tcp_frames()
     }
 
+    pub fn reap_closed_tcp_sessions(&mut self) -> GuestTcpReap {
+        self.tcp_core.reap_closed_sessions()
+    }
+
     pub(crate) fn plan_dns_frame(&self, frame: &[u8]) -> Option<VmnetDnsFramePlan> {
         let query = parse_dns_query_frame(self.policy, frame)?;
         let context = query.response_context();
@@ -352,7 +356,6 @@ pub(crate) struct VmnetPendingDnsQuery {
 }
 
 impl VmnetPendingDnsQuery {
-    #[allow(dead_code)]
     pub(crate) fn service_command(&self, token: VmnetServiceToken) -> VmnetServiceCommand {
         VmnetServiceCommand::DnsLookup(VmnetDnsLookupCommand {
             token,
@@ -716,7 +719,10 @@ mod tests {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
         policy.egress.default_action = crate::network_policy::EgressAction::AllowPublicInternet;
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway = VmnetGateway::new_with_dns_upstream(
             &policy,
             &network,
@@ -959,7 +965,10 @@ mod tests {
     fn allowed_syn_installs_listener_and_polls_smoltcp() {
         let network = GuestNetwork::default();
         let mut policy = VmnetPolicy::default_sandbox(network.clone());
-        policy.egress.allow_ips.push(PUBLIC_IP.to_string());
+        policy
+            .egress
+            .allow_ip_or_cidr(PUBLIC_IP)
+            .expect("test allow ip");
         let mut gateway =
             VmnetGateway::new(&policy, &network, Instant::from_millis(0)).expect("gateway");
 
@@ -1084,7 +1093,7 @@ mod tests {
 
         #[test]
         fn proptest_default_policy_denied_syns_do_not_create_sessions(
-            dst_port in any::<u16>(),
+            dst_port in 1_u16..=u16::MAX,
         ) {
             let network = GuestNetwork::default();
             let policy = VmnetPolicy::default_sandbox(network.clone());
@@ -1257,7 +1266,7 @@ mod tests {
                 ),
                 8 => test_support::tcp_syn_frame(test_support::TEST_PUBLIC_IP, port),
                 9 => {
-                    policy.egress.allow_ips.push(test_support::TEST_PUBLIC_IP.to_string());
+                    policy.egress.allow_ip_or_cidr(test_support::TEST_PUBLIC_IP).expect("test allow ip");
                     gateway = VmnetGateway::new_with_dns_upstream(
                         &policy,
                         &network,
@@ -1315,7 +1324,7 @@ mod tests {
             let network = GuestNetwork::default();
             let mut policy = VmnetPolicy::default_sandbox(network.clone());
             if allowed {
-                policy.egress.allow_ips.push(test_support::TEST_PUBLIC_IP.to_string());
+                policy.egress.allow_ip_or_cidr(test_support::TEST_PUBLIC_IP).expect("test allow ip");
             }
             let mut gateway = VmnetGateway::new(&policy, &network, Instant::from_millis(0))
                 .expect("gateway");

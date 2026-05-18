@@ -7,7 +7,7 @@ This document describes the current VM-only runtime operated by the Rust
 
 - The agent payload always runs inside a project-scoped QEMU microvm.
 - Docker runs inside the same guest and is available to payloads through the
-  guest socket bridge at `tcp://127.0.0.1:1075`.
+  Rust guest Docker bridge at `tcp://127.0.0.1:1075`.
 - The host does not run the payload under Bubblewrap.
 - Filesystem sharing is served by embedded Rust composed-fs instances.
 - Guest networking is enforced by the Rust userspace vmnet gateway over QEMU
@@ -43,7 +43,7 @@ sudo docker/build-appliance.sh
       qemu.log
       vmnet-events.log
       guest-dockerd.log
-      guest-socket-bridge.log
+      guest-docker-bridge.log
       guest-payload-server.log
       docker.sock
       virtiofs.sock
@@ -108,19 +108,26 @@ cargo test --manifest-path vm-frontend/Cargo.toml --offline
 KVM self-test:
 
 ```sh
+publish_port=$(python3 - <<'PY'
+import socket
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)
 cargo run --manifest-path vm-frontend/Cargo.toml --offline -- \
   self-test \
   --project "$PWD" \
   --run-dir "$PWD/.sandbox/docker-vm/self-test" \
   --artifact-manifest "$PWD/docker/out/artifact-manifest.json" \
   --qemu /usr/bin/qemu-system-x86_64 \
-  --publish-payload-port 12079
+  --publish-payload-port "${publish_port}"
 ```
 
 Expected output includes:
 
 ```text
-self-test: published payload port 12079 ok
+self-test: published payload port ${publish_port} ok
 self-test: payload-start
 self-test: home-ok
 self-test: uid-ok
@@ -150,7 +157,7 @@ Inspect:
 - `.sandbox/docker-vm/run/console.log`
 - `.sandbox/docker-vm/run/vmnet-events.log`
 - `.sandbox/docker-vm/run/guest-dockerd.log`
-- `.sandbox/docker-vm/run/guest-socket-bridge.log`
+- `.sandbox/docker-vm/run/guest-docker-bridge.log`
 - `.sandbox/docker-vm/run/guest-payload-server.log`
 
 Common causes:
@@ -160,6 +167,6 @@ Common causes:
 - Docker pull failures: inspect `vmnet-events.log` and guest Docker logs.
 - Payload behavior that does not match current guest source: rebuild
   `docker/out/rootfs.raw`; the generated artifacts may contain an older
-  `agentvm-payload-server`.
+  `agentvm-guest-service`.
 - Concurrent launch: wait for the active VM process or use `--reset` only
   after the lock is released.
