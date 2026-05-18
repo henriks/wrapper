@@ -2,8 +2,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::mpsc;
 
 use crate::supervisor::{LaunchSupervisor, SupervisorShutdown, SupervisorTaskResult};
 use crate::RuntimePaths;
@@ -69,6 +72,45 @@ impl SupervisorControlClient {
         .await?
         {
             SupervisorControlResponse::Ack => Ok(()),
+            SupervisorControlResponse::Error { message } => {
+                Err(SupervisorControlIoError::RemoteError { message })
+            }
+            response => Err(SupervisorControlIoError::UnexpectedResponse {
+                response: format!("{response:?}"),
+            }),
+        }
+    }
+
+    pub async fn subscribe_status(
+        &self,
+    ) -> Result<SupervisorStatusSubscription, SupervisorControlIoError> {
+        let mut stream = UnixStream::connect(&self.socket_path).await?;
+        write_control_message(&mut stream, &SupervisorControlRequest::SubscribeStatus).await?;
+        stream.shutdown().await?;
+        Ok(SupervisorStatusSubscription::new(stream))
+    }
+}
+
+#[derive(Debug)]
+pub struct SupervisorStatusSubscription {
+    reader: BufReader<UnixStream>,
+}
+
+impl SupervisorStatusSubscription {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            reader: BufReader::new(stream),
+        }
+    }
+
+    pub async fn next_snapshot(
+        &mut self,
+    ) -> Result<Option<SupervisorControlSnapshot>, SupervisorControlIoError> {
+        let Some(bytes) = read_bounded_control_line(&mut self.reader).await? else {
+            return Ok(None);
+        };
+        match decode_control_response(&bytes)? {
+            SupervisorControlResponse::StatusSnapshot { snapshot } => Ok(Some(snapshot)),
             SupervisorControlResponse::Error { message } => {
                 Err(SupervisorControlIoError::RemoteError { message })
             }
@@ -231,16 +273,27 @@ pub async fn handle_control_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let response = match read_bounded_control_message(&mut stream)
+    let request = read_bounded_control_message(&mut stream)
         .await
-        .and_then(|bytes| decode_control_request(&bytes).map_err(Into::into))
-    {
-        Ok(request) => apply_control_request(supervisor, request),
-        Err(error) => SupervisorControlResponse::Error {
-            message: error.to_string(),
-        },
-    };
-    write_control_message(&mut stream, &response).await?;
+        .and_then(|bytes| decode_control_request(&bytes).map_err(Into::into));
+    match request {
+        Ok(SupervisorControlRequest::SubscribeStatus) => {
+            stream_status_subscription(&mut stream, supervisor).await?;
+        }
+        Ok(request) => {
+            let response = apply_control_request(supervisor, request);
+            write_control_message(&mut stream, &response).await?;
+        }
+        Err(error) => {
+            write_control_message(
+                &mut stream,
+                &SupervisorControlResponse::Error {
+                    message: error.to_string(),
+                },
+            )
+            .await?;
+        }
+    }
     stream.shutdown().await?;
     Ok(())
 }
@@ -258,9 +311,66 @@ pub fn apply_control_request(
             SupervisorControlResponse::Ack
         }
         SupervisorControlRequest::SubscribeStatus => SupervisorControlResponse::Error {
-            message: "status subscriptions are not implemented yet".to_string(),
+            message: "status subscriptions must be served as a streaming connection".to_string(),
         },
     }
+}
+
+async fn stream_status_subscription<W>(
+    writer: &mut W,
+    supervisor: &LaunchSupervisor,
+) -> Result<(), SupervisorControlIoError>
+where
+    W: AsyncWrite + Unpin,
+{
+    write_control_message(
+        writer,
+        &SupervisorControlResponse::StatusSnapshot {
+            snapshot: SupervisorControlSnapshot::from_supervisor(supervisor),
+        },
+    )
+    .await?;
+
+    let mut changes = subscribe_status_changes(supervisor);
+    while changes.recv().await.is_some() {
+        write_control_message(
+            writer,
+            &SupervisorControlResponse::StatusSnapshot {
+                snapshot: SupervisorControlSnapshot::from_supervisor(supervisor),
+            },
+        )
+        .await?;
+        if supervisor.shutdown_requested() {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn subscribe_status_changes(supervisor: &LaunchSupervisor) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel(16);
+    for spec in supervisor.task_specs() {
+        let Some(mut status_rx) = supervisor.subscribe_task_status(spec.name) else {
+            continue;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            while status_rx.changed().await.is_ok() {
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    let mut shutdown_rx = supervisor.subscribe_shutdown();
+    tokio::spawn(async move {
+        while shutdown_rx.changed().await.is_ok() {
+            if tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 async fn write_control_message<W, T>(
@@ -273,6 +383,7 @@ where
 {
     let bytes = encode_control_message(message)?;
     writer.write_all(&bytes).await?;
+    writer.write_all(b"\n").await?;
     Ok(())
 }
 
@@ -291,6 +402,26 @@ where
         });
     }
     Ok(bytes)
+}
+
+async fn read_bounded_control_line<R>(
+    reader: &mut R,
+) -> Result<Option<Vec<u8>>, SupervisorControlIoError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut limited = reader.take(MAX_CONTROL_MESSAGE_BYTES + 1);
+    let read = limited.read_until(b'\n', &mut bytes).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() as u64 > MAX_CONTROL_MESSAGE_BYTES {
+        return Err(SupervisorControlIoError::MessageTooLarge {
+            limit: MAX_CONTROL_MESSAGE_BYTES,
+        });
+    }
+    Ok(Some(bytes))
 }
 
 fn decode_control_envelope<T>(bytes: &[u8]) -> Result<T, SupervisorControlProtocolError>
@@ -490,6 +621,61 @@ mod tests {
                 reason: "adapter requested shutdown".to_string(),
             }
         );
+        server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn control_client_subscription_streams_initial_updates_and_shutdown() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let socket = tempdir.path().join(CONTROL_SOCKET_FILE_NAME);
+        let listener = bind_control_socket(&socket).expect("bind control socket");
+        let supervisor = Arc::new(LaunchSupervisor::new(config().supervisor_plan()));
+        let qemu = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let server_supervisor = Arc::clone(&supervisor);
+        let server = tokio::spawn(async move {
+            serve_control_listener_until_shutdown(listener, server_supervisor).await
+        });
+        let client = SupervisorControlClient::new(socket);
+        let mut subscription = client.subscribe_status().await.expect("subscribe");
+
+        let initial = subscription
+            .next_snapshot()
+            .await
+            .expect("initial result")
+            .expect("initial snapshot");
+        assert!(initial.tasks.iter().any(|task| {
+            task.name == SupervisorTaskName::Qemu && task.status == SupervisorTaskStatus::Planned
+        }));
+
+        qemu.mark_ready().expect("mark qemu ready");
+        let ready = subscription
+            .next_snapshot()
+            .await
+            .expect("ready result")
+            .expect("ready snapshot");
+        assert!(ready.tasks.iter().any(|task| {
+            task.name == SupervisorTaskName::Qemu && task.status == SupervisorTaskStatus::Ready
+        }));
+
+        supervisor.request_shutdown("subscription test shutdown");
+        let shutdown = subscription
+            .next_snapshot()
+            .await
+            .expect("shutdown result")
+            .expect("shutdown snapshot");
+        assert_eq!(
+            shutdown.shutdown,
+            SupervisorShutdown::Requested {
+                reason: "subscription test shutdown".to_string(),
+            }
+        );
+        assert!(subscription
+            .next_snapshot()
+            .await
+            .expect("stream eof")
+            .is_none());
         server.await.expect("server join").expect("server result");
     }
 

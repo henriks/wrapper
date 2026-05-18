@@ -23,6 +23,9 @@ use agentvm_frontend::payload_client::{
     DiagnosticRequest, PayloadClientError, PayloadControlOptions, PayloadRequest,
 };
 use agentvm_frontend::runtime_manifest::{guest_runtime_mounts, GuestShareSpec, RuntimeMount};
+use agentvm_frontend::supervisor_control::{
+    control_socket_path, SupervisorControlClient, SupervisorControlIoError,
+};
 use agentvm_frontend::tcp_gateway::UpstreamMapping;
 use agentvm_frontend::vmnet_runtime::{serve_vmnet_gateway, VmnetRuntimeError};
 use agentvm_frontend::{FrontendConfig, GuestNetwork, RuntimePaths};
@@ -99,12 +102,12 @@ async fn run_cli_async(argv: Vec<String>) -> CliResult<()> {
             Some("self-test") => Err(CliError::UnknownCommand {
                 command: "self-test".to_string(),
             }),
-            Some("launch") => run_async(args).await,
+            Some("launch" | "control") => run_async(args).await,
             _ => run_wrapper(args).map_err(Into::into),
         };
     }
     match args.first().map(String::as_str) {
-        Some("launch") => run_async(args).await,
+        Some("launch" | "control") => run_async(args).await,
         Some("prepare" | "vmnet-gateway" | "payload-client" | "self-test")
         | Some("-h" | "--help")
         | None => run(args),
@@ -201,6 +204,10 @@ enum CliError {
     PayloadCli(#[from] PayloadCliError),
     #[error(transparent)]
     PayloadClient(#[from] PayloadClientError),
+    #[error(transparent)]
+    SupervisorControl(#[from] SupervisorControlIoError),
+    #[error("failed to format supervisor control JSON: {source}")]
+    SupervisorControlJson { source: serde_json::Error },
     #[error("prepare failed: {source}")]
     Prepare { source: LaunchError },
     #[error(transparent)]
@@ -254,8 +261,106 @@ async fn run_async(args: impl IntoIterator<Item = String>) -> CliResult<()> {
                 .await
                 .map_err(Into::into)
         }
+        Some("control") => run_control_async(&args[1..]).await,
         _ => run(args),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControlCliConfig {
+    socket_path: PathBuf,
+    command: ControlCliCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlCliCommand {
+    Status,
+    Shutdown { reason: String },
+}
+
+async fn run_control_async(args: &[String]) -> CliResult<()> {
+    let config = control_cli_config_from_args(args).map_err(LaunchCliError::Message)?;
+    print!("{}", run_control_command_async(config).await?);
+    Ok(())
+}
+
+async fn run_control_command_async(config: ControlCliConfig) -> CliResult<String> {
+    let client = SupervisorControlClient::new(config.socket_path);
+    match config.command {
+        ControlCliCommand::Status => {
+            let snapshot = client.status_snapshot().await?;
+            let json = serde_json::to_string_pretty(&snapshot)
+                .map_err(|source| CliError::SupervisorControlJson { source })?;
+            Ok(format!("{json}\n"))
+        }
+        ControlCliCommand::Shutdown { reason } => {
+            client.request_shutdown(reason).await?;
+            Ok("shutdown requested\n".to_string())
+        }
+    }
+}
+
+fn control_cli_config_from_args(args: &[String]) -> Result<ControlCliConfig, String> {
+    let matches = parse_clap_matches(control_clap_command(), args)?;
+    let mut project = matches
+        .get_one::<String>("project")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let mut run_dir = matches
+        .get_one::<String>("run_dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".sandbox/docker-vm/run"));
+    if !project.is_absolute() {
+        project = absolute_cli_path(&project.display().to_string())?;
+    }
+    if !run_dir.is_absolute() {
+        run_dir = project.join(&run_dir);
+    }
+    let socket_path = matches
+        .get_one::<String>("socket")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| control_socket_path(&RuntimePaths::under(run_dir)));
+    let command = match matches.subcommand() {
+        Some(("status", _)) => ControlCliCommand::Status,
+        Some(("shutdown", subcommand)) => ControlCliCommand::Shutdown {
+            reason: subcommand
+                .get_one::<String>("reason")
+                .cloned()
+                .unwrap_or_else(|| "control client requested shutdown".to_string()),
+        },
+        _ => return Err("control command must be status or shutdown".to_string()),
+    };
+    Ok(ControlCliConfig {
+        socket_path,
+        command,
+    })
+}
+
+fn control_clap_command() -> ClapCommand {
+    ClapCommand::new("control")
+        .arg(
+            Arg::new("project")
+                .long("project")
+                .value_name("PATH")
+                .global(true),
+        )
+        .arg(
+            Arg::new("run_dir")
+                .long("run-dir")
+                .value_name("PATH")
+                .global(true),
+        )
+        .arg(
+            Arg::new("socket")
+                .long("socket")
+                .value_name("PATH")
+                .global(true),
+        )
+        .subcommand_required(true)
+        .subcommand(ClapCommand::new("status"))
+        .subcommand(
+            ClapCommand::new("shutdown").arg(Arg::new("reason").long("reason").value_name("TEXT")),
+        )
 }
 
 fn run(args: impl IntoIterator<Item = String>) -> CliResult<()> {
@@ -556,11 +661,12 @@ fn parse_port_pair(value: &str) -> Result<(u16, u16), String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: agentvm-frontend <prepare|launch|self-test|vmnet-gateway|payload-client> [options]\n\
+        "usage: agentvm-frontend <prepare|launch|control|self-test|vmnet-gateway|payload-client> [options]\n\
          prepare/launch options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--gh] [--aws PROFILE] [--ro PATH] [--rw PATH] [--guest-http-smoke-url URL] [--allow-public-internet|--no-net] [--qemu-timeout-seconds N] [--local-http-smoke-upstream IP:PORT] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--payload-script SCRIPT] [--payload-cwd PATH] [--payload-env KEY=VALUE] [--payload-no-stdin] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
          self-test options: [--project PATH] [--run-dir PATH] [--artifact-manifest PATH] [--qemu PATH] [--image IMAGE] [--publish-payload-port PORT] [--no-net] [--hostile]\n\
          vmnet-gateway options: --socket PATH [--allow-ip IP_OR_CIDR] [--allow-domain DOMAIN] [--allow-public-internet|--no-net] [--host-docker-listener HOST:GUEST] [--host-payload-listener HOST:GUEST] [--publish HOST:GUEST] [--pcap PATH] [--tls-ca-cert PATH --tls-ca-key PATH --tls-generate-per-host-certs]\n\
-         payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--diagnostic] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin] [--timeout-seconds N] [--max-output-bytes N]"
+         payload-client options: --port PORT [--host HOST] [--ping|--script SCRIPT] [--diagnostic] [--cwd PATH] [--env KEY=VALUE] [--rows N] [--cols N] [--no-stdin] [--timeout-seconds N] [--max-output-bytes N]\n\
+         control options: [--project PATH] [--run-dir PATH] [--socket PATH] <status|shutdown [--reason TEXT]>"
     );
 }
 
@@ -573,7 +679,14 @@ fn print_self_test_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentvm_frontend::supervisor::{
+        LaunchSupervisor, SupervisorShutdown, SupervisorTaskName, SupervisorTaskStatus,
+    };
+    use agentvm_frontend::supervisor_control::{
+        bind_control_socket, serve_control_listener_until_shutdown, SupervisorControlSnapshot,
+    };
     use std::ops::Deref;
+    use std::sync::Arc;
 
     struct TestTempDir {
         dir: tempfile::TempDir,
@@ -653,6 +766,131 @@ mod tests {
 
         assert!(matches!(error, VmnetCliError::MissingSocket));
         assert_eq!(error.to_string(), "--socket is required");
+    }
+
+    #[test]
+    fn parses_control_status_defaults_to_project_runtime_socket() {
+        let config = control_cli_config_from_args(&["status".to_string()]).expect("control config");
+        let expected = env::current_dir()
+            .expect("cwd")
+            .join(".sandbox/docker-vm/run/agentvm-control.sock");
+
+        assert_eq!(config.socket_path, expected);
+        assert_eq!(config.command, ControlCliCommand::Status);
+    }
+
+    #[test]
+    fn parses_control_shutdown_with_socket_override_and_reason() {
+        let config = control_cli_config_from_args(&[
+            "--socket".to_string(),
+            "/tmp/agentvm-control.sock".to_string(),
+            "shutdown".to_string(),
+            "--reason".to_string(),
+            "operator requested shutdown".to_string(),
+        ])
+        .expect("control config");
+
+        assert_eq!(
+            config.socket_path,
+            PathBuf::from("/tmp/agentvm-control.sock")
+        );
+        assert_eq!(
+            config.command,
+            ControlCliCommand::Shutdown {
+                reason: "operator requested shutdown".to_string(),
+            }
+        );
+    }
+
+    fn test_frontend_config(project: impl Into<PathBuf>) -> FrontendConfig {
+        let project = project.into();
+        FrontendConfig {
+            project: project.clone(),
+            tools: agentvm_frontend::ToolPaths {
+                qemu_system_x86_64: PathBuf::from("qemu-system-x86_64"),
+            },
+            artifacts: agentvm_frontend::VmArtifacts {
+                kernel: project.join("docker/out/vmlinuz"),
+                initrd: project.join("docker/out/initrd.img"),
+                rootfs: project.join("docker/out/rootfs.raw"),
+            },
+            runtime: RuntimePaths::under(project.join(".sandbox/docker-vm/run")),
+            vm: agentvm_frontend::VmShape {
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                cpus: 2,
+                kernel_cmdline: "console=ttyS0".to_string(),
+                virtiofs_tag: agentvm_frontend::COMPOSED_FS_TAG.to_string(),
+            },
+            network: GuestNetwork::default(),
+            guest_http_smoke_url: None,
+            upstream_mappings: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_status_command_reads_snapshot_from_socket() {
+        let root = unique_temp_dir();
+        let socket = root.join("agentvm-control.sock");
+        let listener = bind_control_socket(&socket).expect("bind control socket");
+        let supervisor = Arc::new(LaunchSupervisor::new(
+            test_frontend_config(root.as_ref()).supervisor_plan(),
+        ));
+        supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller")
+            .mark_ready()
+            .expect("mark qemu ready");
+        let server_supervisor = Arc::clone(&supervisor);
+        let server = tokio::spawn(async move {
+            serve_control_listener_until_shutdown(listener, server_supervisor).await
+        });
+
+        let output = run_control_command_async(ControlCliConfig {
+            socket_path: socket,
+            command: ControlCliCommand::Status,
+        })
+        .await
+        .expect("control status");
+        let snapshot: SupervisorControlSnapshot =
+            serde_json::from_str(&output).expect("snapshot json");
+        assert!(snapshot.tasks.iter().any(|task| {
+            task.name == SupervisorTaskName::Qemu && task.status == SupervisorTaskStatus::Ready
+        }));
+
+        supervisor.request_shutdown("status test finished");
+        server.await.expect("server join").expect("server result");
+    }
+
+    #[tokio::test]
+    async fn control_shutdown_command_requests_supervisor_shutdown() {
+        let root = unique_temp_dir();
+        let socket = root.join("agentvm-control.sock");
+        let listener = bind_control_socket(&socket).expect("bind control socket");
+        let supervisor = Arc::new(LaunchSupervisor::new(
+            test_frontend_config(root.as_ref()).supervisor_plan(),
+        ));
+        let server_supervisor = Arc::clone(&supervisor);
+        let server = tokio::spawn(async move {
+            serve_control_listener_until_shutdown(listener, server_supervisor).await
+        });
+
+        let output = run_control_command_async(ControlCliConfig {
+            socket_path: socket,
+            command: ControlCliCommand::Shutdown {
+                reason: "operator requested shutdown".to_string(),
+            },
+        })
+        .await
+        .expect("control shutdown");
+
+        assert_eq!(output, "shutdown requested\n");
+        assert_eq!(
+            supervisor.current_shutdown(),
+            SupervisorShutdown::Requested {
+                reason: "operator requested shutdown".to_string(),
+            }
+        );
+        server.await.expect("server join").expect("server result");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 ---
 id: wra-yl7i
-status: in_progress
+status: closed
 deps: [wra-n0fe, wra-zqci, wra-cvmy]
-links: [wra-bjaa, wra-zqci, wra-jkeg, wra-xcvq, wra-n0fe]
+links: [wra-bjaa, wra-zqci, wra-jkeg, wra-xcvq, wra-n0fe, wra-7t63]
 created: 2026-05-16T16:12:05Z
 type: feature
 priority: 1
@@ -73,3 +73,31 @@ Second control-plane seam: added bounded one-request Unix-socket IPC helpers in 
 **2026-05-17T21:06:38Z**
 
 Third control-plane seam: added SupervisorControlClient as a reusable frontend/TUI adapter with status_snapshot() and request_shutdown() methods, plus serve_control_listener_until_shutdown() for a sidecar server loop that accepts multiple local clients until the existing LaunchSupervisor shutdown watch fires. The loop spawns per-connection handlers so one slow client does not block later accepts. Added focused test proving the client adapter reads QEMU starting status over a Unix socket, requests shutdown, and the server loop exits. Launch/TUI ownership is still unchanged; this avoids exposing a live shutdown command before launch cancellation semantics are wired. Focused validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture; cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message.
+
+**2026-05-17T21:12:28Z**
+
+Fourth control-plane seam: wired supervisor shutdown requests into the supervised async QEMU wait path and exposed the supervisor-control sidecar in run_frontend_until_qemu_exit_with_policy_and_timeout_async. The async launch path now removes a stale agentvm-control.sock, binds the project-local control socket, serves control clients on a sidecar task subordinate to the existing LaunchSupervisor, and passes the supervisor shutdown watch into QEMU/service waiting. A control RequestShutdown now cancels services, marks QEMU cancelled, kills/waits the QEMU child, records terminated launch state with the shutdown reason, and stops the control sidecar. Added focused test supervised_async_qemu_shutdown_request_terminates_child_and_records_state. Validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervised_async_qemu_shutdown_request -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervised_ -- --nocapture.
+
+**2026-05-17T21:19:07Z**
+
+Fifth control-plane seam: implemented status streaming and a first TUI status attachment seam. SupervisorControlClient now has subscribe_status(), returning SupervisorStatusSubscription with bounded per-message next_snapshot() reads. SubscribeStatus connections stream an initial SupervisorControlSnapshot, then updated snapshots when task-status or shutdown watch channels change, and close after supervisor shutdown. Single-request control messages remain bounded by MAX_CONTROL_MESSAGE_BYTES; streaming message lines use the same bound. Added TUI helpers that summarize a SupervisorControlSnapshot / SupervisorControlClient::status_snapshot() result for the existing status bar without taking over payload viewport or VM lifecycle yet. Validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_snapshot_summary -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline tui -- --nocapture; cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message.
+
+**2026-05-17T21:22:14Z**
+
+Sixth control-plane seam: added a live CLI control-client path.  and  now dispatch through the async CLI runtime and use SupervisorControlClient against the project-local control socket. Defaults resolve to <project>/.sandbox/docker-vm/run/agentvm-control.sock, with --project, --run-dir, and --socket overrides.  prints a pretty JSON SupervisorControlSnapshot;  sends RequestShutdown and prints an acknowledgement. Added parser tests for default status socket resolution and shutdown socket/reason overrides. Validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml; cargo test --manifest-path vm-frontend/Cargo.toml --offline control_ -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline supervisor_control -- --nocapture; cargo test --manifest-path vm-frontend/Cargo.toml --offline tui -- --nocapture; cargo test --manifest-path vm-frontend/fuzz/Cargo.toml --offline --no-run --bin supervisor_control_message.
+
+**2026-05-17T21:22:24Z**
+
+Correction to previous note: the new commands are `agentvm control status` and `agentvm control shutdown [--reason TEXT]`. `agentvm control status` prints a pretty JSON SupervisorControlSnapshot, and `agentvm control shutdown` sends RequestShutdown through SupervisorControlClient and prints an acknowledgement.
+
+**2026-05-17T21:24:52Z**
+
+Split follow-up wra-7t63 for the larger payload viewport attach/detach/reconnect work. wra-7t63 depends on wra-yl7i and owns moving payload start/input/resize/signal/exit semantics behind the supervisor/control boundary. This keeps wra-yl7i focused on the option-1 supervisor-control boundary and avoids a broad TUI lifecycle rewrite in the current slice.
+
+**2026-05-17T21:25:21Z**
+
+Control CLI seam hardened with socket-backed tests. run_control_async now delegates to run_control_command_async so tests can exercise command behavior without capturing process stdout. Added Tokio tests that bind a real supervisor-control socket, serve LaunchSupervisor through serve_control_listener_until_shutdown, verify control status returns parseable SupervisorControlSnapshot with QEMU ready, and verify control shutdown requests SupervisorShutdown with the supplied reason. Focused validation passed: cargo fmt --manifest-path vm-frontend/Cargo.toml; cargo test --manifest-path vm-frontend/Cargo.toml --offline control_ -- --nocapture.
+
+**2026-05-17T21:28:37Z**
+
+Required/live-capable validation passed for the narrowed supervisor-control/TUI-observation slice: ./vm-frontend/validate.sh required exited successfully. This gate included formatting, offline tests, fuzz target compilation, live-smoke, and live-setup-tools with the current Python-default appliance. Acceptance mapping for this slice: typed bounded Unix-socket protocol exists; status snapshot/subscription and shutdown requests are implemented; shutdown requests are wired into async QEMU/service cancellation; async launches expose a supervisor-control sidecar; agentvm control status/shutdown provides a non-TUI client; TUI has a status-snapshot display seam. Larger payload viewport attach/detach/reconnect semantics are explicitly split to dependent follow-up wra-7t63.

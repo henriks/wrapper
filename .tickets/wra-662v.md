@@ -136,3 +136,27 @@ wra-xcvq-complete-epic iteration 1: user confirmed an appliance rebuild, but doc
 **2026-05-17T20:53:17Z**
 
 User reported appliance rebuild completed, so I inspected docker/out/artifact-manifest.json during iteration 39. The rebuilt manifest is still Python-default: kernel_cmdline is 'console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet' and does not include agentvm_payload_service=rust; source_inputs still include docker/guest-payload-server.py and no Rust guest-service binary artifact. Therefore this does not unblock Rust opt-in live validation/closure for wra-662v. Needed rebuild remains: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh
+
+**2026-05-17T21:30:03Z**
+
+wra-xcvq iteration 49 rechecked Rust opt-in closure state. Built target/debug/agentvm-guest-service successfully with cargo build --manifest-path guest-service/Cargo.toml --offline --bin agentvm-guest-service. Inspected docker/out/artifact-manifest.json: kernel_cmdline is still the Python-default `console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet`; it does not contain agentvm_payload_service=rust, and source_inputs still list docker/guest-payload-server.py. Attempted non-interactive Rust opt-in appliance rebuild again with sudo -n env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh; it failed because sudo requires a password. Required user-side command remains: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh. Do not close this ticket as Rust opt-in live-validated until that manifest is rebuilt and live validation is run, or until scope is explicitly narrowed with all Rust live appliance validation left to wra-y335.
+
+**2026-05-17T21:31:49Z**
+
+wra-xcvq iteration 50 focused implementation validation still passes while Rust opt-in appliance live validation remains blocked: cargo test --manifest-path guest-service/Cargo.toml --offline -- --nocapture passed; bash docker/tests/test_build_appliance.sh passed; sh docker/tests/test_guest_init.sh passed. No code changes. This reinforces that implementation/source tests are healthy, but does not exercise the Rust guest-service inside an opt-in appliance because sudo rebuild is unavailable in this environment.
+
+**2026-05-17T21:34:53Z**
+
+wra-xcvq iteration 52 recheck: target/debug/agentvm-guest-service still builds successfully (cargo build --manifest-path guest-service/Cargo.toml --offline --bin agentvm-guest-service). docker/out/artifact-manifest.json remains Python-default: kernel_cmdline is 'console=hvc0 root=/dev/vda rootfstype=ext4 ro init=/usr/local/sbin/agentvm-init quiet' and does not contain agentvm_payload_service=rust. No opt-in Rust appliance live validation can be claimed until the privileged rebuild is run: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh, followed by manifest inspection and live validation.
+
+**2026-05-17T21:35:37Z**
+
+wra-xcvq iteration 53: checked task readiness and current appliance manifest again. docker/out/artifact-manifest.json has a fresh timestamp but is still Python-default: kernel_cmdline lacks agentvm_payload_service=rust, source_inputs includes docker/guest-payload-server.py, and source_inputs do not include a Rust guest-service artifact. This confirms a default appliance rebuild occurred but not the required Rust opt-in rebuild. Needed command remains: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh
+
+**2026-05-17T21:36:42Z**
+
+wra-xcvq iteration 55: rechecked execution environment. target/debug/agentvm-guest-service exists and is executable, but sudo -n true still fails with 'sudo: a password is required', so this agent cannot perform the privileged Rust opt-in appliance rebuild. docker/out/artifact-manifest.json remains Python-default and source_inputs include docker/guest-payload-server.py only for the payload server. User-side command remains: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh
+
+**2026-05-17T21:38:35Z**
+
+wra-xcvq iteration 59 near-loop-end status: no Rust opt-in appliance rebuild or explicit scope-narrowing decision has been provided. Keep this ticket in_progress under current acceptance; do not close it on default Python required validation alone. Closure requires either a manifest containing agentvm_payload_service=rust plus Rust opt-in live validation, or an explicit acceptance/scope change assigning all opt-in appliance live proof to wra-y335.

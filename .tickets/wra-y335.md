@@ -24,3 +24,7 @@ Opt-in Rust guest service passes ./vm-frontend/validate.sh live-payload, live-do
 **2026-05-17T11:03:02Z**
 
 Relationship to refactoring option 1: wra-662v owns implementing the real Rust/Tokio guest payload service using the shared payload protocol. This ticket owns parity/live validation of the opt-in Rust guest-service path before any default switch. Do not merge these unless intentionally combining implementation and validation into one large appliance-sensitive ticket; keeping them separate preserves the important gate that default switch/removal of Python is explicit and later.
+
+**2026-05-17T21:31:49Z**
+
+Current handoff from wra-662v/wra-xcvq: Rust guest-service implementation and source-level opt-in appliance wiring have focused tests passing, and default required validation has passed with the Python-default appliance. The remaining parity gate still requires a privileged opt-in appliance build using: sudo env AGENTVM_PAYLOAD_SERVICE=rust AGENTVM_GUEST_SERVICE_BIN=/home/hsaksela/ai/wrapper/target/debug/agentvm-guest-service ./docker/build-appliance.sh. Then inspect docker/out/artifact-manifest.json for agentvm_payload_service=rust and run live-payload/live-docker/required before any default switch. Python remains default.

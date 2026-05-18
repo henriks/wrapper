@@ -7,6 +7,10 @@ use agentvm_frontend::payload_client::{
     PayloadClientError, PayloadControlAction, PayloadControlPolicy, PayloadEvent, PayloadRequest,
     PayloadSession, PayloadWriter,
 };
+use agentvm_frontend::supervisor::{SupervisorShutdown, SupervisorTaskStatus};
+use agentvm_frontend::supervisor_control::{
+    SupervisorControlClient, SupervisorControlIoError, SupervisorControlSnapshot,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Style};
@@ -368,6 +372,11 @@ impl GuestTerminalView {
         self.status.phase = phase;
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn apply_supervisor_snapshot(&mut self, snapshot: &SupervisorControlSnapshot) {
+        self.status.supervisor = Some(supervisor_status_summary(snapshot));
+    }
+
     fn open_prompt(&mut self, question: impl Into<String>) {
         self.prompt = Some(PromptState::new(question));
         self.status.focus = FocusMode::WrapperPrompt;
@@ -512,6 +521,7 @@ pub(crate) struct StatusBar {
     focus: FocusMode,
     guest_rows: u16,
     guest_cols: u16,
+    supervisor: Option<String>,
 }
 
 impl StatusBar {
@@ -521,19 +531,77 @@ impl StatusBar {
             focus: FocusMode::Guest,
             guest_rows,
             guest_cols,
+            supervisor: None,
         }
     }
 
     fn text(&self, width: u16) -> String {
-        let text = format!(
+        let mut text = format!(
             "{} | focus {} | {}x{}",
             self.phase.label(),
             self.focus.label(),
             self.guest_cols,
             self.guest_rows
         );
+        if let Some(supervisor) = &self.supervisor {
+            text.push_str(" | ");
+            text.push_str(supervisor);
+        }
         truncate_status(text, width)
     }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupervisorTaskCounts {
+    ready: usize,
+    failed: usize,
+    cancelled: usize,
+    total: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn supervisor_status_summary_from_client(
+    client: &SupervisorControlClient,
+) -> Result<String, SupervisorControlIoError> {
+    let snapshot = client.status_snapshot().await?;
+    Ok(supervisor_status_summary(&snapshot))
+}
+
+#[allow(dead_code)]
+fn supervisor_status_summary(snapshot: &SupervisorControlSnapshot) -> String {
+    let counts = supervisor_task_counts(snapshot);
+    let lifecycle = match &snapshot.shutdown {
+        SupervisorShutdown::Running => "running".to_string(),
+        SupervisorShutdown::Requested { reason } => format!("shutdown requested: {reason}"),
+    };
+    if counts.failed > 0 || counts.cancelled > 0 {
+        format!(
+            "vm {lifecycle}; ready {}/{}; failed {}; cancelled {}",
+            counts.ready, counts.total, counts.failed, counts.cancelled
+        )
+    } else {
+        format!("vm {lifecycle}; ready {}/{}", counts.ready, counts.total)
+    }
+}
+
+#[allow(dead_code)]
+fn supervisor_task_counts(snapshot: &SupervisorControlSnapshot) -> SupervisorTaskCounts {
+    let mut counts = SupervisorTaskCounts {
+        ready: 0,
+        failed: 0,
+        cancelled: 0,
+        total: snapshot.tasks.len(),
+    };
+    for task in &snapshot.tasks {
+        match &task.status {
+            SupervisorTaskStatus::Ready | SupervisorTaskStatus::Finished => counts.ready += 1,
+            SupervisorTaskStatus::Failed { .. } => counts.failed += 1,
+            SupervisorTaskStatus::Cancelled { .. } => counts.cancelled += 1,
+            SupervisorTaskStatus::Planned | SupervisorTaskStatus::Starting => {}
+        }
+    }
+    counts
 }
 
 fn truncate_status(text: String, width: u16) -> String {
@@ -753,6 +821,7 @@ pub(crate) fn run_payload_viewport(
 
 #[cfg(test)]
 mod tests {
+    use agentvm_frontend::supervisor::{SupervisorTaskName, SupervisorTaskResult};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -824,6 +893,62 @@ mod tests {
         assert_eq!(truncate_status("界界xy".to_string(), 6), "界界xy");
         assert_eq!(truncate_status("界界xy".to_string(), 5), "界...");
         assert_eq!(truncate_status("界界xy".to_string(), 4), "...");
+    }
+
+    #[test]
+    fn supervisor_snapshot_summary_can_feed_status_bar() {
+        let snapshot = SupervisorControlSnapshot {
+            shutdown: SupervisorShutdown::Running,
+            tasks: vec![
+                SupervisorTaskResult {
+                    name: SupervisorTaskName::ComposedFs,
+                    status: SupervisorTaskStatus::Ready,
+                },
+                SupervisorTaskResult {
+                    name: SupervisorTaskName::Qemu,
+                    status: SupervisorTaskStatus::Starting,
+                },
+            ],
+        };
+        assert_eq!(
+            supervisor_status_summary(&snapshot),
+            "vm running; ready 1/2"
+        );
+
+        let mut view = GuestTerminalView::new(21, 78);
+        view.apply_supervisor_snapshot(&snapshot);
+        assert_eq!(
+            view.status.text(120),
+            "starting payload | focus guest | 78x21 | vm running; ready 1/2"
+        );
+    }
+
+    #[test]
+    fn supervisor_snapshot_summary_includes_shutdown_and_failures() {
+        let snapshot = SupervisorControlSnapshot {
+            shutdown: SupervisorShutdown::Requested {
+                reason: "tui requested shutdown".to_string(),
+            },
+            tasks: vec![
+                SupervisorTaskResult {
+                    name: SupervisorTaskName::VmnetGateway,
+                    status: SupervisorTaskStatus::Failed {
+                        cause: "bind failed".to_string(),
+                    },
+                },
+                SupervisorTaskResult {
+                    name: SupervisorTaskName::Qemu,
+                    status: SupervisorTaskStatus::Cancelled {
+                        reason: "tui requested shutdown".to_string(),
+                    },
+                },
+            ],
+        };
+
+        assert_eq!(
+            supervisor_status_summary(&snapshot),
+            "vm shutdown requested: tui requested shutdown; ready 0/2; failed 1; cancelled 1"
+        );
     }
 
     #[test]

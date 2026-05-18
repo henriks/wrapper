@@ -30,6 +30,9 @@ use crate::runtime_manifest::{
 use crate::supervisor::{
     LaunchSupervisor, SupervisorShutdown, SupervisorTaskController, SupervisorTaskName,
 };
+use crate::supervisor_control::{
+    bind_control_socket, control_socket_path, serve_control_listener_until_shutdown,
+};
 use crate::vmnet_runtime::serve_vmnet_gateway;
 use crate::{
     FrontendConfig, GuestNetwork, ManagedTask, ProcessSpec, RuntimePaths, ToolPaths, VmArtifacts,
@@ -194,13 +197,21 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
     remove_stale_socket(&config.runtime.vmnet_sock)?;
     remove_stale_socket(&config.runtime.docker_sock)?;
     remove_stale_socket(&config.runtime.vmnet_event_log)?;
+    remove_stale_socket(&control_socket_path(&config.runtime))?;
 
     let docker_tcp_port = docker_listener_tcp_port(&policy);
     let mut supervisor_plan = config.supervisor_plan();
     if docker_tcp_port.is_some() {
         supervisor_plan.docker_proxy = Some(ManagedTask::DockerProxy);
     }
-    let supervisor = LaunchSupervisor::new(supervisor_plan);
+    let supervisor = Arc::new(LaunchSupervisor::new(supervisor_plan));
+    let control_socket = control_socket_path(&config.runtime);
+    let control_listener =
+        bind_control_socket(&control_socket).map_err(supervisor_control_error)?;
+    let control_server = tokio::spawn(serve_control_listener_until_shutdown(
+        control_listener,
+        Arc::clone(&supervisor),
+    ));
     let mut services = Vec::new();
 
     let composed_controller =
@@ -277,15 +288,24 @@ pub async fn run_frontend_until_qemu_exit_with_policy_and_timeout_async(
         _ => unreachable!("supervisor qemu task must be a child process"),
     };
     let qemu_controller = required_task_controller(&supervisor, SupervisorTaskName::Qemu)?;
-    run_supervised_qemu_process_with_services_async(
+    let qemu_result = run_supervised_qemu_process_with_services_and_shutdown_async(
         &config,
         &policy,
         &process,
         qemu_timeout,
         &qemu_controller,
         services,
+        Some(supervisor.subscribe_shutdown()),
     )
-    .await
+    .await;
+    if !supervisor.shutdown_requested() {
+        supervisor.request_shutdown("launch completed");
+    }
+    let control_result = control_server.await.map_err(|error| {
+        LaunchError::Artifact(format!("supervisor control task failed: {error}"))
+    })?;
+    control_result.map_err(supervisor_control_error)?;
+    qemu_result
 }
 
 pub struct RunningFrontend {
@@ -814,6 +834,9 @@ fn cancel_unfinished_services(
 async fn wait_for_first_service_completion(
     services: Vec<SupervisedBlockingService>,
 ) -> Result<(SupervisorTaskName, Result<(), LaunchError>), LaunchError> {
+    if services.is_empty() {
+        std::future::pending::<()>().await;
+    }
     let mut tasks = tokio::task::JoinSet::new();
     for service in services {
         let name = service.name();
@@ -863,7 +886,11 @@ async fn wait_for_optional_supervisor_shutdown(
 async fn terminate_qemu_after_supervisor_shutdown(
     child: &mut TokioChild,
     controller: &SupervisorTaskController,
-    service_controllers: &[(SupervisorTaskName, SupervisorTaskController, Option<watch::Sender<bool>>)],
+    service_controllers: &[(
+        SupervisorTaskName,
+        SupervisorTaskController,
+        Option<watch::Sender<bool>>,
+    )],
     shutdown: SupervisorShutdown,
 ) -> Result<SupervisedQemuCompletion, LaunchError> {
     let reason = shutdown
@@ -944,6 +971,19 @@ fn write_qemu_exit_state(
     write_launch_state(config, state_status, None, Some(&qemu_status), Some(policy))
 }
 
+fn write_supervisor_shutdown_state(
+    config: &FrontendConfig,
+    policy: &VmnetPolicy,
+    exit: &QemuExit,
+    reason: &str,
+) -> Result<(), LaunchError> {
+    let qemu_status = format!(
+        "supervisor shutdown requested ({reason}); qemu status: {}",
+        exit.status
+    );
+    write_launch_state(config, "terminated", None, Some(&qemu_status), Some(policy))
+}
+
 fn qemu_controller_mismatch(controller: &SupervisorTaskController) -> LaunchError {
     LaunchError::Artifact(format!(
         "qemu process supervisor received {} task controller",
@@ -1021,6 +1061,10 @@ pub async fn wait_for_qemu_async(
 
 fn supervisor_launch_error(error: impl std::fmt::Display) -> LaunchError {
     LaunchError::Artifact(format!("launch supervisor status update failed: {error}"))
+}
+
+fn supervisor_control_error(error: impl std::fmt::Display) -> LaunchError {
+    LaunchError::Artifact(format!("launch supervisor control failed: {error}"))
 }
 
 fn join_launch_error(error: tokio::task::JoinError) -> LaunchError {
@@ -1748,6 +1792,47 @@ mod tests {
             supervisor.task_status(SupervisorTaskName::Qemu),
             Some(crate::supervisor::SupervisorTaskStatus::Failed {
                 cause: "qemu timed out".to_string()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn supervised_async_qemu_shutdown_request_terminates_child_and_records_state() {
+        let config = minimal_frontend_config("supervised-qemu-control-shutdown");
+        let policy = VmnetPolicy::default_sandbox(config.network.clone());
+        let supervisor = crate::supervisor::LaunchSupervisor::new(config.supervisor_plan());
+        let controller = supervisor
+            .task_controller(SupervisorTaskName::Qemu)
+            .expect("qemu controller");
+        let shutdown_rx = supervisor.subscribe_shutdown();
+        let process = ProcessSpec {
+            program: PathBuf::from("sh"),
+            args: vec!["-c".to_string(), "while true; do sleep 1; done".to_string()],
+            stdout_log: config.runtime.run_dir.join("qemu-supervised-shutdown.log"),
+        };
+        supervisor.request_shutdown("control socket shutdown");
+
+        let exit = run_supervised_qemu_process_with_services_and_shutdown_async(
+            &config,
+            &policy,
+            &process,
+            Some(Duration::from_secs(10)),
+            &controller,
+            Vec::new(),
+            Some(shutdown_rx),
+        )
+        .await
+        .expect("supervised qemu shutdown");
+
+        assert!(!exit.timed_out);
+        assert!(!exit.status.success());
+        let state = fs::read_to_string(config.runtime.state_json).expect("state json");
+        assert!(state.contains("\"status\": \"terminated\""), "{state}");
+        assert!(state.contains("control socket shutdown"), "{state}");
+        assert_eq!(
+            supervisor.task_status(SupervisorTaskName::Qemu),
+            Some(crate::supervisor::SupervisorTaskStatus::Cancelled {
+                reason: "control socket shutdown".to_string()
             })
         );
     }
