@@ -1,237 +1,97 @@
-# Sandbox Wrapper Requirements (v2)
+# Sandbox wrapper requirements
 
-## Overview
+The wrapper runs Codex, or an explicitly supplied command, in a persistent
+project-specific smolvm machine. Linux hosts require KVM. The guest image is built
+from the checked-in Debian slim Dockerfile; host system directories are not shared.
 
-A Python-based sandbox wrapper that uses Linux namespaces (via Bubblewrap) to run
-AI coding agents (OpenAI Codex, GitHub Copilot, Pi) in an isolated environment. Sandbox
-state is persistent and project-local, stored in a `.sandbox/` directory within the
-project. Toolchains are managed by mise and installed within the sandbox state.
+1. `codex-wrap` and `sandbox-wrap` invoke the same Python script. Arguments after
+   `--` replace the default `codex --dangerously-bypass-approvals-and-sandbox` command.
+2. `--project PATH` selects the workspace, defaulting to the current directory.
+   It is shared writable at its canonical absolute host path.
+3. `.sandbox/` contains smolvm's registry and persistent guest disks, selected
+   using `SMOLVM_DATA_DIR`. HOME is `/home/agent` in the persistent root filesystem.
+   `/tmp` and `/run` remain ephemeral. A project lifecycle lock serializes
+   startup, configuration and reset.
+   Concurrent foreground sessions share the VM, which stops after the last exits.
+4. `.sandbox/` is masked within the guest workspace. Git metadata is read-only
+   unless `--git` is selected, including external metadata for linked worktrees.
+   Git protection is an ordinary-operation guard: Docker access grants guest root
+   privileges, so it does not prevent deliberate bypass by a hostile workload.
+5. Host `~/.codex`, when present, is shared writable at guest `~/.codex`. No other
+   agent's host configuration, host toolchain directories, or host Docker socket
+   is shared. No host AWS configuration is shared.
+6. Mise is installed in the image. Node 24 and Codex are installed through mise
+   on launch; project mise configurations are used without being rewritten.
+   AWS CLI and GitHub CLI are provisioned through mise when their credentials are
+   injected. Downloads and other guest filesystem changes persist across stop/start.
+7. Docker Engine, CLI, Buildx and the `docker compose` plugin are installed from
+   Docker's official stable apt repository. Its daemon starts on each VM boot.
+   `/var/lib/docker` is a persistent guest-local volume on smolvm's storage disk,
+   separate from the container's root overlay and host workspace. Docker readiness
+   is required before launching the workload.
+8. Outbound networking defaults on; `--no-net` disables it. `--port HOST:GUEST`
+   publishes TCP ports. VM localhost is distinct from host localhost; this wrapper
+   does not implicitly expose host loopback services.
+9. `--ro PATH` and `--rw PATH` share extra directories at their absolute paths.
+   File mounts are unsupported. Extra mounts cannot overlap the project or guest
+   HOME. Paths containing colon/newline are rejected because smolvm uses delimiters.
+10. `--aws PROFILE` exports resolved credentials on the host. `--gh` resolves a
+    host GitHub token. `--pass-env NAME` explicitly forwards other variables.
+    Values are passed through smolvm's per-exec secret references, not stored in
+    machine configuration or included as plaintext command arguments. Guest Git
+    global config, AWS config/credential files, SSH agent and Kubernetes config
+    are disabled by default. Shared Codex state remains intentionally accessible.
+11. Interactive sessions use a guest PTY. Nonterminal sessions stream output and
+    stdin. Exit codes are propagated; normal exit, Ctrl-C, SIGTERM and SIGHUP
+    end that session. The last session triggers VM shutdown. OS leases also
+    release on SIGKILL; a separate host supervisor keeps other sessions alive.
+    Supervisor/host failure can leave the VM running; after old clients exit,
+    the next launch stops it before reconfiguration. Guest disks persist in either case.
+12. `--reset` deletes the project VM and `.sandbox/`. Existing bwrap state is not
+    automatically migrated. Move old `.sandbox/` aside before first use.
+13. `--image` selects a registry reference or local archive for first creation.
+    The default is `sandbox-wrap.tar` beside the wrapper, built and exported
+    automatically using host Docker when absent at launch.
+    `--rebuild-image` forces a build/export of the default archive and exits,
+    without requiring smolvm or touching project VM state. It cannot be combined
+    with `--reset`, a guest command, or a custom `--image`.
+    Concurrent builds are serialized and the archive is published atomically.
+    Existing archives are reused; explicit images are never built automatically.
+    Reset does not build an image. An existing machine keeps
+    its original image and filesystem; rebuild plus `--reset` is needed to replace
+    the base image. Mounts, git mode, network access, and published ports are
+    updated only when the effective configuration changes, without discarding
+    disks. Per-session credentials and commands are applied on every launch.
 
----
+14. `hostctl status` inside the guest queries the running wrapper over JSON-RPC
+    through `/run/sandbox-wrap/host.sock`, forwarded from `.sandbox/host.sock`.
+    Status contains lifecycle state, VM name, project path, host supervisor PID,
+    networking, git access, and published ports. No credentials or host execution
+    methods are exposed. The socket is private, messages are bounded to 64 KiB,
+    frame reads have five-second deadlines, and the server is removed after the last session exits.
 
-## 1. Entry Points and Invocation
 
-1. The project shall consist of a single Python script.
-2. Three symlinks shall point to the script: `codex-wrap`, `copilot-wrap`, and
-   `pi-wrap`.
-3. The script shall determine its mode from `argv[0]`:
-   - Invoked as `codex-wrap` → Codex mode.
-   - Invoked as `copilot-wrap` → Copilot mode.
-   - Invoked as `pi-wrap` → Pi mode.
-4. A `--tool codex|copilot|pi` flag shall override the invocation-name
-   detection.
-5. In Codex mode, the script shall run the Codex CLI and automatically include
-   `--dangerously-bypass-approvals-and-sandbox` unless already present in the
-   user-supplied arguments.
-6. In Copilot mode, the script shall run the Copilot CLI with appropriate
-   default flags (e.g. `--allow-all`, `--no-auto-update`).
-7. In Pi mode, the script shall run the `pi` CLI with no additional default
-   flags.
-8. Arguments after `--` or unrecognized positional arguments shall replace the
-   default tool command and be executed directly inside the sandbox.
-9. `--project PATH` shall set the project directory (default: `$PWD`).
+15. `--terminal` opens bash in the project VM and cannot be combined with an
+    explicit command, reset or image rebuild. Concurrent sessions inherit current
+    VM settings when options are omitted. Explicit git/network/ports and extra
+    shares must agree with the active VM; conflicting requests and reset fail
+    without stopping other sessions. Each client retains its own exec credentials.
+    Mise bootstrap is locked, then released before foreground execution.
 
----
 
-## 2. Sandbox State and Persistence
+`.sandbox/launch.json` records the last successfully applied mounts, ports, git
+mode, network-enabled flag, and host RPC socket path. The wrapper compares these
+settings directly to skip unchanged updates and remove obsolete mappings when
+changes are needed. It is generated runtime state, not a user configuration file.
+For an RPC-enabled VM, a record missing the network flag receives one update.
+VMs without the RPC socket mapping require explicit recreation because smolvm
+1.29.1 cannot add socket bridges through update; no disks are deleted implicitly.
+This checkout has no `.sandbox/config.json` parser or `vm-frontend/config-json.md`.
 
-1. All mutable sandbox state shall be stored in `.sandbox/` within the project
-   directory.
-2. `.sandbox/` shall be created automatically on first run.
-3. `.sandbox/` itself shall serve as `$HOME` inside the sandbox. All
-   sandbox-local state (mise toolchains, caches, configs) lives within it
-   at standard XDG-relative paths (e.g. `.sandbox/.local/share/mise/`,
-   `.sandbox/.config/mise/`, etc.).
-4. `.sandbox/` shall NOT be visible inside the sandbox; a tmpfs shall be mounted
-   over its path within the project directory mount.
-5. `--reset` shall remove the entire `.sandbox/` directory so the next run
-   starts fresh.
-6. The script shall not modify the project's `.gitignore`.
-
----
-
-## 3. Isolation and Namespace Setup
-
-1. The wrapper shall use Bubblewrap (`bwrap`) for namespace-based isolation.
-2. The wrapper shall fail with a clear error if `bwrap` is not found.
-3. The sandbox shall unshare all namespaces except network (by default).
-4. Network access shall be enabled by default; `--no-net` shall disable it.
-5. All Linux capabilities shall be dropped.
-6. The sandbox process shall die with its parent (`--die-with-parent`).
-7. For non-interactive invocations, a new session shall be created
-   (`--new-session`). For interactive terminal UIs, the wrapper shall keep the
-   caller's terminal session so terminal-generated resize events (`SIGWINCH`)
-   continue to reach the agent.
-8. The environment shall be cleared (`--clearenv`) and selectively rebuilt
-   (see §7).
-
----
-
-## 4. Filesystem Layout Inside the Sandbox
-
-### 4.1 Host System Directories (Read-Only)
-
-1. The following shall be bind-mounted read-only from the host:
-   `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64` (if it exists).
-2. Selective `/etc` entries shall be mounted read-only: `resolv.conf`, `hosts`,
-   `passwd`, `group`, `ssl`, `ca-certificates`, `pki`,
-   `java*` directories, `mavenrc`.
-3. `/proc` shall be mounted via `--proc`.
-4. `/dev` shall be mounted via `--dev`.
-
-### 4.2 Project Directory
-
-1. The project directory shall be mounted read-write at its real host path.
-2. `.git` within the project shall be mounted read-only (overriding the
-   read-write mount), preventing the agent from modifying git state.
-3. `--git` shall disable the `.git` read-only overlay, leaving `.git`
-   writable through the project directory mount when the caller intentionally
-   allows git metadata changes inside the sandbox.
-4. `.sandbox` within the project shall be hidden by a tmpfs overlay.
-
-### 4.3 Persistent Sandbox State (from `.sandbox/`)
-
-1. `$HOME` inside the sandbox shall map directly to `.sandbox/` on the host.
-2. Mise directories use their default XDG-relative paths under `$HOME`, so
-   they naturally reside within `.sandbox/` (no separate mounts needed).
-
-### 4.4 Ephemeral Mounts
-
-1. `/tmp` inside the sandbox shall map to a project-specific directory under
-   the host's `/tmp` (e.g. `/tmp/sandbox-<hash>/`). This is ephemeral
-   (cleared on host reboot) but persists across sandbox restarts within a
-   session.
-2. `/var` shall be a tmpfs.
-
-### 4.5 Optional / User-Specified Mounts
-
-1. `--ro PATH` — bind-mount a host path read-only (repeatable).
-2. `--rw PATH` — bind-mount a host path read-write (repeatable).
-3. `--docker` — mount the Docker socket and `~/.docker` config into the
-   sandbox. Docker is NOT mounted by default.
-
----
-
-## 5. Toolchain Management via Mise
-
-1. Before launching the sandbox, the script shall check for `mise.toml` or
-   `.mise.toml` in the project directory.
-2. If no mise config exists in the project, the script shall create
-   `mise.toml` with default tool entries:
-   ```toml
-   [tools]
-   node = "24"
-   ```
-3. The script shall maintain a **separate** mise config for sandbox-specific
-   tool entries (e.g. the AI tool npm package) at
-   `.sandbox/.config/mise/config.toml` (the sandbox HOME's standard mise
-   config path). The project's own mise config is never modified by the
-   script for these entries.
-4. The sandbox mise config shall contain the selected AI tool's entry:
-   - Codex: `"npm:@openai/codex" = "latest"`
-   - Copilot: equivalent entry (TBD)
-   - Pi: `"npm:@mariozechner/pi-coding-agent" = "latest"`
-5. Mise shall be configured to read **both** the project's mise config and
-   the sandbox HOME's mise config. Since mise reads configs from both the
-   project directory and `$MISE_CONFIG_DIR` by default, this should work
-   naturally with `$HOME` set to `.sandbox/`.
-6. Since `$HOME` maps to `.sandbox/`, mise's default XDG-relative data/state
-   directories (`$HOME/.local/share/mise`, etc.) naturally reside within
-   `.sandbox/` — no explicit `MISE_DATA_DIR`/`MISE_STATE_DIR` overrides are
-   needed.
-7. On each sandbox start, `mise install` shall be run inside the sandbox before
-   launching the target CLI. This is idempotent and typically a no-op after
-   the first run.
-8. The sandbox `$PATH` shall include mise shims / tool binary paths so
-   installed tools are available to the agent.
-9. The mise binary itself must be accessible inside the sandbox (via the
-   read-only host system mounts or by explicitly mounting its location).
-
----
-
-## 6. AWS Credential Handling
-
-1. When `--aws PROFILE` is provided, the script shall acquire temporary
-   credentials before launching the sandbox by invoking
-   `aws sts get-session-token` (or `assume-role` as appropriate) using the
-   named profile on the host.
-2. The resulting temporary credentials shall be injected as environment
-   variables inside the sandbox:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-   - `AWS_SESSION_TOKEN`
-   - `AWS_DEFAULT_REGION` (from the profile config, if available)
-3. Host AWS configuration (`~/.aws`) shall NOT be mounted into the sandbox.
-4. Without `--aws`, AWS credential environment variables and config paths
-   shall be explicitly nullified to prevent leakage.
-
----
-
-## 7. Environment Handling
-
-1. The following environment variables shall be set inside the sandbox:
-   - `HOME` — sandbox home path
-   - `USER`, `LOGNAME` — current username
-   - `TERM` — inherited from host
-   - `LANG` — inherited from host (or a sane default)
-   - `PATH` — constructed to include: mise shims, sandbox home bin, and
-     standard system paths.
-2. XDG base directories shall point to sandbox-local paths:
-   - `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`
-3. The following shall be explicitly nullified to prevent host credential
-   leakage:
-   - `SSH_AUTH_SOCK`
-   - `GIT_CONFIG_GLOBAL` → `/dev/null`
-   - `AWS_SHARED_CREDENTIALS_FILE` → `/dev/null`
-   - `AWS_CONFIG_FILE` → `/dev/null`
-   - `GOOGLE_APPLICATION_CREDENTIALS`
-   - `KUBECONFIG` → `/dev/null`
-4. `--pass-env VAR` shall pass a named host environment variable into the
-   sandbox (repeatable).
-
----
-
-## 8. Git Access
-
-1. `.git` shall be mounted read-only, allowing the agent to read repository
-   state (log, diff, status, blame, etc.).
-2. Git write operations (commit, push, checkout, etc.) shall fail due to the
-   read-only mount.
-3. `--git` shall opt out of the read-only `.git` mount for workflows
-   that need git write operations inside the sandbox.
-4. `GIT_CONFIG_GLOBAL` shall be set to `/dev/null` to prevent host git config
-   leakage.
-
----
-
-## 9. CLI Summary
-
-```
-codex-wrap [OPTIONS] [-- EXTRA_ARGS...]
-copilot-wrap [OPTIONS] [-- EXTRA_ARGS...]
-pi-wrap [OPTIONS] [-- EXTRA_ARGS...]
-
-Options:
-  --project PATH        Project directory (default: $PWD)
-  --tool codex|copilot|pi  Explicit tool selection (overrides argv[0])
-  --no-net              Disable network access
-  --docker              Mount Docker socket and config
-  --aws PROFILE         Acquire temporary AWS credentials via STS
-  --ro PATH             Extra read-only bind mount (repeatable)
-  --rw PATH             Extra read-write bind mount (repeatable)
-  --pass-env VAR        Pass host env var into sandbox (repeatable)
-  --git                 Allow sandbox writes to the project's .git directory
-  --reset               Remove .sandbox/ and start fresh
-  --help                Show usage
-```
-
----
-
-## 10. Non-Goals (Current Scope)
-
-1. GUI/display passthrough (DISPLAY, WAYLAND, DBUS) is not required.
-2. Persistent sandbox home at an arbitrary path (`--persist PATH`) is replaced
-   by the fixed `.sandbox/` approach (`.sandbox/` is `$HOME` directly).
-3. Host `~/.cargo`, `~/.rustup`, `~/.m2` are NOT directly mounted; these
-   toolchains are managed by mise inside the sandbox instead.
-4. Host `~/bin` mounting is not included by default (can be added via `--ro`).
+The `.sandbox/launch.json` fields retain their existing format. Joining sessions
+read this record without changing it. Private `owner.lock` and `sessions.lock`
+files implement supervisor ownership and shared OS session leases; they contain
+no serialized session counters or credentials. `supervisor.log` contains VM
+startup/shutdown diagnostics and `supervisor.error` reports owner failures.
+`wrapper_pid` in status identifies this supervisor and stays constant while
+sessions join/leave, even if the initial foreground wrapper exits.

@@ -2,3 +2,7 @@
 .sandbox/
 docker/
 __pycache__/
+.sandbox-wrap.lock
+sandbox-wrap.tar
+sandbox-wrap.build.lock
+.sandbox-image-*/

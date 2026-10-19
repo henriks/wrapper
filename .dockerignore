@@ -1,0 +1,5 @@
+*
+!Dockerfile
+!guest/
+!guest/**
+!host_rpc.py

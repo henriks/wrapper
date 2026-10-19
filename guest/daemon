@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+# Docker must use a block-backed guest volume, not the root overlay or virtiofs.
+dockerd --host=unix:///run/docker.sock &
+daemon=$!
+trap 'kill -TERM "$daemon" 2>/dev/null || true; wait "$daemon" || true' TERM INT EXIT
+wait "$daemon"
