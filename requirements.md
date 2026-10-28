@@ -25,12 +25,16 @@ from the checked-in Debian slim Dockerfile; host system directories are not shar
    Conflicting RW shares inside RO subtrees and exports of control state are
    rejected. Policies are enforced outside the guest and cannot be changed by
    guest root through unmounts, remounts, alternate binds or parent renames.
-   The wrapper verifies kernel read-only flags before starting the VM.
+   Ancestor anchors preserve nested mounts, keeping covered underlying host files
+   inaccessible. The wrapper verifies kernel read-only flags before starting the VM.
 5. Host `~/.codex`, when present, is shared writable at guest `~/.codex`. No other
    agent's host configuration, host toolchain directories, or host Docker socket
    is shared. No host AWS configuration is shared.
 6. Mise is installed in the image. Node 24 and Codex are installed through mise
-   on launch; project mise configurations are used without being rewritten.
+   when the requested executable is `codex`, and reused when already available.
+   Generic commands and shells do not require agent provisioning. Missing project
+   tools are installed from project mise configurations without rewriting them;
+   sessions with all requested tools available skip the installation lock.
    AWS CLI and GitHub CLI are provisioned through mise when their credentials are
    injected. Downloads and other guest filesystem changes persist across stop/start.
 7. Docker Engine, CLI, Buildx and the `docker compose` plugin are installed from
@@ -49,9 +53,11 @@ from the checked-in Debian slim Dockerfile; host system directories are not shar
 10. `--aws PROFILE` exports resolved credentials on the host. `--gh` resolves a
     host GitHub token. `--pass-env NAME` explicitly forwards other variables.
     Values are passed through smolvm's per-exec secret references, not stored in
-    machine configuration or included as plaintext command arguments. Guest Git
-    global config, AWS config/credential files, SSH agent and Kubernetes config
-    are disabled by default. Shared Codex state remains intentionally accessible.
+   machine configuration or included as plaintext command arguments. Git, AWS and
+   Kubernetes use normal guest-owned configuration under the persistent guest HOME.
+   Host configuration and the host SSH agent are not implicitly forwarded. Explicit
+   `--pass-env` values remain available to guest tools. Shared Codex state remains
+   intentionally accessible.
 11. Interactive sessions use a guest PTY. Nonterminal sessions stream output and
     stdin. Exit codes are propagated; normal exit, Ctrl-C, SIGTERM and SIGHUP
     end that session. The last session triggers VM shutdown. OS leases also
@@ -88,7 +94,8 @@ from the checked-in Debian slim Dockerfile; host system directories are not shar
     VM settings when options are omitted. Explicit git/network/ports and extra
     shares must agree with the active VM; conflicting requests and reset fail
     without stopping other sessions. Each client retains its own exec credentials.
-    Mise bootstrap is locked, then released before foreground execution.
+    Necessary mise installation is locked, then released before foreground execution.
+    Sessions whose requested tools are already available skip installation.
 
 
 `.sandbox/launch.json` records the last successfully applied mounts, ports, git

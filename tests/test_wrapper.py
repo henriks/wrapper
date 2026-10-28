@@ -177,6 +177,7 @@ class WrapperTests(unittest.TestCase):
                  patch.object(w, 'ensure_default_image'), \
                      patch.object(w, 'project_session', side_effect=single_session), \
                      patch.object(w, 'serve_status'), \
+                 patch.object(w.network_proxy, 'serve_proxy'), \
                  patch.object(w, 'mount_plan', return_value=[f'{root}:{root}:rw']), \
                  patch.object(w.subprocess, 'run', side_effect=execute), \
                  patch.object(w.signal, 'signal'):
@@ -195,6 +196,75 @@ class WrapperTests(unittest.TestCase):
         for _ in range(2000):
             command = ['printf', ''.join(rng.choices(string.printable, k=rng.randrange(100)))]
             self.assertEqual(w.parse_args(['--', *command]).command, command)
+
+    def test_guest_configuration_defaults_and_explicit_environment_precedence(self):
+        host_environment = {
+            'GIT_CONFIG_GLOBAL': '/host/gitconfig', 'AWS_CONFIG_FILE': '/host/aws/config',
+            'AWS_SHARED_CREDENTIALS_FILE': '/host/aws/credentials', 'KUBECONFIG': '/host/kubeconfig',
+            'SSH_AUTH_SOCK': '/host/ssh-agent.sock', 'AWS_ACCESS_KEY_ID': 'host-access-key',
+            'AWS_SECRET_ACCESS_KEY': 'host-secret-key', 'AWS_SESSION_TOKEN': 'host-session-token',
+            'AWS_DEFAULT_REGION': 'host-region', 'GH_TOKEN': 'host-gh-token',
+            'UNRELATED_TOKEN': 'host-unrelated-token',
+        }
+        injected_aws = {'AWS_ACCESS_KEY_ID': 'injected-access-key', 'AWS_SECRET_ACCESS_KEY': 'injected-secret-key',
+                        'AWS_SESSION_TOKEN': 'injected-session-token', 'AWS_DEFAULT_REGION': 'injected-region'}
+        for explicit in (False, True):
+            with self.subTest(explicit=explicit), tempfile.TemporaryDirectory() as root:
+                calls = []
+                def execute(argv, **kwargs):
+                    calls.append((argv, dict(kwargs.get('env', {}))))
+                    return w.subprocess.CompletedProcess(argv, 0, stdout='[]')
+                forwarded = {key: value for key, value in host_environment.items() if key != 'UNRELATED_TOKEN'}
+                flags = [flag for key in forwarded for flag in ('--pass-env', key)] if explicit else []
+                if explicit:
+                    flags += ['--aws', 'test-profile', '--gh']
+                with patch.object(w.sys, 'argv', ['sandbox-wrap', '--project', root, '--raw-net', *flags, '--', 'true']), \
+                     patch.dict(w.os.environ, host_environment, clear=True), \
+                     patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                     patch.object(w, 'ensure_default_image'), \
+                     patch.object(w, 'project_session', side_effect=single_session), \
+                     patch.object(w, 'serve_status'), \
+                     patch.object(w, 'mount_plan', return_value=[f'{root}:{root}:rw']), \
+                     patch.object(w, 'acquire_aws_credentials', return_value=injected_aws) as aws, \
+                     patch.object(w, 'acquire_gh_token', return_value='injected-gh-token') as gh, \
+                     patch.object(w.subprocess, 'run', side_effect=execute), \
+                     patch.object(w.signal, 'signal'):
+                    self.assertEqual(w.main(), 0)
+                argv, environment = next(call for call in calls if '/usr/local/lib/sandbox-wrap/run' in call[0])
+                ordinary_env = [argv[i + 1] for i, argument in enumerate(argv) if argument == '--env']
+                self.assertEqual(ordinary_env, ['TERM=xterm-256color', 'LANG=C.UTF-8'])
+                secret_env = [argv[i + 1] for i, argument in enumerate(argv) if argument == '--secret-env']
+                expected = {**forwarded, **injected_aws, 'GH_TOKEN': 'injected-gh-token'} if explicit else {}
+                self.assertEqual(secret_env, [f'{key}=SANDBOX_WRAP_SECRET_{key}' for key in expected])
+                for key, value in expected.items():
+                    self.assertEqual(environment[f'SANDBOX_WRAP_SECRET_{key}'], value)
+                self.assertNotIn('SANDBOX_WRAP_SECRET_UNRELATED_TOKEN', environment)
+                if explicit:
+                    aws.assert_called_once_with('test-profile')
+                    gh.assert_called_once_with()
+                else:
+                    aws.assert_not_called()
+                    gh.assert_not_called()
+                snapshot = (Path(root) / '.sandbox/launch.json').read_text()
+                for value in (*host_environment.values(), *injected_aws.values(), 'injected-gh-token'):
+                    self.assertNotIn(value, snapshot)
+                    for arguments, _ in calls:
+                        self.assertNotIn(value, ' '.join(arguments))
+                create = next(arguments for arguments, _ in calls if arguments[2] == 'create')
+                self.assertNotIn('--secret-env', create)
+
+    def test_default_mounts_share_codex_without_host_tool_configuration(self):
+        with tempfile.TemporaryDirectory() as root:
+            host_home = Path(root) / 'host-home'
+            project = Path(root) / 'project'
+            project.mkdir()
+            host_home.mkdir()
+            for name in ('.codex', '.aws', '.kube', '.ssh'):
+                (host_home / name).mkdir()
+            (host_home / '.gitconfig').write_text('[user]\nname = host-user\n')
+            with patch.object(w.Path, 'home', return_value=host_home):
+                mounts = w.mount_plan(w.parse_args([]), project)
+            self.assertEqual(mounts, [f'{project}:{project}:rw', f'{host_home / ".codex"}:/home/agent/.codex:rw'])
 
     def test_active_sessions_inherit_settings_and_reject_changes(self):
         @contextmanager
@@ -281,6 +351,82 @@ class WrapperTests(unittest.TestCase):
                             w.main()
                     else:
                         self.assertEqual(w.main(), 0)
+
+    def test_active_attach_never_reads_future_configuration(self):
+        @contextmanager
+        def active(project, boot, attach, reset=False):
+            attach()
+            yield
+
+        for mode, matching, conflicting in (
+            ('proxy', ['--allow-domain', 'active.example'], ['--deny-domain', 'changed.example']),
+            ('direct', ['--raw-net'], ['--no-net']),
+            ('off', ['--no-net'], ['--raw-net']),
+        ):
+            for text in (None, '{', '{"network":{"mode":"direct"}}', '{"network":{"mode":"invalid"}}'):
+                with self.subTest(mode=mode, config=text), tempfile.TemporaryDirectory() as root:
+                    state = Path(root) / '.sandbox'
+                    state.mkdir()
+                    config = state / 'config.json'
+                    if text is not None:
+                        config.write_text(text)
+                    policy = w.network_proxy.policy({'mode': mode, **({'allow': ['active.example']} if mode == 'proxy' else {})})
+                    settings = {'mounts': [f'{root}:{root}:rw'], 'ports': [], 'git': False,
+                                'network': mode == 'direct', 'proxy': policy if mode == 'proxy' else None,
+                                'rpc_socket': str(state / 'host.sock'), 'host_mounts': w.host_mounts.LAYOUT}
+                    snapshot = json.dumps(settings)
+                    (state / 'launch.json').write_text(snapshot)
+                    with patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                         patch.object(w, 'mount_plan', return_value=settings['mounts']), \
+                         patch.object(w, 'project_session', side_effect=active), \
+                         patch.object(w.network_proxy, 'configuration', side_effect=AssertionError('active attach read config')), \
+                         patch.object(w, 'ensure_default_image', side_effect=AssertionError('active attach booted')), \
+                         patch.object(w.subprocess, 'run', return_value=w.subprocess.CompletedProcess([], 0)) as execute, \
+                         patch.object(w.signal, 'signal'):
+                        for flags in ([], matching):
+                            with patch.object(w.sys, 'argv', ['sandbox-wrap', '--project', root, *flags, '--', 'true']):
+                                self.assertEqual(w.main(), 0)
+                            argv = execute.call_args.args[0]
+                            self.assertEqual('HTTPS_PROXY=http://127.0.0.1:4750' in argv, mode == 'proxy')
+                        execute.reset_mock()
+                        with patch.object(w.sys, 'argv', ['sandbox-wrap', '--project', root, *conflicting, '--', 'true']):
+                            with self.assertRaisesRegex(SystemExit, 'network policy conflicts'):
+                                w.main()
+                        execute.assert_not_called()
+                    self.assertEqual((state / 'launch.json').read_text(), snapshot)
+                    self.assertEqual(config.read_text() if config.exists() else None, text)
+
+    def test_invalid_configuration_is_rejected_only_after_startup_admission(self):
+        for text in ('{', '{"unexpected":true}', '{"network":{"mode":"invalid"}}'):
+            for flags in ([], ['--raw-net']):
+                with self.subTest(config=text, flags=flags), tempfile.TemporaryDirectory() as root:
+                    state = Path(root) / '.sandbox'
+                    state.mkdir()
+                    (state / 'config.json').write_text(text)
+                    admitted = False
+                    @contextmanager
+                    def startup(project, boot, attach, reset=False):
+                        nonlocal admitted
+                        admitted = True
+                        with boot():
+                            yield
+                    configuration = w.network_proxy.configuration
+                    def configure(project):
+                        self.assertTrue(admitted)
+                        return configuration(project)
+                    with patch.object(w.sys, 'argv', ['sandbox-wrap', '--project', root, *flags, '--', 'true']), \
+                         patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                         patch.object(w, 'project_session', side_effect=startup), \
+                         patch.object(w.network_proxy, 'configuration', side_effect=configure) as read_config, \
+                         patch.object(w, 'ensure_default_image') as build, \
+                         patch.object(w.subprocess, 'run') as execute:
+                        with self.assertRaises(ValueError):
+                            w.main()
+                        read_config.assert_called_once_with(Path(root))
+                        build.assert_not_called()
+                        execute.assert_not_called()
+                    self.assertFalse((state / 'launch.json').exists())
+                    self.assertEqual((state / 'config.json').read_text(), text)
 
     def test_network_defaults_switches_and_configuration_is_read_only(self):
         for flags, mode, allow in (([], 'proxy', list(w.network_proxy.DEFAULT_ALLOW)),

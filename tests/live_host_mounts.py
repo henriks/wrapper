@@ -1,4 +1,5 @@
-"""Privileged guest attempts against host-enforced exports; all data disposable."""
+"""Live host export checks; --mount-only needs no VM and uses disposable data."""
+import errno
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,74 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import host_mounts
 from host_rpc import GUEST_SOCKET, serve_status
+
+
+def check_prepared_views(root):
+    """Run in a child mount namespace; its exit releases every fixture mount."""
+    project = root / 'project'; project.mkdir()
+    state = project / '.sandbox'; state.mkdir()
+    (state / 'config.json').write_text('host control state')
+    (project / '.sandbox-wrap.lock').touch()
+    (project / '.git').mkdir()
+    data = root / 'data'
+    private = data / 'parent/private'; private.mkdir(parents=True)
+    public = data / 'parent/public'; public.mkdir()
+    (public / 'underlying-hidden').write_text('covered host file')
+    subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=1m', 'tmpfs', str(public)], check=True)
+    (public / 'intended-export').write_text('visible nested filesystem')
+    nested = private / 'nested'; nested.mkdir()
+    subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=1m', 'tmpfs', str(nested)], check=True)
+    (nested / 'file').write_text('nested read-only filesystem')
+    alias = root / 'project-alias'; alias.mkdir()
+    state_alias = root / 'state-alias'; state_alias.mkdir()
+    for source, target in ((project, alias), (state, state_alias)):
+        subprocess.run(['mount', '--bind', str(source), str(target)], check=True)
+    mounts = [f'{project}:/workspace:rw', f'{data}:/data:rw',
+              f'{private}:/private:ro', f'{root}:/parent:rw']
+    host_mounts.prepare(project, mounts, False)
+    exports = state / 'exports'
+    for view in (exports / '1', exports / '3/data'):
+        assert (view / 'parent/public/intended-export').read_text() == 'visible nested filesystem'
+        assert not (view / 'parent/public/underlying-hidden').exists()
+    (exports / '1/parent/public/proof').write_text('writable')
+    assert (public / 'proof').read_text() == 'writable'
+
+    def fails(operation, expected):
+        try:
+            operation()
+        except OSError as error:
+            assert error.errno == expected, error
+        else:
+            raise AssertionError(f'operation unexpectedly succeeded: {operation}')
+
+    for view in (exports / '0', exports / '3/project', exports / '3/project-alias'):
+        assert not (view / '.sandbox/config.json').exists()
+        fails(lambda: (view / '.sandbox/config.json').write_text('changed'), errno.EROFS)
+        fails(lambda: (view / '.sandbox-wrap.lock').write_text('changed'), errno.EROFS)
+        fails(lambda: (view / '.git/forbidden').touch(), errno.EROFS)
+    assert not (exports / '3/state-alias/config.json').exists()
+    for view in (exports / '1/parent/private', exports / '2', exports / '3/data/parent/private'):
+        fails(lambda: (view / 'forbidden').touch(), errno.EROFS)
+        assert (view / 'nested/file').read_text() == 'nested read-only filesystem'
+        fails(lambda: (view / 'nested/forbidden').touch(), errno.EROFS)
+    fails(lambda: (exports / '1/parent').rename(exports / '1/moved'), errno.EBUSY)
+    fails(lambda: (exports / '3/project').rename(exports / '3/moved'), errno.EBUSY)
+    assert (state / 'config.json').read_text() == 'host control state'
+    print('Nested mounts, covered files, aliases, masks, read-only policies and ancestor anchors passed', flush=True)
+
+
+def mount_only():
+    # Keep cleanup outside the child namespace, after all its mounts disappear.
+    helper = str(host_mounts.HELPER) if host_mounts.HELPER.exists() else shutil.which('unshare')
+    with tempfile.TemporaryDirectory(prefix='wrapper-host-mounts-') as directory:
+        subprocess.run([helper, '--user', '--map-current-user', '--mount',
+                        '--propagation', 'private', '--keep-caps', sys.executable,
+                        str(Path(__file__).resolve()), '--mount-worker', directory],
+                       check=True, timeout=60)
+        root = Path(directory)
+        assert not os.path.ismount(root / 'project/.sandbox/exports')
+        assert list((root / 'project/.sandbox/exports').iterdir()) == []
+        assert (root / 'data/parent/public/underlying-hidden').read_text() == 'covered host file'
 
 
 def check_legacy_migration(root, codex):
@@ -62,6 +131,8 @@ def main():
         config.write_text(contents)
         codex = root / 'codex'; codex.mkdir()
         data = root / 'data'; (data / 'nested/private').mkdir(parents=True)
+        public = data / 'nested/public'; public.mkdir()
+        (public / 'underlying-hidden').write_text('covered host file')
         readonly = root / 'readonly'; (readonly / 'nested').mkdir(parents=True)
         alias = root / 'project-alias'; alias.mkdir()
         state_alias = root / 'state-alias'; state_alias.mkdir()
@@ -83,6 +154,9 @@ def main():
             for source, target in ((project, alias), (state, state_alias)):
                 subprocess.run(['mount', '--bind', str(source), str(target)], check=True)
                 fixture_mounts.append(target)
+            subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=1m', 'tmpfs', str(public)], check=True)
+            fixture_mounts.append(public)
+            (public / 'intended-export').write_text('visible nested filesystem')
             subprocess.run(['mount', '-t', 'tmpfs', '-o', 'size=1m', 'tmpfs', str(readonly / 'nested')], check=True)
             fixture_mounts.append(readonly / 'nested')
             (readonly / 'nested/file').write_text('nested')
@@ -105,6 +179,8 @@ if touch /readonly/write; then exit 1; fi
 test "$(cat /readonly/nested/file)" = nested
 if touch /readonly/nested/write; then exit 1; fi
 if touch /data/nested/private/write; then exit 1; fi
+test "$(cat /data/nested/public/intended-export)" = 'visible nested filesystem'
+test ! -e /data/nested/public/underlying-hidden
 if mv /data/nested /data/moved; then exit 1; fi
 echo workspace > /workspace/proof
 echo writable > /data/proof
@@ -166,4 +242,9 @@ echo codex > /codex/proof
 
 
 if __name__ == '__main__':
-    main()
+    if sys.argv[1:] == ['--mount-only']:
+        mount_only()
+    elif len(sys.argv) == 3 and sys.argv[1] == '--mount-worker':
+        check_prepared_views(Path(sys.argv[2]))
+    else:
+        main()

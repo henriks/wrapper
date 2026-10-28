@@ -68,7 +68,9 @@ and use `mode: "proxy"`, or remove the network configuration.
 A running shared VM uses a policy snapshot until its last session ends. Joining
 sessions inherit that snapshot, including CLI overrides; explicit CLI network
 options must agree with it. Config edits take effect at the next VM startup,
-not while sessions are running. Generated `.sandbox/launch.json` is separate
+not while sessions are running. Joining sessions do not parse the future config,
+so even an unfinished or malformed edit cannot prevent attachment. A new VM
+lifecycle still rejects malformed configuration. Generated `.sandbox/launch.json` is separate
 runtime state; it includes the effective proxy policy and socket mapping.
 
 Proxy mode accepts only `CONNECT host:443` and forwards the resulting TCP

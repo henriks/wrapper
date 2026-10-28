@@ -100,6 +100,9 @@ def main():
             path.write_text(script)
             path.chmod(0o755)
         environment = dict(os.environ, PATH=f'{binaries}:{os.environ["PATH"]}', WRAPPER_TEST_SECRET='test-secret-value')
+        # Host configuration paths must not become guest configuration implicitly.
+        environment.update({key: str(base / 'host-only-config') for key in (
+            'GIT_CONFIG_GLOBAL', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'KUBECONFIG', 'SSH_AUTH_SOCK')})
         subprocess.run(['git', 'init', '-q', str(project)], check=True)
         command = [str(ROOT / 'sandbox-wrap'), '--project', str(project), '--codex-home', str(codex)]
         if sys.argv[1:] == ['worktree']:
@@ -107,6 +110,7 @@ def main():
             return
         if sys.argv[1:] == ['codex']:
             try:
+                subprocess.run([*command, '--entrypoint', 'codex', '--', '--version'], check=True, timeout=300)
                 subprocess.run([*command, '--', 'bash', '-ec', CODEX_STARTUP], check=True, timeout=300)
             finally:
                 subprocess.run([*command, '--reset'], check=True, timeout=120)
@@ -123,6 +127,16 @@ def main():
                 assert 'Created machine' not in result.stdout, result.stdout
 
         try:
+            # Generic commands work before any agent tools have been downloaded.
+            subprocess.run([*command, '--no-net', '--', '/usr/bin/true'], check=True, timeout=120)
+            subprocess.run([*command, '--no-net', '--entrypoint', 'bash', '--', '-ec',
+                            '! command -v codex; ! command -v node'], check=True, timeout=120)
+            subprocess.run([*command, '--reset'], check=True, timeout=120)
+            (project / '.sandbox/config.json').write_text('{"network":{"allow":[]}}')
+            subprocess.run([*command, '--entrypoint', 'bash', '--', '-ec',
+                            '! command -v codex; ! command -v node'], check=True, timeout=120)
+            (project / '.sandbox/config.json').unlink()
+            subprocess.run([*command, '--entrypoint', 'codex', '--', '--version'], check=True, timeout=300)
             run(CODEX_STARTUP)
             run('''
                 codex --version
@@ -132,6 +146,13 @@ def main():
                 test ! -e .sandbox/launch.json
                 ! touch .git/forbidden
                 echo persisted > ~/persistent-test
+                test -z "${GIT_CONFIG_GLOBAL+x}${AWS_CONFIG_FILE+x}${AWS_SHARED_CREDENTIALS_FILE+x}${KUBECONFIG+x}${SSH_AUTH_SOCK+x}"
+                git config --global user.name guest-review-user
+                git config --global user.email guest-review@example.invalid
+                mkdir -p ~/.aws ~/.kube
+                printf '[default]\nregion = eu-west-1\n' > ~/.aws/config
+                printf '[default]\naws_access_key_id = guest-key\naws_secret_access_key = guest-secret\n' > ~/.aws/credentials
+                echo guest-kube-config > ~/.kube/config
                 echo shared > workspace-test
                 docker version
                 docker compose version
@@ -152,6 +173,11 @@ def main():
                 hostctl status > rpc-restarted.json
                 python3 -c 'import json; old=json.load(open("rpc-status.json")); new=json.load(open("rpc-restarted.json")); assert new["network"] is False and new["state"] == "running" and new["wrapper_pid"] != old["wrapper_pid"]'
                 test "$(cat ~/persistent-test)" = persisted
+                test "$(git config --global user.name)" = guest-review-user
+                test "$(git config --global user.email)" = guest-review@example.invalid
+                grep -q 'region = eu-west-1' ~/.aws/config
+                grep -q 'aws_access_key_id = guest-key' ~/.aws/credentials
+                test "$(cat ~/.kube/config)" = guest-kube-config
                 docker run --rm wrapper-built grep built-inside-vm /build-test
                 docker run --rm -v wrapper-test:/data alpine:3.20 grep docker-persisted /data/test
                 ! touch .git/forbidden
@@ -169,6 +195,9 @@ def main():
                 test "$AWS_DEFAULT_REGION" = eu-north-1
                 test "$GH_TOKEN" = test-gh-token
                 test "$WRAPPER_TEST_SECRET" = test-secret-value
+                test "$(aws configure get region)" = eu-west-1
+                grep -q 'aws_access_key_id = guest-key' ~/.aws/credentials
+                ! grep -q test-aws-secret ~/.aws/credentials
                 read -r line; test "$line" = stdin-test
                 ! read -r extra
             ''', '--aws', 'test-profile', '--gh', '--pass-env', 'WRAPPER_TEST_SECRET', input='stdin-test\n')

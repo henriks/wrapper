@@ -209,12 +209,10 @@ def main():
         die("project must be a directory outside the guest HOME ancestors")
     if not a.reset:
         host_mounts.ensure_namespace()
-    configured_network = None if a.reset else network_proxy.configuration(project)
     def choose_network(base):
         return network_proxy.select_policy(base, raw_net=a.raw_net, unfiltered_net=a.unfiltered_net, no_net=a.no_net,
                                            allow=a.allow_domain, deny=a.deny_domain)
-    network = choose_network(configured_network)
-    proxy_enabled = network['mode'] == 'proxy'
+    proxy_enabled = None
     for port in a.port:
         if not re.fullmatch(r"[0-9]+:[0-9]+", port) or not all(0 < int(n) < 65536 for n in port.split(":")):
             die("ports must be HOST:GUEST with values 1..65535")
@@ -233,19 +231,16 @@ def main():
     mounts = [] if a.reset else mount_plan(a, project)
     settings_path = state / "launch.json"
     socket_path = state / "host.sock"
-    settings = {"mounts": mounts, "ports": a.port, "git": a.git, "network": network["mode"] == "direct",
-                "rpc_socket": str(socket_path), "proxy": network if proxy_enabled else None,
-                "host_mounts": host_mounts.LAYOUT}
     def attach():
-        nonlocal network, proxy_enabled
+        nonlocal proxy_enabled
         previous = json.loads(settings_path.read_text())
         if previous.get('host_mounts') != host_mounts.LAYOUT:
             die('active VM predates host mount protection; close its sessions before restarting')
         current = previous.get('proxy') or network_proxy.policy({'mode': 'direct' if previous['network'] else 'off'})
         network = choose_network(current)
-        proxy_enabled = network['mode'] == 'proxy'
         if network != current:
             die('network policy conflicts with active sessions')
+        proxy_enabled = network['mode'] == 'proxy'
         # Unspecified machine options inherit the already-running VM settings.
         conflict = ((a.git and not previous["git"]) or (a.no_net and previous["network"])
                     or (a.port and a.port != previous["ports"]))
@@ -261,6 +256,11 @@ def main():
             die("machine settings conflict with active sessions; close them before changing settings")
     @contextmanager
     def boot():
+        network = choose_network(network_proxy.configuration(project))
+        proxy_enabled = network['mode'] == 'proxy'
+        settings = {"mounts": mounts, "ports": a.port, "git": a.git, "network": network["mode"] == "direct",
+                    "rpc_socket": str(socket_path), "proxy": network if proxy_enabled else None,
+                    "host_mounts": host_mounts.LAYOUT}
         ensure_default_image(a.image)
         records = json.loads(smol("ls", "--json", capture=True).stdout)
         exists = bool(records)
@@ -336,6 +336,10 @@ def main():
                     else:
                         child.unlink()
             return
+        # Boot runs in the supervisor process; the first client also needs the
+        # recorded policy, rather than policy values computed in that child.
+        if proxy_enabled is None:
+            attach()
         def terminate(signum, frame):
             raise SystemExit(128 + signum)
         for sig in (signal.SIGTERM, signal.SIGHUP):
@@ -358,9 +362,7 @@ def main():
             env[host_key] = value
             execute += ["--secret-env", f"{key}={host_key}"]
         for key, value in {"TERM": os.environ.get("TERM", "xterm-256color"),
-                           "LANG": "C.UTF-8", "GIT_CONFIG_GLOBAL": "/dev/null",
-                           "AWS_CONFIG_FILE": "/dev/null", "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
-                           "SSH_AUTH_SOCK": "", "KUBECONFIG": "/dev/null"}.items():
+                           "LANG": "C.UTF-8"}.items():
             execute += ["--env", f"{key}={value}"]
         if proxy_enabled:
             for key, value in network_proxy.environment().items():

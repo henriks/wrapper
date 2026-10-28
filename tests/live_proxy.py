@@ -84,6 +84,13 @@ CHECK
                 subprocess.run([*command, '--', 'bash', '-ec',
                                 'curl -fsS --max-time 30 https://nodejs.org/ >/dev/null; if curl -fsS --max-time 10 https://pypi.org/ >/dev/null; then exit 1; fi; hostctl status > joined.json'],
                                check=True, timeout=60)
+                # Configuration edits belong to the next lifecycle, even if invalid.
+                config.write_text('{')
+                subprocess.run([*command, '--entrypoint', 'bash', '--', '-ec',
+                                'if curl -fsS --max-time 10 https://pypi.org/ >/dev/null; then exit 1; fi; hostctl status > invalid-config-joined.json'],
+                               check=True, timeout=60)
+                assert json.loads((project / 'invalid-config-joined.json').read_text())['wrapper_pid'] == json.loads((project / 'joined.json').read_text())['wrapper_pid']
+                assert config.read_text() == '{'
                 rejected = subprocess.run([*command, '--deny-domain', 'changed.org', '--', 'true'], timeout=30)
                 assert rejected.returncode != 0
                 assert first.poll() is None
@@ -92,6 +99,10 @@ CHECK
                     first.terminate()
                 first.wait(timeout=60)
             assert not (state / 'proxy.sock').exists()
+            rejected = subprocess.run([*command, '--', 'true'], capture_output=True, timeout=30)
+            assert rejected.returncode != 0, 'new lifecycle accepted malformed configuration'
+            assert config.read_text() == '{'
+            config.write_text(text)
             # Retaining the socket bridge must not leave a usable proxy in off mode.
             subprocess.run([*command, '--no-net', '--', 'bash', '-ec',
                             'test -z "${HTTPS_PROXY:-}"; if curl --proxy http://127.0.0.1:4750 --max-time 3 https://example.com; then exit 1; fi'],

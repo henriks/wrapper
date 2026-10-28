@@ -13,16 +13,41 @@ exec setpriv --reuid="$uid" --regid="$gid" --groups="$(getent group docker | cut
     --inh-caps=-all --ambient-caps=-all --bounding-set=-all \
     bash -c '
         set -euo pipefail
-        mkdir -p "$XDG_CACHE_HOME"
-        exec 9>"$XDG_CACHE_HOME/sandbox-wrap-tools.lock"
-        flock 9
-        tools=(node@24 npm:@openai/codex@latest)
-        if [[ -n ${AWS_ACCESS_KEY_ID:-} ]]; then tools+=(aws-cli@2); fi
-        if [[ -n ${GH_TOKEN:-} ]]; then tools+=(github-cli@latest); fi
-        mise use --global "${tools[@]}"
-        mise install --yes
+        find_missing_tools() {
+            # Only project requests belong to generic sessions. In particular,
+            # do not reinstall unrelated agent tools from the global config.
+            project_tools=$(mise ls --local --missing --json | python3 -c "
+import json, sys
+sys.stdout.write(\"\\n\".join(json.load(sys.stdin)))")
+            agent_tools=()
+            if [[ ${1##*/} == codex ]]; then
+                if ! mise which node >/dev/null 2>&1; then agent_tools+=(node@24); fi
+                if ! mise which codex >/dev/null 2>&1; then agent_tools+=(npm:@openai/codex@latest); fi
+            fi
+            if [[ -n ${AWS_ACCESS_KEY_ID:-} ]] && ! mise which aws >/dev/null 2>&1; then
+                agent_tools+=(aws-cli@2)
+            fi
+            if [[ -n ${GH_TOKEN:-} ]] && ! mise which gh >/dev/null 2>&1; then
+                agent_tools+=(github-cli@latest)
+            fi
+        }
+        find_missing_tools "$@"
+        if [[ -n $project_tools || ${#agent_tools[@]} -gt 0 ]]; then
+            mkdir -p "$XDG_CACHE_HOME"
+            exec 9>"$XDG_CACHE_HOME/sandbox-wrap-tools.lock"
+            flock 9
+            # Another session may have installed them while we waited.
+            find_missing_tools "$@"
+            if [[ ${#agent_tools[@]} -gt 0 ]]; then
+                mise use --global --pin --yes "${agent_tools[@]}"
+            fi
+            if [[ -n $project_tools ]]; then
+                mapfile -t tools <<< "$project_tools"
+                mise install --yes "${tools[@]}"
+            fi
+            flock -u 9
+            exec 9>&-
+        fi
         eval "$(mise activate bash --shims)"
-        flock -u 9
-        exec 9>&-
         exec "$@"
     ' bash "$@"

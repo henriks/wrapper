@@ -87,7 +87,7 @@ class ViewTests(unittest.TestCase):
             data = root / 'data'; protected = data / 'nested/private'; protected.mkdir(parents=True)
             _, calls = self.prepare(root, [f'{project}:{project}:rw', f'{data}:/data:rw', f'{protected}:/private:ro'])
             base = project / '.sandbox/exports'
-            self.assertIn(['mount', '--bind', str(base / '1/nested'), str(base / '1/nested')], calls)
+            self.assertIn(['mount', '--rbind', str(base / '1/nested'), str(base / '1/nested')], calls)
             self.assertIn(['mount', '-o', 'rbind,ro=recursive', str(base / '1/nested/private'), str(base / '1/nested/private')], calls)
             self.assertIn(['mount', '-o', 'rbind,ro=recursive', str(protected), str(base / '2')], calls)
 
@@ -116,7 +116,7 @@ class ViewTests(unittest.TestCase):
             _, calls = self.prepare(root, [f'{project}:{project}:rw', f'{root}:/parent:rw'], table=table)
             base = project / '.sandbox/exports/1'
             self.assertIn(['mount', '-t', 'tmpfs', '-o', 'size=4k,mode=000,ro', 'tmpfs', str(base / 'alias')], calls)
-            self.assertEqual(calls.count(['mount', '--bind', str(base / 'project'), str(base / 'project')]), 1)
+            self.assertEqual(calls.count(['mount', '--rbind', str(base / 'project'), str(base / 'project')]), 1)
 
     def test_conflicting_readwrite_export_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

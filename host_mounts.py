@@ -156,11 +156,12 @@ def prepare(project, mounts, git_writable):
             for suffix, path, policy in sorted(targets, key=lambda item: (len(item[0].parts), str(item[0]), item[2])):
                 if suffix == Path('.') or any(suffix.is_relative_to(parent) for parent in masked):
                     continue
-                # Anchor once: re-binding a parent would cover existing masks.
+                # Recursive anchors retain child mounts and keep covered files hidden.
+                # Anchor once so later policies cannot replace earlier masks.
                 for parent in reversed(suffix.parents):
                     target = view / parent
                     if parent != Path('.') and target not in anchored:
-                        run('mount', '--bind', str(target), str(target))
+                        run('mount', '--rbind', str(target), str(target))
                         anchored.add(target)
                 target = view / suffix
                 readonly_views.append(target)

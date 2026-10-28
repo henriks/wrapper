@@ -29,12 +29,17 @@ exits; `--reset` is rejected while any session is active.
 A small host supervisor owns the VM and status socket independently of the first
 client. OS locks track active sessions, including clients killed with SIGKILL.
 Startup/shutdown diagnostics are in `.sandbox/supervisor.log`. Guest tool
-bootstrap is serialized; foreground commands run concurrently.
+installation is serialized; sessions with installed tools proceed directly
+to their commands, which run concurrently.
 
 The guest starts from Debian bookworm-slim with mise and Docker. Engine, CLI,
 Buildx and the `docker compose` plugin come from Docker's official stable apt
 repository. Fresh image builds install the available stable packages. Node and Codex
-are installed through mise on launch; put project toolchains in `mise.toml`.
+are installed through mise when launching `codex` and reused on later launches;
+put project toolchains in `mise.toml`. Generic commands and shells do not install
+Node or Codex, so they work offline when their requested project tools are already
+available. To use Codex from a shell on a fresh VM, first run
+`codex-wrap --entrypoint codex -- --version`.
 Mise, HOME, installed packages, and Docker data persist in project-local
 `.sandbox/` VM storage. The directory is hidden from the guest workspace.
 Host `~/.codex` is shared writable so existing Codex authentication can be reused.
@@ -44,6 +49,8 @@ custom archives and registry references are not built by the wrapper. To rebuild
 the default image, run `codex-wrap --rebuild-image`. This command uses host Docker
 and exits without starting or modifying a project VM. Existing VMs retain their
 filesystem until `--reset`; reset itself does not build an image.
+This also applies to changes in the guest runner: rebuilding updates the archive
+for new VMs, while existing VMs retain their installed runner and tools.
 Existing bwrap `.sandbox/` directories must be moved aside before first launch.
 
 Every shared directory is exported through a private host filesystem view. Host
@@ -92,12 +99,16 @@ finish before host protection can be enabled.
 `--port HOST:GUEST` publishes TCP ports. Guest localhost is separate from the host.
 AWS/GitHub tokens and `--pass-env` variables use per-session secret injection.
 `--aws` and `--gh` also provision the corresponding CLI through mise.
+Guest-owned Git, AWS and Kubernetes configuration uses the persistent guest HOME.
+Host configuration and the host SSH agent are not forwarded automatically;
+`--pass-env` remains an explicit environment override.
 See [requirements.md](requirements.md) for the full behavior contract.
 
 Validation:
 
 ```sh
 ./validate.sh offline
+python3 tests/live_host_mounts.py --mount-only  # real host mounts, without a VM
 ./validate.sh required  # includes image build and live VM scenarios
 ```
 
