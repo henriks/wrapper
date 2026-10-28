@@ -2,6 +2,7 @@ from contextlib import contextmanager
 import importlib.machinery
 import importlib.util
 import json
+import io
 import random
 import string
 import tempfile
@@ -23,6 +24,14 @@ def single_session(project, boot, attach, reset=False):
 
 
 class WrapperTests(unittest.TestCase):
+    def setUp(self):
+        namespace = patch.object(w.host_mounts, 'ensure_namespace')
+        views = patch.object(w.host_mounts, 'prepare', side_effect=lambda project, mounts, git: w.host_mounts.volumes(project / '.sandbox', mounts))
+        namespace.start()
+        views.start()
+        self.addCleanup(namespace.stop)
+        self.addCleanup(views.stop)
+
     def test_update_only_when_effective_machine_settings_change(self):
         with tempfile.TemporaryDirectory() as root:
             calls = []
@@ -37,7 +46,7 @@ class WrapperTests(unittest.TestCase):
                 if action == 'update' and fail_update:
                     raise w.subprocess.CalledProcessError(1, argv)
                 return w.subprocess.CompletedProcess(argv, 0, stdout=json.dumps([{'name': 'sandbox'}] if registered else []))
-            def launch(flags=(), mounts=('workspace:workspace:rw',)):
+            def launch(flags=('--raw-net',), mounts=('workspace:workspace:rw',)):
                 calls.clear()
                 with patch.object(w.sys, 'argv', ['sandbox-wrap', '--project', root, *flags, '--', 'true']), \
                      patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
@@ -83,6 +92,10 @@ class WrapperTests(unittest.TestCase):
                 launch(flags, mounts)
             self.assertEqual(calls, ['ls'])
             self.assertEqual(json.loads(path.read_text()), legacy)
+            path.write_text(previous)
+            with self.assertRaisesRegex(SystemExit, 'no proxy bridge'):
+                launch(['--unfiltered-net'])
+            self.assertEqual(calls, ['ls'])
 
     def test_image_build_cache_and_explicit_images(self):
         with tempfile.TemporaryDirectory() as root:
@@ -196,30 +209,140 @@ class WrapperTests(unittest.TestCase):
             codex.mkdir()
             mounts = [f'{root}:{root}:rw', f'{codex}:/home/agent/.codex:rw']
             settings = {'mounts': mounts, 'ports': ['8080:80'], 'git': True, 'network': True,
-                        'rpc_socket': str(state / 'host.sock')}
+                        'rpc_socket': str(state / 'host.sock'), 'host_mounts': w.host_mounts.LAYOUT}
             (state / 'launch.json').write_text(json.dumps(settings))
-            def launch(flags):
+            def launch(flags, command=('bash',)):
                 with patch.object(w.sys, 'argv', ['codex-wrap', '--project', root, *flags]), \
                      patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
                      patch.object(w, 'project_session', side_effect=active_session), \
                      patch.object(w.subprocess, 'run', return_value=w.subprocess.CompletedProcess([], 0)) as execute:
                     result = w.main()
                     self.assertEqual(execute.call_count, 1)
-                    self.assertEqual(execute.call_args.args[0][-1], 'bash')
+                    self.assertEqual(execute.call_args.args[0][-len(command):], list(command))
                     return result
-            for flags in (['--terminal'], ['--terminal', '--git'], ['--terminal', '--port', '8080:80'],
-                          ['--terminal', '--codex-home', str(codex)]):
+            for flags in (['--entrypoint', 'bash'], ['--entrypoint', 'bash', '--git'], ['--entrypoint', 'bash', '--port', '8080:80'],
+                          ['--entrypoint', 'bash', '--codex-home', str(codex)]):
                 self.assertEqual(launch(flags), 0)
-            for flags in (['--terminal', '--no-net'], ['--terminal', '--port', '9090:80'],
-                          ['--terminal', '--codex-home', str(project / 'missing')],
-                          ['--terminal', '--ro', str(codex)]):
+            command = ('bash', '-lc', 'printf "%s" "a b; $(literal)"')
+            self.assertEqual(launch(['--entrypoint', command[0], '--', *command[1:]], command), 0)
+            self.assertEqual(launch([], ('codex', '--dangerously-bypass-approvals-and-sandbox')), 0)
+            self.assertEqual(launch(['--', 'printf', 'hello world'], ('printf', 'hello world')), 0)
+            for flags in (['--entrypoint', 'bash', '--no-net'], ['--entrypoint', 'bash', '--port', '9090:80'],
+                          ['--entrypoint', 'bash', '--codex-home', str(project / 'missing')],
+                          ['--entrypoint', 'bash', '--ro', str(codex)]):
                 with self.assertRaises(SystemExit):
                     launch(flags)
             self.assertEqual(json.loads((state / 'launch.json').read_text()), settings)
 
-    def test_terminal_arguments(self):
-        self.assertTrue(w.parse_args(['--terminal']).terminal)
-        for args in (['--terminal', '--reset'], ['--terminal', '--rebuild-image'], ['--terminal', '--', 'true']):
+    def test_proxy_creation_cli_overrides_and_active_policy(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / '.sandbox'
+            state.mkdir()
+            config = {'network': {'mode': 'proxy', 'allow': ['example.com'], 'deny': ['blocked.example.com']}}
+            (state / 'config.json').write_text(json.dumps(config))
+            calls = []
+            def execute(argv, **kwargs):
+                calls.append(argv)
+                return w.subprocess.CompletedProcess(argv, 0, stdout='[]')
+            with patch.object(w.sys, 'argv', ['codex-wrap', '--project', root, '--allow-domain', 'other.org', '--', 'true']), \
+                 patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                 patch.object(w, 'ensure_default_image'), \
+                 patch.object(w, 'project_session', side_effect=single_session), \
+                 patch.object(w, 'serve_status'), \
+                 patch.object(w.network_proxy, 'serve_proxy'), \
+                 patch.object(w.subprocess, 'run', side_effect=execute), \
+                 patch.object(w.signal, 'signal'):
+                self.assertEqual(w.main(), 0)
+            create = next(x for x in calls if x[2] == 'create')
+            self.assertNotIn('--net', create)
+            self.assertNotIn('--net-backend', create)
+            self.assertIn(f'{state / "proxy.sock"}:{w.network_proxy.GUEST_SOCKET}', create)
+            self.assertIn('SANDBOX_WRAP_PROXY=1', create)
+            saved = json.loads((state / 'launch.json').read_text())
+            self.assertEqual(saved['proxy']['allow'], ['other.org'])
+            self.assertEqual(saved['proxy']['deny'], ['blocked.example.com'])
+            self.assertFalse(saved['network'])
+            session = next(x for x in calls if '/usr/local/lib/sandbox-wrap/run' in x)
+            self.assertIn('HTTPS_PROXY=http://127.0.0.1:4750', session)
+            @contextmanager
+            def active(project, boot, attach, reset=False):
+                attach()
+                yield
+            for flags, rejected in (([], False), (['--unfiltered-net'], True), (['--raw-net'], True),
+                                    (['--allow-domain', 'other.org'], False),
+                                    (['--deny-domain', 'changed.org'], True), (['--no-net'], True)):
+                with patch.object(w.sys, 'argv', ['codex-wrap', '--project', root, *flags, '--', 'true']), \
+                     patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                     patch.object(w, 'project_session', side_effect=active), \
+                     patch.object(w.subprocess, 'run', side_effect=execute), \
+                     patch.object(w.signal, 'signal'):
+                    if rejected:
+                        with self.assertRaises(SystemExit):
+                            w.main()
+                    else:
+                        self.assertEqual(w.main(), 0)
+
+    def test_network_defaults_switches_and_configuration_is_read_only(self):
+        for flags, mode, allow in (([], 'proxy', list(w.network_proxy.DEFAULT_ALLOW)),
+                                   (['--unfiltered-net'], 'proxy', None),
+                                   (['--raw-net'], 'direct', None), (['--no-net'], 'off', None)):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as root:
+                state = Path(root) / '.sandbox'
+                state.mkdir()
+                text = '{"network":{"deny":["blocked.org"]}}'
+                (state / 'config.json').write_text(text)
+                calls = []
+                def execute(argv, **kwargs):
+                    calls.append(argv)
+                    return w.subprocess.CompletedProcess(argv, 0, stdout='[]')
+                with patch.object(w.sys, 'argv', ['codex-wrap', '--project', root, *flags, '--', 'true']), \
+                     patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                     patch.object(w, 'ensure_default_image'), \
+                     patch.object(w, 'project_session', side_effect=single_session), \
+                     patch.object(w, 'serve_status'), patch.object(w.network_proxy, 'serve_proxy'), \
+                     patch.object(w.subprocess, 'run', side_effect=execute), patch.object(w.signal, 'signal'):
+                    self.assertEqual(w.main(), 0)
+                saved = json.loads((state / 'launch.json').read_text())
+                self.assertEqual(saved['network'], mode == 'direct')
+                self.assertEqual(saved['proxy']['allow'] if saved['proxy'] else None, allow)
+                self.assertEqual(saved['proxy']['deny'] if saved['proxy'] else [], ['blocked.org'] if not flags else [])
+                self.assertEqual((state / 'config.json').read_text(), text)
+                create = next(x for x in calls if x[2] == 'create')
+                self.assertEqual('--net' in create, mode == 'direct')
+        for flags in (['--raw-net', '--unfiltered-net'], ['--raw-net', '--no-net'],
+                      ['--unfiltered-net', '--deny-domain', 'blocked.org'], ['--raw-net', '--allow-domain', 'ok.org']):
+            with self.assertRaises(SystemExit):
+                w.parse_args(flags)
+
+    def test_config_help_needs_no_project_or_vm(self):
+        with patch.object(w.sys, 'argv', ['codex-wrap', '--help-config', '--project', '/missing-project']), \
+             patch.object(w.sys, 'stdout', new_callable=io.StringIO) as output, \
+             patch.object(w.shutil, 'which', side_effect=AssertionError('must not probe smolvm')):
+            w.main()
+        self.assertEqual(output.getvalue(), Path(w.__file__).resolve().with_name('config-json.md').read_text())
+
+    def test_reset_preserves_configuration(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / '.sandbox'
+            state.mkdir()
+            # Reset must work even when a user is repairing invalid config.
+            (state / 'config.json').write_text('invalid')
+            (state / 'disk').mkdir()
+            (state / 'disk' / 'data').write_text('guest state')
+            with patch.object(w.sys, 'argv', ['codex-wrap', '--project', root, '--reset']), \
+                 patch.object(w.shutil, 'which', return_value='/bin/smolvm'), \
+                 patch.object(w.subprocess, 'run', return_value=w.subprocess.CompletedProcess([], 0, stdout='[]')):
+                w.main()
+            self.assertEqual(list(state.iterdir()), [state / 'config.json'])
+            self.assertEqual((state / 'config.json').read_text(), 'invalid')
+
+    def test_entrypoint_arguments(self):
+        self.assertEqual(w.parse_args(['--entrypoint', 'bash']).entrypoint, 'bash')
+        args = w.parse_args(['--entrypoint', 'python3', '--', '-c', 'print("hello world")'])
+        self.assertEqual(args.entrypoint, 'python3')
+        self.assertEqual(args.command, ['-c', 'print("hello world")'])
+        for args in (['--entrypoint', 'bash', '--reset'], ['--entrypoint', 'bash', '--rebuild-image'],
+                     ['--entrypoint'], ['--terminal']):
             with self.assertRaises(SystemExit):
                 w.parse_args(args)
 

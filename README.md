@@ -1,23 +1,26 @@
 # Persistent Codex microVM wrapper
 
-Requirements: Python 3, git, smolvm 1.29.1 or newer, and a Linux host with KVM.
+Requirements: Python 3, git, smolvm 1.29.1 or newer, Linux 5.12+ with KVM,
+and util-linux 2.39+ with unprivileged user namespaces enabled.
 A missing default `sandbox-wrap.tar` is built from the Dockerfile at launch
 and exported automatically using host Docker. Later launches reuse it. Host
 Docker is used only to build/export the image; the workload uses its own
 Docker daemon inside the VM.
+Outbound access defaults to an allowlisted CONNECT proxy.
 The wrapper reuses its recorded VM configuration on unchanged launches; it runs
 `smolvm machine update` only when mounts, ports, git mode, or networking change.
 
 ```sh
 ./codex-wrap --project /path/to/project
-./codex-wrap --project /path/to/project --terminal  # attach a shell alongside Codex
+./codex-wrap --project /path/to/project --entrypoint bash  # attach a shell alongside Codex
+./codex-wrap --entrypoint bash -- -lc 'pwd'  # pass arguments to the chosen program
 ./codex-wrap --port 8080:8080 --aws my-profile --gh
 ./codex-wrap --rebuild-image  # rebuild/export the default image, then exit
 ./codex-wrap --reset
 ```
 
 Multiple wrapper invocations for the same project share one running VM. Start
-Codex normally, then run `codex-wrap --terminal` from another terminal. Plain
+Codex normally, then run `codex-wrap --entrypoint bash` from another terminal. Plain
 `-- COMMAND` sessions share it too. Joining sessions inherit active machine
 settings; explicit mount, git, port or network options must agree. Each session
 keeps its own credentials and command. The VM stops only after the last session
@@ -43,11 +46,47 @@ and exits without starting or modifying a project VM. Existing VMs retain their
 filesystem until `--reset`; reset itself does not build an image.
 Existing bwrap `.sandbox/` directories must be moved aside before first launch.
 
-Git metadata is read-only by default; `--git` enables writes. These mounts guard
-against ordinary accidental writes. Guest Docker access grants guest root and
-can bypass guest mount restrictions. Host directories explicitly shared writable,
-including Codex state, are writable by the workload. The VM is not given the host
-Docker socket or general host HOME access.
+Every shared directory is exported through a private host filesystem view. Host
+mounts hide `.sandbox/`, protect the lifecycle lock and enforce read-only Git
+metadata unless `--git` is selected. The same policy applies through overlapping
+or bind-aliased exports, including extra shares and linked worktrees. Conflicting
+writable shares inside a read-only subtree are rejected. Read-only `.git`
+symlinks are rejected; ordinary Git directories and worktree files are supported. Docker grants guest
+root, but guest remounts do not change these host mount restrictions. Host files
+explicitly shared writable, including Codex state, remain writable by the workload. These are path-level
+mount controls: host-created hard links and deliberately shared writable files
+remain trusted.
+
+Install the command symlink from the checkout:
+
+```sh
+./setup
+```
+
+This creates `codex-wrap` in `~/.local/bin`, or `/usr/local/bin`
+when run as root. Use `--bin-dir PATH` to choose another directory. The symlink
+points to this checkout, which must stay in place. Setup reports if the directory
+needs adding to `PATH`.
+
+Setup checks the host's AppArmor settings rather than its distribution. When
+AppArmor restricts unprivileged user namespaces, it locates the host's `unshare`,
+copies it to `/usr/local/libexec/sandbox-wrap-unshare`, installs the dedicated
+profile in `/etc/apparmor.d/`, and loads it with `apparmor_parser`. Only these
+system changes use `sudo` when needed; missing tools produce an actionable error.
+It does not install packages or disable host restrictions. Re-run setup after
+updating util-linux to refresh the helper binary. Hosts without this AppArmor
+restriction need only the command symlink and use `unshare` directly when no
+dedicated helper is installed.
+Normal launches run without sudo. Ubuntu profile behavior still needs validation
+on Ubuntu; the implementation and live scenarios were exercised on Debian 13.
+
+The supervisor and VMM own the private mount namespace. Attached clients use the
+same running VM; their exit cannot remove another session's views. Kernel
+namespace teardown cleans up the views after the last owning process exits.
+Do not start protected machines directly with `smolvm machine start`: their
+export views are prepared by the wrapper. Existing stopped machines receive a
+single mount update without losing their guest disks; old active sessions must
+finish before host protection can be enabled.
 
 `--ro`/`--rw` accept directories. `--no-net` disables outbound networking;
 `--port HOST:GUEST` publishes TCP ports. Guest localhost is separate from the host.
@@ -62,33 +101,25 @@ Validation:
 ./validate.sh required  # includes image build and live VM scenarios
 ```
 
-The historical `./vm-frontend/validate.sh required` mentioned in repository guidance
-is absent in this checkout. `validate.sh` provides the gate for this Python port.
 Live validation creates disposable test projects, avoids sharing real Codex state,
 and checks filesystem persistence, Docker, git protection, masking, networking,
 exit status, and terminal resize behavior. A real interactive Codex session and
 AWS/GitHub authentication should also be checked with your accounts.
 
-If an existing VM reports `failed to invoke ps` during Codex daemon startup, its
-image predates the `procps` dependency. Updating the Dockerfile or rebuilding the
-archive does not change that VM's persistent filesystem. Install the package in
-the existing guest to preserve its HOME, toolchains, and Docker data. From the
-project directory, with no wrapper session running:
+Older guest filesystems missing `procps` can be repaired without resetting.
+Start `codex-wrap --raw-net --entrypoint bash` and keep the shell open. In another host
+terminal in the same project, run:
 
 ```sh
-SMOLVM_DATA_DIR="$PWD/.sandbox" smolvm machine start --name sandbox
 SMOLVM_DATA_DIR="$PWD/.sandbox" smolvm machine exec --name sandbox --user root -- bash -ec 'apt-get update; apt-get install -y --no-install-recommends procps'
-SMOLVM_DATA_DIR="$PWD/.sandbox" smolvm machine stop --name sandbox
-codex-wrap
 ```
 
-New VMs need an archive rebuilt from the updated Dockerfile. Run
-`codex-wrap --rebuild-image` to rebuild/export it. `--reset` discards the entire project VM; it is
-not needed to repair the missing package in an existing VM.
+Exit the shell and launch Codex normally. New guest images already include this
+package; rebuilding an archive does not replace an existing guest filesystem.
 
 Inside the guest, `hostctl status` queries the running host wrapper through
 `/run/sandbox-wrap/host.sock` and prints JSON with `state`, `machine`, `project`,
-`wrapper_pid`, `network`, `git_writable`, and `published_ports`. The PID belongs to
+`wrapper_pid`, `network`, `proxy`, `git_writable`, and `published_ports`. The PID belongs to
 the host supervisor, not a guest process. No credential values are returned. Status
 works with `--no-net` and does not open a TCP port.
 
@@ -112,3 +143,32 @@ project VM with `codex-wrap --reset` and `codex-wrap`. **Reset deletes that VM's
 persisted guest data.** Smolvm 1.29.1 can configure socket forwarding at creation
 but cannot add it through `machine update`; the wrapper reports this rather than
 silently recreating a VM. Native updates are tracked in `wra-adhj`.
+
+## Network access
+
+By default, outbound access uses the built-in CONNECT proxy with a domain
+allowlist for Codex/OpenAI, mise/Node/npm, GitHub downloads, PyPI and Docker Hub.
+Direct VM egress is disabled. Choose broader access explicitly:
+
+```sh
+codex-wrap --unfiltered-net  # any public CONNECT destination; IP checks remain
+codex-wrap --raw-net         # direct networking, without proxy enforcement
+codex-wrap --no-net          # no external access
+codex-wrap --help-config     # config format, defaults and override rules
+```
+
+Persist per-project rules in `.sandbox/config.json`:
+
+```json
+{"network": {"allow": ["api.openai.com", "chatgpt.com"], "deny": []}}
+```
+
+`allow` replaces the built-in list, so include bootstrap endpoints when using a
+fresh VM. Repeatable `--allow-domain` / `--deny-domain` options replace only their
+corresponding configured list. CLI options never change the config file.
+Configuration can also explicitly persist unfiltered or raw access.
+
+Deny wins. `--reset` preserves configuration. Existing VMs need a rebuilt image
+and explicit reset to add the proxy bridge, or an explicit `--raw-net` override.
+See [config-json.md](config-json.md) for the exact default domains, shared-session
+behavior, and container proxy configuration.

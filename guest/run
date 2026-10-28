@@ -7,8 +7,8 @@ export XDG_CONFIG_HOME=$HOME/.config XDG_DATA_HOME=$HOME/.local/share
 export XDG_CACHE_HOME=$HOME/.cache XDG_STATE_HOME=$HOME/.local/state
 export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 export MISE_TRUSTED_CONFIG_PATHS="$PWD"
-# Drop mount capabilities before running the workload. Docker access still grants
-# guest root privileges; git masking prevents ordinary writes, not deliberate bypass.
+# Run the command as the host UID with guest Docker access. Host filesystem
+# restrictions are enforced by prepared exports independently of guest capabilities.
 exec setpriv --reuid="$uid" --regid="$gid" --groups="$(getent group docker | cut -d: -f3)" \
     --inh-caps=-all --ambient-caps=-all --bounding-set=-all \
     bash -c '

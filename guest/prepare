@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-project=$1 uid=$2 gid=$3 protect_git=$4
+uid=$1 gid=$2
 mkdir -p /home/agent
 if ! getent group "$gid" >/dev/null; then groupadd --gid "$gid" agent; fi
 if ! getent passwd "$uid" >/dev/null; then
@@ -10,14 +10,6 @@ chown "$uid:$gid" /home/agent
 chmod 755 /run/sandbox-wrap
 chown "$uid:$gid" /run/sandbox-wrap/host.sock
 chmod 600 /run/sandbox-wrap/host.sock
-# These mounts must be applied on every boot, rather than smolvm's one-time init.
-if ! mountpoint -q "$project/.sandbox"; then
-    mount -t tmpfs -o size=4k,mode=000 tmpfs "$project/.sandbox"
-fi
-if [[ "$protect_git" == 1 && -e "$project/.git" ]]; then
-    mount --bind "$project/.git" "$project/.git"
-    mount -o remount,bind,ro "$project/.git"
-fi
 for attempt in {1..60}; do
     if docker info >/dev/null 2>&1; then exit 0; fi
     sleep 1

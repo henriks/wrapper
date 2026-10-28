@@ -1,7 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 # Docker must use a block-backed guest volume, not the root overlay or virtiofs.
+proxy_pid=
+if [[ ${SANDBOX_WRAP_PROXY:-0} == 1 ]]; then
+    test -S /run/sandbox-wrap/proxy.sock
+    python3 /usr/local/lib/sandbox-wrap/network_proxy.py &
+    proxy_pid=$!
+    export http_proxy=http://127.0.0.1:4750 https_proxy=http://127.0.0.1:4750
+    export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy
+    export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+fi
 dockerd --host=unix:///run/docker.sock &
 daemon=$!
-trap 'kill -TERM "$daemon" 2>/dev/null || true; wait "$daemon" || true' TERM INT EXIT
+trap 'if [[ -n $proxy_pid ]]; then kill -TERM "$proxy_pid" 2>/dev/null || true; fi; kill -TERM "$daemon" 2>/dev/null || true; wait "$daemon" || true' TERM INT EXIT
 wait "$daemon"

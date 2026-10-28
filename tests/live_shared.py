@@ -43,10 +43,10 @@ def main():
             pid_file, = (project / '.sandbox').rglob('agent.pid')
             vm_pid = pid_file.read_text()
             owner = json.loads((project / 'first-status.json').read_text())['wrapper_pid']
-            # No repeated machine flags: --terminal inherits the active VM,
+            # No repeated machine flags: --entrypoint bash inherits the active VM,
             # including its writable git metadata and disposable Codex share.
             master, slave = pty.openpty()
-            terminal = subprocess.Popen([str(ROOT / 'codex-wrap'), '--project', str(project), '--terminal'],
+            terminal = subprocess.Popen([str(ROOT / 'codex-wrap'), '--project', str(project), '--entrypoint', 'bash'],
                                         stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
             os.close(slave)
             # Wait for bash before sending input: the VM's PTY setup may flush

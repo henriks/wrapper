@@ -127,7 +127,7 @@ def main():
             run('''
                 codex --version
                 hostctl status > rpc-status.json
-                python3 -c 'import json, os; s=json.load(open("rpc-status.json")); assert s["state"] == "running" and s["project"] == os.getcwd() and s["network"] and not s["git_writable"] and s["wrapper_pid"] > 0'
+                python3 -c 'import json, os; s=json.load(open("rpc-status.json")); assert s["state"] == "running" and s["project"] == os.getcwd() and not s["network"] and s["proxy"] and not s["git_writable"] and s["wrapper_pid"] > 0'
                 test "$(cat ~/.codex/test-state)" = shared
                 test ! -e .sandbox/launch.json
                 ! touch .git/forbidden
@@ -143,7 +143,7 @@ def main():
                 docker run --rm -v wrapper-test:/data alpine:3.20 sh -c 'echo docker-persisted > /data/test'
                 test "$DOCKER_HOST" = unix:///run/docker.sock
                 docker run --rm -v "$PWD:/workspace" alpine:3.20 sh -c 'cat /workspace/workspace-test; echo container-write > /workspace/container-test'
-                curl --fail --max-time 30 https://example.com >/dev/null
+                curl --fail --max-time 30 https://pypi.org/simple/pip/ >/dev/null
             ''', expected_update=False)
             assert (project / 'workspace-test').read_text().strip() == 'shared'
             assert (project / 'container-test').read_text().strip() == 'container-write'

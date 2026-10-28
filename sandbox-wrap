@@ -2,7 +2,7 @@
 """Run Codex or a command in a persistent project-local smolvm machine."""
 import argparse
 import fcntl
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 import os
 from pathlib import Path
@@ -15,6 +15,8 @@ import tempfile
 
 from host_rpc import GUEST_SOCKET, serve_status
 from vm_session import project_session
+import network_proxy
+import host_mounts
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "sandbox-wrap.tar"
 
@@ -128,8 +130,14 @@ def parse_args(argv):
     p.add_argument("--project", type=Path, default=Path.cwd())
     p.add_argument("--image", default=str(DEFAULT_IMAGE), help="Registry image or docker-save archive; default builds automatically when missing")
     p.add_argument("--codex-home", type=Path, default=None, help="Host Codex directory to share (default ~/.codex)")
-    p.add_argument("--terminal", action="store_true", help="Open a shell in the shared project VM")
-    p.add_argument("--no-net", action="store_true")
+    p.add_argument('--help-config', action='store_true', help='Print the sandbox configuration reference and exit')
+    p.add_argument("--entrypoint", metavar="PROGRAM", help="Run PROGRAM instead of Codex; arguments follow -- (e.g. --entrypoint bash)")
+    network = p.add_mutually_exclusive_group()
+    network.add_argument("--no-net", action="store_true")
+    network.add_argument('--unfiltered-net', action='store_true', help='Allow any public CONNECT destination without domain filtering')
+    network.add_argument('--raw-net', action='store_true', help='Enable direct VM networking without the proxy')
+    p.add_argument('--allow-domain', action='append', default=None, help='Replace configured allow list (repeatable); enables proxy mode')
+    p.add_argument('--deny-domain', action='append', default=None, help='Replace configured deny list (repeatable); enables proxy mode')
     p.add_argument("--git", action="store_true", help="Allow git metadata writes")
     p.add_argument("--aws", metavar="PROFILE")
     p.add_argument("--gh", action="store_true")
@@ -140,12 +148,14 @@ def parse_args(argv):
     actions = p.add_mutually_exclusive_group()
     actions.add_argument("--reset", action="store_true")
     actions.add_argument("--rebuild-image", action="store_true", help="Rebuild/export the default image and exit; existing VMs are unchanged")
-    p.add_argument("command", nargs=argparse.REMAINDER)
+    p.add_argument("command", nargs=argparse.REMAINDER, help="Guest command, or arguments to --entrypoint (after --)")
     a = p.parse_args(argv)
     if a.command[:1] == ["--"]:
         a.command = a.command[1:]
-    if a.terminal and (a.command or a.reset or a.rebuild_image):
-        p.error("--terminal cannot be combined with a command, --reset, or --rebuild-image")
+    if (a.no_net or a.raw_net or a.unfiltered_net) and (a.allow_domain is not None or a.deny_domain is not None):
+        p.error('network mode switches cannot be combined with domain rules')
+    if a.entrypoint is not None and (a.reset or a.rebuild_image):
+        p.error("--entrypoint cannot be combined with --reset or --rebuild-image")
     return a
 
 
@@ -186,6 +196,9 @@ def mount_plan(a, project):
 
 def main():
     a = parse_args(sys.argv[1:])
+    if a.help_config:
+        print(Path(__file__).resolve().with_name('config-json.md').read_text(), end='')
+        return
     if a.rebuild_image:
         if a.command:
             die("--rebuild-image does not run a guest command")
@@ -194,6 +207,14 @@ def main():
     project = a.project.resolve(strict=True)
     if not project.is_dir() or project == Path("/") or project == Path("/home/agent") or project in Path("/home/agent").parents:
         die("project must be a directory outside the guest HOME ancestors")
+    if not a.reset:
+        host_mounts.ensure_namespace()
+    configured_network = None if a.reset else network_proxy.configuration(project)
+    def choose_network(base):
+        return network_proxy.select_policy(base, raw_net=a.raw_net, unfiltered_net=a.unfiltered_net, no_net=a.no_net,
+                                           allow=a.allow_domain, deny=a.deny_domain)
+    network = choose_network(configured_network)
+    proxy_enabled = network['mode'] == 'proxy'
     for port in a.port:
         if not re.fullmatch(r"[0-9]+:[0-9]+", port) or not all(0 < int(n) < 65536 for n in port.split(":")):
             die("ports must be HOST:GUEST with values 1..65535")
@@ -205,17 +226,26 @@ def main():
     state = project / ".sandbox"
     env = os.environ.copy()
     env["SMOLVM_DATA_DIR"] = str(state)
-    def smol(*args, capture=False, check=True, timeout=120):
+    def smol(*args, capture=False, check=True, timeout=120, input=None):
         return subprocess.run(["smolvm", "machine", *args], env=env,
-                              check=check, capture_output=capture, text=True, timeout=timeout)
+                              check=check, capture_output=capture, text=True, timeout=timeout, input=input)
     name = "sandbox"
     mounts = [] if a.reset else mount_plan(a, project)
     settings_path = state / "launch.json"
     socket_path = state / "host.sock"
-    settings = {"mounts": mounts, "ports": a.port, "git": a.git, "network": not a.no_net,
-                "rpc_socket": str(socket_path)}
+    settings = {"mounts": mounts, "ports": a.port, "git": a.git, "network": network["mode"] == "direct",
+                "rpc_socket": str(socket_path), "proxy": network if proxy_enabled else None,
+                "host_mounts": host_mounts.LAYOUT}
     def attach():
+        nonlocal network, proxy_enabled
         previous = json.loads(settings_path.read_text())
+        if previous.get('host_mounts') != host_mounts.LAYOUT:
+            die('active VM predates host mount protection; close its sessions before restarting')
+        current = previous.get('proxy') or network_proxy.policy({'mode': 'direct' if previous['network'] else 'off'})
+        network = choose_network(current)
+        proxy_enabled = network['mode'] == 'proxy'
+        if network != current:
+            die('network policy conflicts with active sessions')
         # Unspecified machine options inherit the already-running VM settings.
         conflict = ((a.git and not previous["git"]) or (a.no_net and previous["network"])
                     or (a.port and a.port != previous["ports"]))
@@ -239,30 +269,43 @@ def main():
             die("unrecognized .sandbox state; move it aside before launching")
         if exists and previous.get("rpc_socket") != str(socket_path):
             die("this VM predates host RPC; run --rebuild-image, then --reset to recreate it (reset deletes guest state)")
+        if exists and proxy_enabled and not previous.get('proxy_socket'):
+            die('this VM has no proxy bridge; rebuild the image and --reset to recreate it (reset deletes guest state)')
+        if proxy_enabled or (previous and previous.get('proxy_socket')):
+            settings['proxy_socket'] = str(state / 'proxy.sock')
         status = {"state": "starting", "machine": name, "project": str(project),
-                  "wrapper_pid": os.getpid(), "network": not a.no_net,
+                  "wrapper_pid": os.getpid(), "network": settings["network"], "proxy": proxy_enabled,
                   "git_writable": a.git, "published_ports": a.port}
-        with serve_status(socket_path, status):
-            if exists:
-                smol("stop", "--name", name)
+        relay = (network_proxy.serve_proxy(state / 'proxy.sock', network if proxy_enabled else {'mode': 'proxy', 'allow': []})
+                 if settings.get('proxy_socket') else nullcontext())
+        if exists:
+            smol('stop', '--name', name)
+        exported = host_mounts.prepare(project, mounts, a.git)
+        with serve_status(socket_path, status), relay:
             if not exists:
                 create = ["create", "--name", name, "--image", a.image,
-                          "--net-backend", "virtio-net", "--volume", "/var/lib/docker",
+                          "--volume", "/var/lib/docker",
                           "--mount-socket", f"{socket_path}:{GUEST_SOCKET}"]
-                if not a.no_net:
-                    create.append("--net")
-                for item in mounts:
+                create += ['--env', f'SANDBOX_WRAP_PROXY={int(proxy_enabled)}']
+                if proxy_enabled:
+                    create += ['--mount-socket', f'{state / "proxy.sock"}:{network_proxy.GUEST_SOCKET}']
+                if settings['network']:
+                    create += ["--net", "--net-backend", "virtio-net"]
+                for item in exported:
                     create += ["--volume", item]
                 for port in a.port:
                     create += ["--port", port]
                 smol(*create)
             elif previous != settings:
-                update = ["update", "--name", name, "--no-net" if a.no_net else "--net"]
-                for item in previous["mounts"]:
+                update = ["update", "--name", name, "--net" if settings["network"] else "--no-net",
+                          "--env", f"SANDBOX_WRAP_PROXY={int(proxy_enabled)}"]
+                old = (host_mounts.volumes(state, previous['mounts'])
+                       if previous.get('host_mounts') else previous['mounts'])
+                for item in old:
                     update += ["--remove-volume", item.rsplit(":", 1)[0]]
                 for port in previous["ports"]:
                     update += ["--remove-port", port]
-                for item in mounts:
+                for item in exported:
                     update += ["--volume", item]
                 for port in a.port:
                     update += ["--port", port]
@@ -271,8 +314,9 @@ def main():
                 settings_path.write_text(json.dumps(settings))
             try:
                 smol("start", "--name", name, timeout=300)
-                smol("exec", "--name", name, "--", "/usr/local/lib/sandbox-wrap/prepare",
-                     str(project), str(os.getuid()), str(os.getgid()), str(int(not a.git)))
+                smol("exec", "--name", name, "--interactive", "--stream", "--", "bash", "-s", "--",
+                     str(os.getuid()), str(os.getgid()),
+                     input=(Path(__file__).resolve().parent / 'guest/prepare').read_text())
                 status["state"] = "running"
                 yield
             finally:
@@ -281,9 +325,16 @@ def main():
 
     with project_session(project, boot, attach, reset=a.reset):
         if a.reset:
+            if os.path.ismount(state / 'exports'):
+                die('cannot reset from an active host export namespace')
             if json.loads(smol("ls", "--json", capture=True).stdout):
                 smol("delete", "--name", name, "--force")
-            shutil.rmtree(state)
+            for child in state.iterdir():
+                if child.name != 'config.json':
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
             return
         def terminate(signum, frame):
             raise SystemExit(128 + signum)
@@ -311,7 +362,10 @@ def main():
                            "AWS_CONFIG_FILE": "/dev/null", "AWS_SHARED_CREDENTIALS_FILE": "/dev/null",
                            "SSH_AUTH_SOCK": "", "KUBECONFIG": "/dev/null"}.items():
             execute += ["--env", f"{key}={value}"]
-        command = ["bash"] if a.terminal else (a.command or ["codex", "--dangerously-bypass-approvals-and-sandbox"])
+        if proxy_enabled:
+            for key, value in network_proxy.environment().items():
+                execute += ['--env', f'{key}={value}']
+        command = [a.entrypoint, *a.command] if a.entrypoint is not None else (a.command or ["codex", "--dangerously-bypass-approvals-and-sandbox"])
         execute += ["--", "/usr/local/lib/sandbox-wrap/run", str(os.getuid()), str(os.getgid()), *command]
         # No timeout on the interactive agent session; lifecycle is the user's.
         result = subprocess.run(["smolvm", "machine", *execute], env=env)

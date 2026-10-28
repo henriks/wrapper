@@ -75,11 +75,13 @@ def project_session(project, boot, attach, reset=False):
     pid = None
     try:
         while True:
+            if (project / '.sandbox-wrap.lock').is_symlink():
+                raise ValueError('project lifecycle lock must not be a symlink')
             with (project / '.sandbox-wrap.lock').open('a') as gate:
                 fcntl.flock(gate, fcntl.LOCK_EX)
                 if state.is_symlink():
                     raise ValueError('.sandbox must not be a symlink')
-                internal = {'owner.lock', 'sessions.lock', 'supervisor.log', 'supervisor.error'}
+                internal = {'config.json', 'exports', 'export-mask', 'owner.lock', 'sessions.lock', 'supervisor.log', 'supervisor.error'}
                 if (not reset and state.exists() and not (state / 'launch.json').exists()
                         and any(p.name not in internal for p in state.iterdir())):
                     raise ValueError('unrecognized .sandbox state; move it aside or use --reset')

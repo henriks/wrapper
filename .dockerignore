@@ -3,3 +3,4 @@
 !guest/
 !guest/**
 !host_rpc.py
+!network_proxy.py

@@ -17,8 +17,8 @@ RUN curl --fail --show-error --location https://mise.run -o /tmp/install-mise \
     && MISE_INSTALL_PATH=/usr/local/bin/mise sh /tmp/install-mise \
     && rm /tmp/install-mise
 RUN mkdir -p /home/agent /var/lib/docker
-COPY guest/ /usr/local/lib/sandbox-wrap/
-COPY host_rpc.py /usr/local/lib/sandbox-wrap/
+COPY guest/daemon guest/run guest/hostctl /usr/local/lib/sandbox-wrap/
+COPY host_rpc.py network_proxy.py /usr/local/lib/sandbox-wrap/
 RUN chmod +x /usr/local/lib/sandbox-wrap/*
 RUN ln -s /usr/local/lib/sandbox-wrap/hostctl /usr/local/bin/hostctl
 ENV HOME=/home/agent DOCKER_HOST=unix:///run/docker.sock
