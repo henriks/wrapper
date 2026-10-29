@@ -315,7 +315,7 @@ def main():
             try:
                 smol("start", "--name", name, timeout=300)
                 smol("exec", "--name", name, "--interactive", "--stream", "--", "bash", "-s", "--",
-                     str(os.getuid()), str(os.getgid()),
+                     str(os.getuid()), str(os.getgid()), str(int(proxy_enabled)),
                      input=(Path(__file__).resolve().parent / 'guest/prepare').read_text())
                 status["state"] = "running"
                 yield

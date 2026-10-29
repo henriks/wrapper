@@ -16,6 +16,7 @@ project = Path(sys.argv[1])
 @contextmanager
 def boot():
     if 'fail-boot' in sys.argv: raise RuntimeError('injected boot failure')
+    if 'fail-migration' in sys.argv: raise SystemExit('error: this VM has no proxy bridge; rebuild the image and --reset to recreate it')
     with (project / 'events').open('a') as out: out.write('boot\\n')
     (project / '.sandbox/launch.json').write_text('{}')
     try: yield
@@ -33,9 +34,13 @@ with project_session(project, boot, attach, reset='reset' in sys.argv):
 class SessionTests(unittest.TestCase):
     def test_failed_startup_can_be_retried(self):
         with tempfile.TemporaryDirectory() as directory:
-            failed = subprocess.run([sys.executable, '-c', CLIENT, directory, 'fail-boot'], cwd=ROOT,
-                                    input=b'\n', capture_output=True, timeout=10)
-            self.assertNotEqual(failed.returncode, 0)
+            for flag, message in (('fail-boot', b'injected boot failure'),
+                                  ('fail-migration', b'this VM has no proxy bridge; rebuild the image and --reset')):
+                with self.subTest(flag=flag):
+                    failed = subprocess.run([sys.executable, '-c', CLIENT, directory, flag], cwd=ROOT,
+                                            input=b'\n', capture_output=True, timeout=10)
+                    self.assertNotEqual(failed.returncode, 0)
+                    self.assertIn(message, failed.stderr)
             retried = subprocess.run([sys.executable, '-c', CLIENT, directory], cwd=ROOT,
                                      input=b'\n', capture_output=True, timeout=10)
             self.assertEqual(retried.returncode, 0, retried.stderr)
@@ -46,6 +51,7 @@ class SessionTests(unittest.TestCase):
                                     input=b'\n', capture_output=True, timeout=10)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b'VM supervisor failed', result.stderr)
+            self.assertIn(b'injected stop failure', result.stderr)
 
 
     def test_owner_outlives_first_client_and_last_client_stops(self):

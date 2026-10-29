@@ -28,7 +28,8 @@ exits; `--reset` is rejected while any session is active.
 
 A small host supervisor owns the VM and status socket independently of the first
 client. OS locks track active sessions, including clients killed with SIGKILL.
-Startup/shutdown diagnostics are in `.sandbox/supervisor.log`. Guest tool
+Startup/shutdown diagnostics are in `.sandbox/supervisor.log`; supervisor failures
+also print the log to the client's terminal. Guest tool
 installation is serialized; sessions with installed tools proceed directly
 to their commands, which run concurrently.
 
@@ -49,6 +50,9 @@ custom archives and registry references are not built by the wrapper. To rebuild
 the default image, run `codex-wrap --rebuild-image`. This command uses host Docker
 and exits without starting or modifying a project VM. Existing VMs retain their
 filesystem until `--reset`; reset itself does not build an image.
+If an older image lacks the guest proxy, startup reports it before launching
+tools. Run `codex-wrap --rebuild-image`, then `codex-wrap --reset` to recreate
+the VM from the updated image. Reset deletes the guest filesystem and Docker data.
 This also applies to changes in the guest runner: rebuilding updates the archive
 for new VMs, while existing VMs retain their installed runner and tools.
 Existing bwrap `.sandbox/` directories must be moved aside before first launch.

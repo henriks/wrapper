@@ -142,4 +142,8 @@ def project_session(project, boot, attach, reset=False):
             if pid is not None:
                 os.waitpid(pid, 0 if last else os.WNOHANG)
             if last and (state / 'supervisor.error').exists():
+                log = state / 'supervisor.log'
+                if log.exists():
+                    sys.stderr.write(log.read_text())
+                    sys.stderr.flush()
                 raise RuntimeError(f'VM supervisor failed; see {state / "supervisor.log"}')
